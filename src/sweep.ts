@@ -36,12 +36,22 @@
  * do in one run: it is a safety net, and a safety net that throttles real-time
  * sync to fix hypothetical gaps is worse than the gap.
  *
- * A caveat on the counter: `pagedRequests` counts only the list pages and the
- * calls this module makes directly. Each re-sync then goes through syncOne,
- * which makes its OWN Zuper fetch inside job_details, uncounted here. Measured:
- * 6 'requests' took 171s, roughly double what the pacer alone would explain.
- * So real API usage is about twice this figure — budget accordingly, and do not
- * read it as total consumption against the 150/min limit.
+ * WHAT ACTUALLY CONSTRAINS THIS, measured rather than assumed.
+ *
+ * Not Zuper's rate limit. A capped run of 25 re-syncs took 1,192s — about 48s
+ * each — while making only ~53 counted requests. At 45 req/min the pacer would
+ * have allowed roughly 900 in that time, so it never bound. The cost is per-job
+ * processing: job_details' afterWrite rebuilds assignments, status history,
+ * custom fields, teams and tags, which is many Supabase round-trips per job.
+ *
+ * So `perMinute` is a safety belt against bursts, not the throttle that matters,
+ * and a backlog should be budgeted in minutes-per-job (~48s) rather than in API
+ * calls: 238 outstanding jobs is roughly 3 hours, not a few minutes.
+ *
+ * `pagedRequests` counts only this module's own calls. Each re-sync makes further
+ * uncounted Zuper fetches inside syncOne, and an unmapped job costs two syncOne
+ * calls (jobs, then job_details) — 25 re-syncs produced 53 counted requests. Read
+ * it as a lower bound on API usage, never as total consumption.
  */
 
 import { config } from "./config.js";
