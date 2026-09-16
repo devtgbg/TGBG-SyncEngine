@@ -1,0 +1,25 @@
+# Never let secrets into an image layer.
+.env
+.env.*
+!.env.example
+
+.git
+.gitignore
+node_modules
+dist
+.next
+out
+*.tsbuildinfo
+
+# The dashboard is a separate deployable with its own Dockerfile.
+dashboard
+
+# Scratch from API probes.
+.webhooks.json
+.wh
+.wh.*
+
+.vscode
+.idea
+.DS_Store
+Thumbs.db

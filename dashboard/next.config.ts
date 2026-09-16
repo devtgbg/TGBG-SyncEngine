@@ -12,6 +12,9 @@ import type { NextConfig } from "next";
  */
 const nextConfig: NextConfig = {
   outputFileTracingRoot: path.resolve(__dirname),
+  // Emit a self-contained server for the Docker image: only the modules actually
+  // imported, so the runtime stage needs no node_modules copy at all.
+  output: "standalone",
 };
 
 export default nextConfig;
