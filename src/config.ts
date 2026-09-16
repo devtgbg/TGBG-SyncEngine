@@ -75,11 +75,11 @@ export const config = {
    * retried on an interval, up to replayMaxAttempts, so a restart mid-processing
    * or a transient Zuper 500 does not lose the change.
    *
-   * The WINDOW SWEEP is NOT built. nearDaysBack/nearDaysAhead describe re-reading
-   * every job Zuper changed in a rolling window, which is the only thing that
-   * catches a delivery that never arrived at all — Zuper retries three times and
-   * then gives up, so a long outage loses changes permanently. The values are
-   * kept here because the intent is real, but nothing reads them yet.
+   * The WINDOW SWEEP is built — see `sweep` below and src/sweep.ts. It re-reads
+   * what Zuper changed in a rolling window and re-fetches only the records that
+   * have actually drifted, which is the only thing that catches a delivery that
+   * never arrived at all. Zuper gives up after its retries (the real payload
+   * carries max_retries: 4), so without it a long outage loses changes for good.
    */
   reconcile: {
     enabled: optional("RECONCILE_ENABLED", "true") !== "false",
@@ -88,8 +88,30 @@ export const config = {
     // A row that can never succeed must stop retrying rather than burn the
     // 200-700 req/min Zuper budget forever.
     replayMaxAttempts: Math.max(1, Number(optional("RECONCILE_MAX_ATTEMPTS", "5"))),
-    nearDaysBack: Number(optional("RECONCILE_NEAR_DAYS_BACK", "1")),   // not yet used
-    nearDaysAhead: Number(optional("RECONCILE_NEAR_DAYS_AHEAD", "21")), // not yet used
+  },
+
+  /**
+   * The rolling-window sweep (src/sweep.ts) — the other half of converging.
+   *
+   * Replay retries deliveries we received; this catches the ones that never
+   * arrived, which is what an outage longer than Zuper's retries produces.
+   *
+   * Windowed on updated_at rather than on scheduled dates: a missed webhook is by
+   * definition a record that CHANGED, which is not the same set as the records
+   * scheduled soon. (The earlier RECONCILE_NEAR_DAYS_* settings encoded the
+   * scheduled-window idea and are gone.)
+   *
+   * perMinute is deliberately a fraction of Zuper's limit — measured at 150/min
+   * on this account via x-rate-limit, not the 200-700 the docs advertise — because
+   * live webhook re-fetches compete for the same budget. A safety net that
+   * throttles real-time sync to repair hypothetical gaps is worse than the gap.
+   */
+  sweep: {
+    enabled: optional("SWEEP_ENABLED", "true") !== "false",
+    everyMinutes: Math.max(5, Number(optional("SWEEP_EVERY_MINUTES", "30"))),
+    minutesBack: Math.max(5, Number(optional("SWEEP_MINUTES_BACK", "180"))),
+    maxResyncs: Math.max(1, Number(optional("SWEEP_MAX_RESYNCS", "200"))),
+    perMinute: Math.min(120, Math.max(1, Number(optional("SWEEP_REQUESTS_PER_MINUTE", "45")))),
   },
 } as const;
 

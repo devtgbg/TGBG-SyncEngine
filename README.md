@@ -81,6 +81,7 @@ npm run simulate -- --send --bad-secret                # prove refusal works
 | `npm run check-db` | every table readable, write permitted |
 | `npm run check-routes` | every routed event points at a real sync entity |
 | `npm run check-wire-routes` | all 73 of Zuper's real wire strings route; 8/8 deletions exact |
+| `npm run check-real-payload` | a REAL Zuper body — flat, no module field — still routes |
 | `npm run check-checklist-import` | what the Zuper checklist import preserves |
 
 `check-wire-routes` exists because `check-routes` validates the catalogue against

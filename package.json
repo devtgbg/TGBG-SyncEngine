@@ -20,7 +20,8 @@
     "simulate": "tsx src/cli/simulate.ts",
     "check-wire-routes": "tsx src/cli/check-wire-routes.ts",
     "check": "npm run check-routes && npm run check-wire-routes && npm run check-real-payload && npm run check-checklist-import",
-    "check-real-payload": "tsx src/cli/check-real-payload.ts"
+    "check-real-payload": "tsx src/cli/check-real-payload.ts",
+    "sweep": "tsx src/cli/sweep.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

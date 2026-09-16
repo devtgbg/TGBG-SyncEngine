@@ -11,6 +11,19 @@
  * single-record entry point. Keep the two in step: map lookup → transform →
  * insert/update → 23505 number-collision recovery → afterWrite.
  *
+ * ONE DELIBERATE DIVERGENCE from that closure: syncOne refreshes
+ * zuper_sync_map.synced_at on UPDATE as well as on create; syncEntity only
+ * does so on create (zuper-sync.ts:1750, 1755 — both insert branches).
+ *
+ * That is correct for a bulk migration, where synced_at means "imported at"
+ * and zuper-sync.ts:1110 uses `.lt("synced_at", cutoff)` as a resume marker so
+ * the job_details enrichment pass can skip what it already did. Refreshing it
+ * there would make that pass re-scan everything, every run.
+ *
+ * But the window sweep decides what has drifted by comparing Zuper's updated_at
+ * against synced_at, so for single-record syncs the column has to mean "last
+ * synced" or the sweep can never converge. Hence the split.
+ *
  * The one thing it deliberately does NOT reproduce is line 1732. `syncEntity`
  * loads the whole zuper_sync_map for the entity and every dependency before it
  * starts; jms.zuper_sync_map holds 513,336 rows, which is correct for a migration
@@ -156,6 +169,21 @@ export async function syncOne(
         const { error } = await client.schema(e.schema).from(e.table).update(payload).eq("id", id).eq("tenant_id", tenantId);
         if (error) throw error;
       }
+      // Refresh synced_at on UPDATE too, not only on create.
+      //
+      // Without this, synced_at means "when we first imported this record" and
+      // never moves again — so the window sweep, which decides what has drifted by
+      // comparing Zuper's updated_at against synced_at, can never converge. It
+      // re-fetches the same jobs every run, for ever, against a rate limit shared
+      // with live webhook traffic — while looking like it works, because the rows
+      // really are updated correctly. There is simply no progress.
+      //
+      // Verified: six jobs the sweep had just re-synced still carried synced_at
+      // from 11-15 September, and all six read as drifted on the very next pass.
+      //
+      // setMap upserts on (tenant_id, entity, zuper_uid), so this is idempotent:
+      // it rewrites the same jms_id and moves the timestamp.
+      await setMap(ctx, mapName, rowUid, id);
     } else if ((e as any).enrichOnly) {
       throw new Error(`${uid} is not imported yet`);
     } else if ((e as any).insert) {
