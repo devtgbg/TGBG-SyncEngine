@@ -12,6 +12,11 @@ node_modules/
 dist/
 *.tsbuildinfo
 
+# Next.js build output (dashboard/)
+.next/
+out/
+next-env.d.ts
+
 # Editor / OS
 .DS_Store
 Thumbs.db
