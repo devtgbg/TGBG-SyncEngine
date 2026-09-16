@@ -413,7 +413,23 @@ const norm = (s: string) => String(s ?? "").toLowerCase().replace(/[\s_\-/.]+/g,
  * would write the wrong table.
  */
 export function resolveRoute(module: string, event: string): Route | null {
-  const key = MODULE_ALIASES[norm(module)] ?? MODULE_NAMES.find((m) => norm(m) === norm(module));
+  // A real delivery carries NO module field.
+  //
+  // Verified against a genuine payload pulled from Zuper's webhook history: its
+  // top-level keys are job_uid, event, work_order_number, scheduled_start_time,
+  // triggered_by … and nothing resembling a module. (`type` appears on the
+  // history ROW, not in the body — which is what misled identify().)
+  //
+  // Zuper's wire events are "<module>.<verb>", so the prefix is the module:
+  // job.update, customer.create, property.new, service_contract.renew. Every one
+  // of the nine live modules is already in MODULE_ALIASES.
+  //
+  // Without this fallback every real delivery resolves to no route and is stored
+  // but never processed — silently, because nothing errors.
+  const fromEvent = String(event ?? "").split(".")[0];
+  const key = MODULE_ALIASES[norm(module)]
+    ?? MODULE_NAMES.find((m) => norm(m) === norm(module))
+    ?? MODULE_ALIASES[norm(fromEvent)];
   if (!key) return null;
   const spec = MODULES[key];
 

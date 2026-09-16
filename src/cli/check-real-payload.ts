@@ -1,0 +1,92 @@
+/**
+ * Routing against Zuper's REAL delivery shape.
+ *
+ *   npm run check-real-payload
+ *
+ * This guard exists because of a bug that was completely silent.
+ *
+ * Everything was tested against synthetic bodies shaped {module, event, data},
+ * because Zuper documents no payload schema. A genuine delivery, pulled from
+ * Zuper's webhook history on 2026-09-16, turns out to be FLAT and to carry no
+ * module field at all:
+ *
+ *   { job_uid, event, work_order_number, scheduled_start_time, triggered_by,
+ *     updated_by, company_uid, job_title, all_day_schedule, max_retries,
+ *     prev_scheduled_start_time, prev_scheduled_end_time, reason,
+ *     triggered_at, workflow_builder }
+ *
+ * `type` — which identify() probed for a module — belongs to the history ROW,
+ * not the body. So module resolved to null, resolveRoute returned null, and every
+ * real delivery would have been stored and never processed. Nothing would have
+ * errored; it would simply have looked like the sync not working.
+ *
+ * Zuper's events are "<module>.<verb>" on the wire, so the prefix is the module.
+ * These assertions pin that down.
+ *
+ * Pure: routes.ts needs no environment, so this runs anywhere. Identifiers below
+ * are placeholders — no customer data belongs in the repository.
+ */
+
+import { resolveRoute } from "../routes.js";
+
+/** The real delivery, with identifying values replaced. Shape is verbatim. */
+const REAL_JOB_PAYLOAD: Record<string, unknown> = {
+  job_uid: "00000000-0000-4000-8000-00000000job",
+  event: "job.update_schedule",
+  work_order_number: "54401",
+  job_title: "<redacted>",
+  company_uid: "00000000-0000-4000-8000-0000000comp",
+  scheduled_start_time: "2026-09-17T06:00:00Z",
+  scheduled_end_time: "2026-09-17T07:00:00Z",
+  prev_scheduled_start_time: "2026-09-16T06:00:00Z",
+  prev_scheduled_end_time: "2026-09-16T07:00:00Z",
+  // Zuper sends scalars as strings, and workflow_builder as a PYTHON repr, not
+  // JSON — another reason the body is a trigger and never a source of truth.
+  all_day_schedule: "False",
+  max_retries: "4",
+  reason: "",
+  workflow_builder: "{'workflow_uid': None, 'from_workflow_builder': False}",
+  triggered_at: "2026-09-16T15:51:50.106Z",
+  triggered_by: "<redacted>",
+  updated_by: "<redacted>",
+};
+
+let pass = 0, fail = 0;
+const ok = (name: string, cond: boolean) => (cond ? (pass++, console.log(`  pass  ${name}`)) : (fail++, console.log(`  FAIL  ${name}`)));
+
+// The fact that caused the bug, asserted so it cannot quietly change.
+ok("a real Zuper body carries NO module field",
+  !("module" in REAL_JOB_PAYLOAD) && !("webhook_module" in REAL_JOB_PAYLOAD) && !("type" in REAL_JOB_PAYLOAD));
+
+// The load-bearing case: no module, only an event.
+const r = resolveRoute("", String(REAL_JOB_PAYLOAD.event));
+ok("routes with an EMPTY module, from the event prefix alone", r !== null);
+ok("…to the jobs path", r?.entity === "job_details" && r?.createEntity === "jobs");
+ok("…and looks for job_uid", (r?.uidFields ?? []).includes("job_uid"));
+ok("…and is not treated as a deletion", r?.deletion === false);
+
+// Every live module's prefix must resolve with no module supplied.
+const PREFIXES: [string, string][] = [
+  ["job.update", "job_details"],
+  ["customer.create", "customers"],
+  ["property.new", "organizations"],      // Zuper calls organizations PROPERTY
+  ["estimate.delete", "estimates"],       // …and quotes ESTIMATES
+  ["invoice.payment", "invoices"],
+  ["asset.activate", "assets"],
+  ["user.update", "users"],
+  ["request.new", "requests"],
+  ["service_contract.renew", "contracts"],
+];
+for (const [event, entity] of PREFIXES) {
+  const got = resolveRoute("", event);
+  ok(`"${event}" with no module -> ${entity}`, got?.entity === entity);
+}
+
+// A module that is present must still win, and nonsense must still be refused.
+ok("an explicit module still takes precedence", resolveRoute("JOB", "job.update")?.entity === "job_details");
+ok("an unknown event with no module is still refused", resolveRoute("", "nonsense.thing") === null);
+ok("an empty event with no module is refused", resolveRoute("", "") === null);
+
+console.log("");
+console.log(`${pass} passed, ${fail} failed`);
+if (fail) process.exit(1);
