@@ -1,0 +1,19 @@
+# Secrets — .env holds the Zuper API key and the webhook secret. Never commit it.
+.env
+.env.*
+!.env.example
+
+# Scratch output from API probes (Zuper returns secret_key inline in webhook lists).
+.webhooks.json
+.wh
+.wh.*
+
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

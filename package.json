@@ -1,0 +1,37 @@
+{
+  "name": "tgbg-zupersync",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Zuper ↔ Supabase sync engine. Receives Zuper webhooks, keeps the shared jms.* tables live, and pushes app-side changes back to Zuper.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/index.js",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p . --noEmit",
+    "sync": "tsx src/cli/run-sync.ts",
+    "webhooks": "tsx src/cli/webhooks.ts",
+    "build:check": "tsc -p . --noEmit",
+    "check-routes": "tsx src/cli/check-routes.ts",
+    "check-db": "tsx src/cli/check-db.ts",
+    "check-checklist-import": "tsx src/cli/check-checklist-import.ts",
+    "simulate": "tsx src/cli/simulate.ts",
+    "check-wire-routes": "tsx src/cli/check-wire-routes.ts",
+    "check": "npm run check-routes && npm run check-wire-routes && npm run check-checklist-import"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.0",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
