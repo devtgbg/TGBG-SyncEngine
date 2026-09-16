@@ -128,6 +128,25 @@ Optional: `PORT` (3020), `ZUPER_API_URL`, `ZUPER_WEBHOOK_HEADER`
 (`x-zupersync-key`), `NODE_ENV` — the image already sets it to `production`, so
 do not override it with `development`.
 
+### If the domain returns `404 page not found`
+
+That 18-byte body is Traefik's own 404, not this app's — the hostname has no
+route, so requests never reach a container. Over HTTPS the same cause shows up
+as a certificate error (curl exit 60), because Let's Encrypt does not issue for a
+hostname the proxy is not serving. One cause, two symptoms.
+
+Check, in this order:
+
+1. **The container is not running.** The commonest reason is a missing required
+   variable: the process throws at boot, so there is no healthy backend to route
+   to. The log line names the variable — `SUPABASE_URL is required`, and so on.
+2. **The domain is not set on the application** in Coolify.
+3. **The port does not match.** The app listens on `PORT` (default 3020).
+
+To tell the two apart quickly: a Traefik 404 means nothing is routed; an
+Express 404 (`Cannot GET /…`) means the app *is* serving and the path is wrong.
+`/health` is always defined, so a 404 there is never the app.
+
 ### Registering the webhooks in Zuper
 
 Point them at:
