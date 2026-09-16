@@ -90,12 +90,26 @@ async function create(module: string, event: string): Promise<{ ok: boolean; det
       webhook_url: ENDPOINT,
       request_method: "POST",
       content_type: "application/json",
-      // Zuper stores headers as a JSON object string (its retry schema shows the
-      // same shape). This is what makes the delivery verifiable at our end.
-      headers: JSON.stringify({ [config.webhook.header]: config.webhook.secret }),
+      // An OBJECT, not a pre-stringified string. Zuper stringifies it once itself
+      // for storage, exactly as its UI does.
+      //
+      // Sending JSON.stringify(...) here produces a double-encoded value: the
+      // string is serialised again with the body, and Zuper stores the literal
+      // `"{\"x-zupersync-key\":\"…\"}"` — which needs two json.loads to reach a
+      // dict, where a webhook created through the UI needs one. Compared against
+      // a working webhook byte for byte: theirs begins `{"x-tgbg-webhook-token":`
+      // (70 chars), the double-encoded one begins `"{\"…` (92). A double-encoded
+      // value is not sent as a header at all, so every delivery would arrive
+      // unverified and be refused.
+      headers: { [config.webhook.header]: config.webhook.secret },
     },
   };
-  const r = await zuper("/webhook", { method: "POST", body: JSON.stringify(body) });
+  // Create shares the /service/notifications/ prefix with list. Zuper's docs show
+  // a shortened `POST /webhook`, which answers 503 with an HTML body — the same
+  // contradiction between their curl samples and their OpenAPI paths that the
+  // list endpoint has. Probed with an empty body: only this path answered JSON
+  // ({"message":"Webhook details are mandatory"}), i.e. a real endpoint.
+  const r = await zuper("/service/notifications/webhook", { method: "POST", body: JSON.stringify(body) });
   return { ok: r.ok, detail: r.ok ? (r.json?.data?.webhook_uid ?? "created") : `HTTP ${r.status} ${r.text.slice(0, 160)}` };
 }
 
