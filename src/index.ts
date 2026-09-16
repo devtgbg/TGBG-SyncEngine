@@ -15,6 +15,7 @@ import express from "express";
 import { config, secretConfigured } from "./config.js";
 import { dbReachable } from "./supabase.js";
 import { receiver } from "./receiver.js";
+import { startReplay } from "./reconcile.js";
 
 const app = express();
 
@@ -41,6 +42,13 @@ app.use("/webhooks/zuper", receiver);
 app.listen(config.port, () => {
   console.log(`[zupersync] listening on :${config.port} (${config.nodeEnv})`);
   if (!secretConfigured()) {
-    console.warn("[zupersync] ZUPER_WEBHOOK_SECRET is not set — deliveries will be captured but marked unverified");
+    console.warn(
+      config.isProduction
+        ? "[zupersync] ZUPER_WEBHOOK_SECRET is NOT SET — this endpoint is public and every delivery will be stored but REFUSED. Set it."
+        : "[zupersync] ZUPER_WEBHOOK_SECRET is not set — deliveries will be captured but marked unverified",
+    );
   }
+  // Retry what was received but never finished. Without this a delivery that
+  // failed once is simply lost, and the tables quietly drift from Zuper.
+  startReplay();
 });

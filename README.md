@@ -96,19 +96,52 @@ Zuper sent, whether it was accepted, whether it was applied, and if not, why.
 
 ## Deployment
 
-Two deployables, two Coolify applications from this one repository:
+Two deployables, two Coolify applications from this one repository. A push to
+`main` auto-deploys.
 
-| App | Dockerfile | Base directory | Port |
-|---|---|---|---|
-| Sync service | `Dockerfile` | *(repo root)* | 3020 |
-| Delivery log | `dashboard/Dockerfile` | `dashboard` | 3021 |
+| App | Dockerfile | Base directory | Port | Domain |
+|---|---|---|---|---|
+| Sync service | `Dockerfile` | *(repo root)* | 3020 | `zupersync.golfbuggyguy.com` |
+| Delivery log | `dashboard/Dockerfile` | `dashboard` | 3021 | *(internal — see the warning above)* |
 
-Environment (see `.env.example`): `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`,
-`DEFAULT_TENANT_ID`, `ZUPER_API_URL`, `ZUPER_API_KEY`, `ZUPER_WEBHOOK_HEADER`,
-`ZUPER_WEBHOOK_SECRET`.
+Health check path: `/health`. It returns 503 when the database is unreachable, so
+it reports the thing that matters rather than merely that the process is alive.
 
-Point Zuper's webhooks at `https://<host>/webhooks/zuper`, with the header name
-and value matching `ZUPER_WEBHOOK_HEADER` / `ZUPER_WEBHOOK_SECRET`.
+### Environment
+
+Three are enforced at boot — the container exits without them:
+
+| | |
+|---|---|
+| `SUPABASE_URL` | the shared project, the same one Tuper reads |
+| `SUPABASE_SERVICE_ROLE_KEY` | writes across `jms.*`, so it must bypass RLS |
+| `ZUPER_API_KEY` | every webhook re-reads its record through this |
+
+Two more are *not* enforced, and both fail quietly rather than loudly — set them:
+
+| | |
+|---|---|
+| `ZUPER_WEBHOOK_SECRET` | **Set this before the first deploy.** The receiver only refuses an unverified delivery `if (!verified && secretConfigured())`. With no secret, that guard never fires and the public endpoint will process anything anyone POSTs to it, straight into the live tables. |
+| `DEFAULT_TENANT_ID` | the fallback is `00000000-0000-0000-0000-000000000001`, which on this installation happens to be the real tenant (`core.tenants` → "TGBG"). Set it explicitly anyway: a value that is right by coincidence is not configuration, and on any other tenant the default would fail the `core.tenants` foreign key on every write. |
+
+Optional: `PORT` (3020), `ZUPER_API_URL`, `ZUPER_WEBHOOK_HEADER`
+(`x-zupersync-key`), `NODE_ENV` — the image already sets it to `production`, so
+do not override it with `development`.
+
+### Registering the webhooks in Zuper
+
+Point them at:
+
+```
+https://zupersync.golfbuggyguy.com/webhooks/zuper
+```
+
+with one header whose key and value match `ZUPER_WEBHOOK_HEADER` and
+`ZUPER_WEBHOOK_SECRET`. Zuper's webhook form calls these fields literally `key`
+and `value`; there is no separate secret field.
+
+`GET /webhooks/zuper` answers a liveness probe, which is what Zuper's "test URL"
+check uses.
 
 ### Migrations
 

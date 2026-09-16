@@ -301,12 +301,30 @@ export async function processEvent(delivery: Delivery): Promise<SyncOneResult | 
   }
 }
 
-/** Replay stored deliveries that never completed — the sweep, and manual retries. */
+/**
+ * Replay stored deliveries that never completed — the interval in reconcile.ts,
+ * and manual retries.
+ *
+ * Capped by attempts on purpose: a delivery that can never succeed (its record
+ * was deleted in Zuper, or it names an entity we cannot fetch by uid) would
+ * otherwise be retried on every pass forever, against a rate-limited API. Past
+ * the cap it stays in the log with its error, visible in the dashboard, and stops
+ * consuming budget.
+ */
 export async function processPending(limit = 50): Promise<{ attempted: number; ok: number; failed: number }> {
   const { data, error } = await db().schema("jms").from("zuper_webhook_events")
     .select("id, module, event, zuper_uid, work_order_number, body")
     .eq("tenant_id", config.tenantId)
+    // Only ever replay deliveries that PASSED verification.
+    //
+    // Without this the two halves combine into a hole: the receiver correctly
+    // refuses a delivery whose secret header did not match, storing it with
+    // verified = false and processed_at = null — and those are exactly the rows
+    // this query would otherwise select, so the replay loop would process a
+    // forged request minutes after the door was shut on it.
+    .eq("verified", true)
     .is("processed_at", null)
+    .lt("attempts", config.reconcile.replayMaxAttempts)
     .order("received_at", { ascending: true })
     .limit(limit);
   if (error) throw error;

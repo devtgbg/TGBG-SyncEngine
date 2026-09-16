@@ -109,8 +109,17 @@ receiver.post("/", async (req: Request, res: Response) => {
 
   // A mismatched secret is recorded but never acted on. Still a 200: arguing
   // with the sender achieves nothing and invites retries we don't want.
-  if (!v.verified && secretConfigured()) {
-    res.status(200).json({ ok: true, stored: eventId, processed: false });
+  //
+  // In production an UNSET secret is refused too. This endpoint is public, and
+  // processing means writing the live jms.* tables that four applications read —
+  // so with nothing to verify against, trusting every caller would hand anyone
+  // who finds the URL a write into the database. Locally it still processes, so
+  // development does not need a secret to be useful.
+  if (!v.verified && (secretConfigured() || config.isProduction)) {
+    res.status(200).json({
+      ok: true, stored: eventId, processed: false,
+      reason: secretConfigured() ? "unverified" : "no_secret_configured",
+    });
     return;
   }
 
