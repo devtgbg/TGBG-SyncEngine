@@ -128,6 +128,27 @@ Optional: `PORT` (3020), `ZUPER_API_URL`, `ZUPER_WEBHOOK_HEADER`
 (`x-zupersync-key`), `NODE_ENV` — the image already sets it to `production`, so
 do not override it with `development`.
 
+### Two Coolify settings that are not defaults
+
+**Build pack must be `dockerfile`.** A new application defaults to Nixpacks, which
+ignores the `Dockerfile` here and builds its own way — skipping the esbuild step.
+That step is load-bearing: `src/lib/` uses extensionless relative imports, which
+Node refuses under `"type": "module"`, so a Nixpacks image crash-loops on
+`ERR_MODULE_NOT_FOUND` and never becomes healthy. Set `ports_exposes` to 3020 too;
+the default is 3000.
+
+**Secrets should not be build variables.** Coolify passes every environment
+variable into the build as an `ARG`, so anything marked as a build variable is
+baked into image layers — Docker warns about this itself
+(`SecretsUsedInArgOrEnv`). Nothing here needs a secret at build time; untick the
+build-variable box for `SUPABASE_SERVICE_ROLE_KEY`, `ZUPER_API_KEY` and
+`ZUPER_WEBHOOK_SECRET`.
+
+That same injection is why the build stage runs `npm ci --include=dev`: with
+`NODE_ENV=production` exported into the build, a bare `npm ci` installs no
+devDependencies and the build dies with `sh: esbuild: not found`. It builds
+locally, where nothing exports `NODE_ENV`, and fails only on the platform.
+
 ### If the domain returns `404 page not found`
 
 That 18-byte body is Traefik's own 404, not this app's — the hostname has no

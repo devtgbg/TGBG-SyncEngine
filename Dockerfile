@@ -13,7 +13,14 @@
 FROM node:24-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci
+# --include=dev is NOT redundant. Deployment platforms inject the application's
+# environment into the build (Coolify passes every variable as a build ARG), so
+# NODE_ENV=production — which this service needs at RUNTIME, or the receiver
+# would process unverified deliveries — arrives here too and makes a bare
+# `npm ci` skip devDependencies. esbuild is a devDependency, so the next line
+# fails with "sh: esbuild: not found". It builds locally, where nothing exports
+# NODE_ENV, and fails only on the platform.
+RUN npm ci --include=dev
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
