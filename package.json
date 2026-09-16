@@ -12,7 +12,6 @@
     "build": "esbuild src/index.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/index.js",
     "start": "node dist/index.js",
     "typecheck": "tsc -p . --noEmit",
-    "sync": "tsx src/cli/run-sync.ts",
     "webhooks": "tsx src/cli/webhooks.ts",
     "build:check": "tsc -p . --noEmit",
     "check-routes": "tsx src/cli/check-routes.ts",
