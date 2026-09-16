@@ -70,6 +70,51 @@ export function identify(body: unknown): {
   };
 }
 
+/**
+ * Persist a delivery whose body could not be parsed.
+ *
+ * express.json() rejects malformed JSON and Express answers 400 before this
+ * router ever runs — which is the worst outcome available: Zuper retries a
+ * non-2XX three times, all three fail identically, and it then abandons the
+ * delivery. Nothing is stored, so there is no forensic record and nothing to
+ * replay, and the rolling-window sweep that would otherwise catch it is not
+ * built. The change is simply lost, silently.
+ *
+ * So an unparseable body is still stored, and still answered 200.
+ *
+ * It is recorded as TERMINAL (processed_at set, with the reason) rather than
+ * pending: it carries no uid, so it can never be routed, and leaving it pending
+ * would have the replay loop retry it five times for nothing.
+ *
+ * The header verdict is still meaningful here — headers parsed fine; only the
+ * body did not.
+ */
+export async function captureUnparseable(req: Request, err: Error & { type?: string }): Promise<string | null> {
+  const v = verify(req);
+  const raw = (req as Request & { rawBody?: Buffer }).rawBody;
+  try {
+    const { data, error } = await db().schema("jms").from("zuper_webhook_events").insert({
+      tenant_id: config.tenantId,
+      received_at: new Date().toISOString(),
+      verified: v.verified,
+      verify_reason: v.reason,
+      // Nothing can be identified from a body that would not parse.
+      module: null, event: null, zuper_uid: null, work_order_number: null,
+      headers: req.headers,
+      // body is JSONB, so the raw text is wrapped to stay valid JSON while
+      // preserving exactly what arrived.
+      body: { _unparsed: raw ? raw.toString("utf8").slice(0, 100_000) : null, _parse_error: err.type ?? err.name },
+      processed_at: new Date().toISOString(),
+      process_error: `unparseable body: ${err.message}`.slice(0, 400),
+    }).select("id").single();
+    if (error) throw error;
+    return (data as { id: string }).id;
+  } catch (e) {
+    console.warn("[zupersync] could not persist unparseable delivery:", e instanceof Error ? e.message : e);
+    return null;
+  }
+}
+
 /** Persist the delivery. Never throws — a logging failure must not cost us the ACK. */
 async function capture(
   req: Request, v: Verdict, ids: ReturnType<typeof identify>,

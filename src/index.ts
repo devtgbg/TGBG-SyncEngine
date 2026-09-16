@@ -26,6 +26,38 @@ app.use(express.json({
   verify: (req, _res, buf) => { (req as express.Request & { rawBody?: Buffer }).rawBody = buf; },
 }));
 
+/**
+ * A body express.json() could not parse must not become a 400.
+ *
+ * Zuper retries a non-2XX three times with exponential backoff and then gives
+ * up. A malformed or wrongly-typed body fails identically every time, so a 400
+ * spends all three retries and loses the delivery — and because the failure
+ * happens in the parser, the receiver never runs and nothing is stored, leaving
+ * no forensic record and nothing to replay.
+ *
+ * Store it and answer 200 instead. Only on the webhook path: elsewhere a 400 for
+ * malformed input is the right answer.
+ */
+app.use(async (err: Error & { type?: string; status?: number }, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const isBodyError = err?.type === "entity.parse.failed" || err?.type === "entity.too.large" || err?.type === "encoding.unsupported";
+  if (!isBodyError || !req.path.startsWith("/webhooks/")) return next(err);
+
+  console.warn(`[zupersync] unparseable delivery (${err.type}): ${err.message}`);
+
+  // Awaited, exactly like the normal path: storing is the whole point of not
+  // returning 400, and the ACK carrying the id is what makes the delivery
+  // findable in the log afterwards. capture never throws, but the import might,
+  // and a failure here must still not cost us the 200.
+  let stored: string | null = null;
+  try {
+    const { captureUnparseable } = await import("./receiver.js");
+    stored = await captureUnparseable(req, err);
+  } catch (e) {
+    console.warn("[zupersync] could not store unparseable delivery:", e instanceof Error ? e.message : e);
+  }
+  res.status(200).json({ ok: true, stored, processed: false, reason: err.type });
+});
+
 app.get("/health", async (_req, res) => {
   const database = await dbReachable();
   res.status(database.ok ? 200 : 503).json({
