@@ -2,10 +2,9 @@
 #
 # Build context is this directory (set Coolify's base directory to `dashboard`).
 #
-# SECURITY: this app authenticates nobody and renders stored webhook bodies,
-# which contain customer names, addresses and job details. Put authentication in
-# front of it — Coolify basic auth, an IP allowlist, or a private network — before
-# exposing it on a public hostname.
+# Every page is behind HTTP Basic sign-in (src/middleware.ts): set DASHBOARD_USER
+# and DASHBOARD_PASSWORD on the container, or it answers 503. /healthz is open and
+# returns no data.
 
 FROM node:24-alpine AS deps
 WORKDIR /app
@@ -38,4 +37,6 @@ ENV HOSTNAME=0.0.0.0
 EXPOSE 3021
 
 USER node
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD wget -qO- http://127.0.0.1:3021/healthz >/dev/null || exit 1
 CMD ["node", "server.js"]

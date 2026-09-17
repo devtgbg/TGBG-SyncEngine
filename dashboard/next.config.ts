@@ -14,7 +14,9 @@ const nextConfig: NextConfig = {
   outputFileTracingRoot: path.resolve(__dirname),
   // Emit a self-contained server for the Docker image: only the modules actually
   // imported, so the runtime stage needs no node_modules copy at all.
-  output: "standalone",
+  // NEXT_STANDALONE=0 skips it for a local production check on Windows, where the
+  // standalone copy step needs symlink rights.
+  output: process.env.NEXT_STANDALONE === "0" ? undefined : "standalone",
 };
 
 export default nextConfig;

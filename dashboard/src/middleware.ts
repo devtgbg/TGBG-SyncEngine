@@ -50,5 +50,9 @@ export function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: "/((?!_next/static|_next/image|favicon.ico).*)",
+  // /healthz stays open for Coolify's health check; it returns no data.
+  matcher: "/((?!_next/static|_next/image|favicon.ico|healthz).*)",
+  // Node, not Edge: the Edge build can fix process.env at build time, and the pair is
+  // only set on the running container - it would then refuse everyone with a 503.
+  runtime: "nodejs",
 };
