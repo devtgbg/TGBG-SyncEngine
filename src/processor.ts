@@ -36,7 +36,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { db } from "./supabase.js";
 import { config, errorText } from "./config.js";
 import { ENTITIES, getSyncConfig, zuperGet, type SyncConfig } from "./lib/migration/zuper-sync.js";
-import { detailPathFor, isSelfFetching, resolveRoute, type NoteHost } from "./routes.js";
+import { detailPathFor, isSelfFetching, resolveRoute, type NoteHost, type Route } from "./routes.js";
 
 /** Structurally identical to zuper-sync.ts's Ctx, which is not exported. */
 type Ctx = {
@@ -447,6 +447,25 @@ async function markDeleted(entityName: string, uid: string): Promise<SyncOneResu
   return { entity: entityName, uid, action: "deleted", id };
 }
 
+/** Whether our copy of a record exists and is already flagged deleted. */
+async function heldAsDeleted(entityName: string, uid: string): Promise<boolean> {
+  const e = ENTITIES[entityName];
+  if (!e) return false;
+  try {
+    const client = db();
+    const mapName = (e as any)?.mapEntity ?? entityName;
+    const { data } = await client.schema("jms").from("zuper_sync_map")
+      .select("jms_id").eq("tenant_id", config.tenantId).eq("entity", mapName).eq("zuper_uid", uid).maybeSingle();
+    const id = (data as any)?.jms_id as string | undefined;
+    if (!id) return false;
+    const { data: row } = await client.schema(e.schema).from(e.table)
+      .select("is_deleted").eq("id", id).eq("tenant_id", config.tenantId).maybeSingle();
+    return (row as any)?.is_deleted === true;
+  } catch {
+    return false;
+  }
+}
+
 export interface Delivery {
   id: string | null;
   module?: string | null;
@@ -482,6 +501,8 @@ export async function processEvent(delivery: Delivery): Promise<SyncOneResult | 
     }
   };
 
+  // The record this delivery is about, once known — for the 404 check below.
+  let target: { route: Route; uid: string } | null = null;
   try {
     const route = resolveRoute(delivery.module ?? "", delivery.event ?? "");
     if (!route) {
@@ -514,6 +535,7 @@ export async function processEvent(delivery: Delivery): Promise<SyncOneResult | 
       return { action: "skipped", reason };
     }
 
+    target = { route, uid };
     if (route.module === "JOB") await whenIdle(JOB_CREATE_LOCK);
     const result: SyncOneResult = route.noteHost
       ? await syncHostNotes(route.noteHost, uid, { deletion: route.deletion, noteUid: findUid(delivery.body, "note_uid") })
@@ -527,6 +549,18 @@ export async function processEvent(delivery: Delivery): Promise<SyncOneResult | 
     return result;
   } catch (err) {
     const msg = errorText(err);
+    // A late event for a record Zuper has deleted: Zuper sends assign/schedule events
+    // after job.delete, and the re-fetch 404s. When we already hold that record as
+    // deleted there is nothing left to do, so close the delivery rather than retry it
+    // up to the attempt cap. A 404 alone is not proof of deletion (Zuper lists some
+    // jobs whose detail 404s), so a record we hold as live keeps the normal path.
+    const t = target;
+    if (t && !t.route.noteHost && !t.route.deletion && / → 404$/.test(msg) && (await heldAsDeleted(t.route.entity, t.uid))) {
+      const reason = "skipped: deleted in Zuper (404) and already deleted here";
+      await finish({ processed_at: new Date().toISOString(), sync_entity: t.route.entity, process_error: reason });
+      console.log(`[zupersync] ${t.route.module}/${delivery.event} → ${t.route.entity} ${t.uid} ${reason}`);
+      return { action: "skipped", reason };
+    }
     console.warn(`[zupersync] processing failed for ${delivery.module}/${delivery.event}: ${msg}`);
     await finish({ process_error: msg.slice(0, 400) });
     throw err;
