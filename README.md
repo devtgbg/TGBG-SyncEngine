@@ -221,8 +221,9 @@ Verify over PostgREST afterwards and re-issue `NOTIFY pgrst, 'reload schema';`
 from a fresh session — the one at the end of the file does not reliably reach it.
 
 - `0001_zuper_webhook_events.sql` — the delivery inbox. **Applied.**
-- `0002_zuper_outbox.sql` — pushing changes back to Zuper. **Not applied**: it adds
-  a trigger to `jms.jobs`, which four applications write.
+- `0002_zuper_outbox.sql` — the push outbox, and triggers on `jms.jobs`,
+  `jms.job_assignments` and `jms.job_team_assignments`. Apply it only once the
+  deployed service sends `x-sync-origin` (it does from b474d84).
 
 ## Pushing back to Zuper
 
@@ -240,6 +241,36 @@ createClient(url, key, { global: { headers: { "x-sync-origin": "zupersync" } } }
 
 Writes over a direct Postgres connection have no request headers, read as `app`,
 and queue correctly.
+
+The triggers are `SECURITY DEFINER` and swallow their own errors (as a
+`WARNING`): queueing a push must never fail the save it describes.
+
+`src/pusher.ts` reads the outbox every 30 seconds and groups rows by job. The
+outbox says **which** columns changed; the values are read from the job as it is
+now, so several quick edits become one push of the latest state.
+
+| Tuper change | Zuper request |
+|---|---|
+| title, priority, type, due date, prefix, tags, description, addresses, customer, organization, asset | `PUT /api/jobs` `{ job: { job_uid, … } }` — only fields Zuper does not already hold |
+| schedule | `PUT /api/jobs/schedule` with `job_timezone` |
+| status | `PUT /api/jobs/{uid}/status` with `status_uid` (+ the history row's remarks) — skipped when Zuper already shows it, because every call adds a history entry |
+| assignees | `POST /api/jobs/assign` — the difference only; unassign uses the team the user is under in Zuper |
+| deleted | `DELETE /api/jobs/{uid}/delete` — only with `PUSH_DELETES=true` |
+| a job Zuper has never had | `POST /api/jobs`, then a follow-up for status and people. Zuper assigns its own work order number, which then replaces Tuper's |
+
+Everything else (delay flag, actual times, recurrence, skills, …) is recorded on
+the row as *not pushed*, with the reason.
+
+**Modes** (`PUSH_MODE`): `dry-run` is the default — each change is planned and
+the requests are stored on the row (`planned`), nothing is sent. `live` sends
+them, then reads the job back; a 200 that did not change anything fails the row.
+Writes are never retried blindly: a failed row waits (2, 4, 8 … minutes) and is
+re-planned against Zuper's current state first.
+
+```bash
+npm run outbox            # what is queued, planned and sent
+npm run outbox -- --plan  # plan what is queued now, send nothing
+```
 
 ## Where the engine came from
 

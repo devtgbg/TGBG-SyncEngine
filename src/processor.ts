@@ -48,11 +48,20 @@ type Ctx = {
 };
 
 const UID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Zuper's older records are keyed by 24-hex object ids (checklist entries, attachments). */
+const OBJECT_ID_RE = /^[0-9a-f]{24}$/i;
 
-/** Every uid-shaped string anywhere in the record, however deeply nested. */
+/**
+ * Every string anywhere in the record that the sync map could be keyed by:
+ * uids, object ids, and attachment links (an attachment with neither id is
+ * mapped by its URL).
+ */
 function collectUids(value: unknown, found = new Set<string>(), depth = 0): Set<string> {
   if (depth > 8 || found.size > 400) return found;
-  if (typeof value === "string") { if (UID_RE.test(value)) found.add(value); return found; }
+  if (typeof value === "string") {
+    if (UID_RE.test(value) || OBJECT_ID_RE.test(value) || (value.startsWith("https://") && value.length <= 1024)) found.add(value);
+    return found;
+  }
   if (Array.isArray(value)) { for (const v of value) collectUids(v, found, depth + 1); return found; }
   if (value && typeof value === "object") { for (const v of Object.values(value)) collectUids(v, found, depth + 1); }
   return found;
@@ -67,20 +76,38 @@ function collectUids(value: unknown, found = new Set<string>(), depth = 0): Set<
  * manufacture duplicate customers and organizations. Querying first means an
  * empty result is the truth.
  */
-async function seedMaps(ctx: Ctx, record: unknown, extraUids: string[] = []): Promise<void> {
+async function seedMaps(ctx: Ctx, record: unknown, extraUids: string[] = [], preseedComplete = true): Promise<void> {
   const uids = [...collectUids(record)];
   for (const u of extraUids) if (u) uids.push(u);
   if (!uids.length) return;
 
-  const { data, error } = await ctx.client
-    .schema("jms").from("zuper_sync_map")
-    .select("entity, zuper_uid, jms_id")
-    .eq("tenant_id", ctx.tenantId)
-    .in("zuper_uid", [...new Set(uids)]);
-  if (error) throw error;
+  // In chunks bounded by length as well as count: links are long, and the list
+  // travels in the request URL.
+  const keys = [...new Set(uids)];
+  for (let i = 0; i < keys.length;) {
+    const chunk: string[] = [];
+    let len = 0;
+    while (i < keys.length && chunk.length < 100 && len + keys[i].length < 3500) { len += keys[i].length + 3; chunk.push(keys[i++]); }
+    if (!chunk.length) { i++; continue; }   // a single key too long to send is simply not pre-seeded
+    const { data, error } = await ctx.client
+      .schema("jms").from("zuper_sync_map")
+      .select("entity, zuper_uid, jms_id")
+      .eq("tenant_id", ctx.tenantId)
+      .in("zuper_uid", chunk);
+    if (error) throw error;
+    for (const row of (data ?? []) as { entity: string; zuper_uid: string; jms_id: string }[]) {
+      (ctx.maps[row.entity] ??= new Map()).set(row.zuper_uid, row.jms_id);
+    }
+  }
 
-  for (const row of (data ?? []) as { entity: string; zuper_uid: string; jms_id: string }[]) {
-    (ctx.maps[row.entity] ??= new Map()).set(row.zuper_uid, row.jms_id);
+  // Two maps are too big to load whole — files (361k rows) and checklist
+  // responses (36k) — and loading them is what made one note or one job take
+  // most of a minute. Their keys are always ids or links carried in the record
+  // itself, all of which were looked up above, so an absent key really is new.
+  // (Attachments are also matched by link before insert, so a miss cannot
+  // duplicate a file.) Every other map stays lazy, per the note above.
+  if (preseedComplete) {
+    for (const entity of ["files", "checklist_responses"]) ctx.maps[entity] ??= new Map();
   }
 }
 
@@ -117,7 +144,11 @@ export interface SyncOneResult {
 export async function syncOne(
   entityName: string,
   uid: string,
-  opts: { raw?: any; detail?: ((uid: string) => string) | null; selfFetching?: boolean; client?: SupabaseClient; tenantId?: string } = {},
+  opts: {
+    raw?: any; detail?: ((uid: string) => string) | null; selfFetching?: boolean; client?: SupabaseClient; tenantId?: string;
+    /** For a self-fetching entity: the full record, so the maps are seeded from it rather than from a uid stub. */
+    seed?: any;
+  } = {},
 ): Promise<SyncOneResult> {
   const e = ENTITIES[entityName];
   if (!e) throw new Error(`unknown entity ${entityName}`);
@@ -150,7 +181,12 @@ export async function syncOne(
   const uidKey = Object.keys(r).find((k) => k.endsWith("_uid") && r[k] === uid);
   if (!uidKey) r = { ...r, ...stubUidFields(entityName, uid) };
 
-  await seedMaps(ctx, r, [uid]);
+  // A self-fetching entity only has a uid stub here; the record it will fetch
+  // names other ids (parent job, assets, statuses), so seed from the full record
+  // when the caller has it. Without one, the big maps stay lazy: the stub cannot
+  // vouch for the keys the transform will look up.
+  if (opts.seed) await seedMaps(ctx, opts.seed, [uid]);
+  await seedMaps(ctx, r, [uid], !opts.selfFetching || !!opts.seed);
 
   const mapName = (e as any).mapEntity ?? entityName;
   const map = (ctx.maps[mapName] ??= new Map());
@@ -243,6 +279,18 @@ export function oneAtATime<T>(key: string, fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
+/** Resolves once nothing is queued under `key`. */
+export async function whenIdle(key: string): Promise<void> {
+  await (chains.get(key) ?? Promise.resolve()).catch(() => undefined);
+}
+
+/**
+ * Held by the pusher while it creates a job in Zuper and maps the new uid to the
+ * Tuper row. Job events wait for it, so the webhook Zuper fires for that new job
+ * finds it mapped instead of importing it a second time.
+ */
+export const JOB_CREATE_LOCK = "push:job-create";
+
 /**
  * Write a record, then run its second pass if it has one (job_details, for jobs).
  * The result names the first entity, whose create/update is what happened.
@@ -251,12 +299,19 @@ export async function syncRecord(
   entity: string, uid: string, opts: { enrich?: string; detail?: ((uid: string) => string) | null; selfFetching?: boolean } = {},
 ): Promise<SyncOneResult> {
   return oneAtATime(uid, async () => {
-    const result = await syncOne(entity, uid, {
-      detail: opts.detail ?? detailPathFor(entity),
-      selfFetching: opts.selfFetching ?? isSelfFetching(entity),
-    });
+    const selfFetching = opts.selfFetching ?? isSelfFetching(entity);
+    const detail = opts.detail ?? detailPathFor(entity);
+    // Read the record once: the first pass writes from it, and the second pass
+    // (which fetches for itself) seeds its id maps from it.
+    let raw: any;
+    if (detail && !selfFetching) {
+      const cfg = await getSyncConfig(db(), config.tenantId);
+      raw = (await zuperGet(cfg, detail(uid)))?.data ?? null;
+      if (!raw) throw new Error(`Zuper returned no record for ${entity} ${uid}`);
+    }
+    const result = await syncOne(entity, uid, raw ? { raw } : { detail, selfFetching });
     if (opts.enrich) {
-      await syncOne(opts.enrich, uid, { detail: detailPathFor(opts.enrich), selfFetching: isSelfFetching(opts.enrich) });
+      await syncOne(opts.enrich, uid, { detail: detailPathFor(opts.enrich), selfFetching: isSelfFetching(opts.enrich), seed: raw });
     }
     return result;
   });
@@ -449,6 +504,7 @@ export async function processEvent(delivery: Delivery): Promise<SyncOneResult | 
       return { action: "skipped", reason };
     }
 
+    if (route.module === "JOB") await whenIdle(JOB_CREATE_LOCK);
     const result: SyncOneResult = route.noteHost
       ? await syncHostNotes(route.noteHost, uid, { deletion: route.deletion, noteUid: findUid(delivery.body, "note_uid") })
       : route.deletion

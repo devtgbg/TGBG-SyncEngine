@@ -16,6 +16,14 @@ function required(name: string): string {
   return v.trim();
 }
 
+/** PUSH_MODE, refusing anything unrecognised rather than guessing towards `live`. */
+function pushMode(v: string): "off" | "dry-run" | "live" {
+  const m = v.trim().toLowerCase();
+  if (m === "off" || m === "dry-run" || m === "live") return m;
+  console.warn(`[zupersync] PUSH_MODE="${v}" is not off, dry-run or live — using dry-run`);
+  return "dry-run";
+}
+
 function optional(name: string, fallback: string): string {
   const v = process.env[name];
   return v && v.trim() ? v.trim() : fallback;
@@ -106,6 +114,25 @@ export const config = {
    * live webhook re-fetches compete for the same budget. A safety net that
    * throttles real-time sync to repair hypothetical gaps is worse than the gap.
    */
+  /**
+   * Pushing changes made in Tuper to Zuper (src/pusher.ts, migrations/0002).
+   *
+   * dry-run is the default: changes are planned and stored on the outbox row,
+   * nothing is sent. `live` sends them. Deleting a job in Zuper is a separate
+   * switch because it cannot be undone there.
+   */
+  push: {
+    mode: pushMode(optional("PUSH_MODE", "dry-run")),
+    everySeconds: Math.max(10, Number(optional("PUSH_EVERY_SECONDS", "30"))),
+    batch: Math.max(1, Number(optional("PUSH_BATCH", "20"))),
+    maxAttempts: Math.max(1, Number(optional("PUSH_MAX_ATTEMPTS", "5"))),
+    // A new job arrives in several writes (row, assignees, teams, line items).
+    createDelaySeconds: Math.max(0, Number(optional("PUSH_CREATE_DELAY_SECONDS", "90"))),
+    deletes: optional("PUSH_DELETES", "false") === "true",
+    // The company's zone (Tuper: Settings › Company). Zuper applies it to schedules.
+    timeZone: optional("PUSH_TIMEZONE", "Asia/Dubai"),
+  },
+
   sweep: {
     enabled: optional("SWEEP_ENABLED", "true") !== "false",
     everyMinutes: Math.max(5, Number(optional("SWEEP_EVERY_MINUTES", "30"))),
