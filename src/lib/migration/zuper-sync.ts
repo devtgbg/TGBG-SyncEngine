@@ -122,7 +122,7 @@ async function* zuperListPages(cfg: SyncConfig, path: string, pageSize = 100): A
 
 // ── Map + run helpers ──
 export type Ctx = { client: SupabaseClient; tenantId: string; cfg: SyncConfig; maps: Record<string, Map<string, string>>; extra: Record<string, any> };
-async function loadMap(client: SupabaseClient, tenantId: string, entity: string): Promise<Map<string, string>> {
+export async function loadMap(client: SupabaseClient, tenantId: string, entity: string): Promise<Map<string, string>> {
   const m = new Map<string, string>();
   for (let from = 0; ; from += 1000) {
     const { data } = await client.schema("jms").from("zuper_sync_map").select("zuper_uid, jms_id").eq("tenant_id", tenantId).eq("entity", entity).range(from, from + 999);
@@ -798,6 +798,45 @@ export const ENTITIES: Record<string, Entity> = {
         const { error } = await ctx.client.schema("jms").from("job_statuses").update({ parent_status_ids: [...new Set(parents)] }).eq("id", id).eq("tenant_id", ctx.tenantId);
         if (error) throw error;
       }
+    },
+  },
+  // Job cards (Settings → Job Cards): the printed report a job's Print/Share offers. The list carries only names, so
+  // each is read again for its `template` — the Handlebars a card is written in, which Tuper renders with the same
+  // helpers. `associated_to` names every category whose jobs may print it (00109).
+  job_card_templates: {
+    name: "job_card_templates", schema: "jms", table: "job_card_templates",
+    deps: ["job_categories"],
+    // One plain GET returns every card (there is no paging on this list), then each is read for its template body.
+    async fetch(ctx) {
+      const list: any[] = (await zuperGet(ctx.cfg, "/api/jobs/template")).data ?? [];
+      const out: any[] = [];
+      for (const r of list) out.push({ ...r, ...((await zuperGet(ctx.cfg, `/api/jobs/template/${r.template_uid}`)).data ?? {}) });
+      return out;
+    },
+    uid: (r) => r.template_uid,
+    async transform(r, ctx) {
+      if (r.is_deleted === true) return null;
+      const cats = await ctxMap(ctx, "job_categories");
+      const catUid = (v: any) => (v && typeof v === "object" ? T(v.category_uid) : T(v));
+      const associated = [...new Set(((r.associated_to ?? []) as any[]).map(catUid).filter(Boolean) as string[])]
+        .map((uid) => mapGet(cats, uid)).filter((id): id is string => !!id);
+      const primary = mapGet(cats, catUid(r.job_category));
+      const opts = r.template_options ?? {};
+      const border = opts.border ?? {};
+      const side = (v: unknown) => String(v ?? "0");
+      return {
+        name: S(r.template_name) ?? "Job Card",
+        description: S(r.template_description),
+        is_active: true,                                   // Zuper has no on/off for a card: a deleted one is gone
+        job_category_id: primary ?? associated[0] ?? null,
+        associated_category_ids: associated.length ? associated : primary ? [primary] : [],
+        content: {
+          html: String(r.template ?? ""),
+          format: String(opts.format ?? "A4"),
+          orientation: String(opts.orientation ?? "portrait"),
+          borders: { top: side(border.top), right: side(border.right), bottom: side(border.bottom), left: side(border.left) },
+        },
+      };
     },
   },
   // Job Notifications (Job Settings → Job Notifications): reminders, delay alerts and status alerts for staff, and
