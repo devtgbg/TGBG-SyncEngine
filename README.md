@@ -38,17 +38,30 @@ documents no verification scheme for it, so the header is the usable mechanism.
 
 ### Routing
 
-`src/routes.ts` holds the full catalogue: 11 modules, 192 events, 117 routed.
+`src/routes.ts` holds Zuper's whole event catalogue: **12 modules, 203 events** —
+93 synced (15 of them deletions), 110 stored with a reason and skipped.
 
-Zuper's webhook **form labels are not its wire names**, and assuming otherwise
-breaks routing silently. The form says module "Quotes"; the wire says `ESTIMATES`.
-Organizations are `PROPERTY`. Events are lowercase dotted (`estimate.delete`, not
-"Quote Delete"). Only one module of nine matches as-is.
+The catalogue is Zuper's own, not transcribed from its UI. `GET
+/api/misc/{MODULE}/events` — the call Zuper's New Webhook form makes when a module
+is picked — returns every event's wire key and display name for `JOB`,
+`CUSTOMER`, `ORGANIZATION`, `PROPERTY`, `TIMESHEET`, `PRODUCTS`, `ESTIMATES`,
+`INVOICE`, `SERVICE_CONTRACTS`, `ASSETS`, `USER` and `REQUEST`. A copy lives in
+`src/cli/fixtures/zuper-events.json`.
 
-38 of Zuper's 73 live event names aren't in the catalogue by name at all, so an
-uncatalogued event on a *known* module falls back to re-syncing the record rather
-than being dropped — which is the right default when a webhook only means
-"something about this record changed".
+Things that break routing silently if assumed otherwise:
+
+- **A delivery carries the wire key** (`estimate.delete`), not the form label
+  ("Quote Delete"), and no module field at all. Routing is keyed by wire key.
+- **The key's prefix is not always its module**: `measurement.*` is `JOB`,
+  `inspection_form.*` is `ASSETS`, `timesheet_approval.*` is `TIMESHEET`,
+  `import.organization` is `ORGANIZATION`. Every known key is looked up exactly;
+  the prefix is only a fallback for events Zuper adds later.
+- **`PROPERTY` is not organizations.** They are separate Zuper records (1,008
+  organizations, one property here), and `GET /api/organization/{property_uid}`
+  answers 404. Properties have no importer, so their events are skipped.
+- **Every job change runs `jobs`, then `job_details`.** `job_details` never writes
+  the schedule, title, priority or addresses. Running it alone left 69 of 73
+  rescheduled jobs on their old times while the log said "applied".
 
 Entities Zuper offers no by-uid read for (notes, timesheets, timelogs) are
 **refused, not stubbed**. Handing a bare uid to a transform written for a full
@@ -80,12 +93,13 @@ npm run simulate -- --send --bad-secret                # prove refusal works
 |---|---|
 | `npm run check-db` | every table readable, write permitted |
 | `npm run check-routes` | every routed event points at a real sync entity |
-| `npm run check-wire-routes` | all 73 of Zuper's real wire strings route; 8/8 deletions exact |
+| `npm run check-wire-routes` | all 203 of Zuper's events route by wire key; 15/15 deletions exact |
 | `npm run check-real-payload` | a REAL Zuper body — flat, no module field — still routes |
 | `npm run check-checklist-import` | what the Zuper checklist import preserves |
 
 `check-wire-routes` exists because `check-routes` validates the catalogue against
-itself — the blind spot that hid three live routing bugs.
+itself — the blind spot that hid a label-keyed catalogue whose rules never matched
+real traffic.
 
 ## The dashboard
 

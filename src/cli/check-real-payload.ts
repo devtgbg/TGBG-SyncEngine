@@ -20,8 +20,9 @@
  * real delivery would have been stored and never processed. Nothing would have
  * errored; it would simply have looked like the sync not working.
  *
- * Zuper's events are "<module>.<verb>" on the wire, so the prefix is the module.
- * These assertions pin that down.
+ * Routing therefore works from the event key alone. Every catalogued key is
+ * looked up exactly (check-wire-routes covers all 203); these assertions pin the
+ * no-module case down for one key per syncing module.
  *
  * Pure: routes.ts needs no environment, so this runs anywhere. Identifiers below
  * are placeholders — no customer data belongs in the repository.
@@ -61,16 +62,18 @@ ok("a real Zuper body carries NO module field",
 // The load-bearing case: no module, only an event.
 const r = resolveRoute("", String(REAL_JOB_PAYLOAD.event));
 ok("routes with an EMPTY module, from the event prefix alone", r !== null);
-ok("…to the jobs path", r?.entity === "job_details" && r?.createEntity === "jobs");
+// jobs writes the schedule; job_details alone never did (69 of 73 reschedules lost).
+ok("…to the full job import, then its enrichment", r?.entity === "jobs" && r?.enrich === "job_details");
 ok("…and looks for job_uid", (r?.uidFields ?? []).includes("job_uid"));
 ok("…and is not treated as a deletion", r?.deletion === false);
 
-// Every live module's prefix must resolve with no module supplied.
+// One key per syncing module must resolve with no module supplied.
 const PREFIXES: [string, string][] = [
-  ["job.update", "job_details"],
+  ["job.update", "jobs"],
   ["customer.create", "customers"],
-  ["property.new", "organizations"],      // Zuper calls organizations PROPERTY
-  ["estimate.delete", "estimates"],       // …and quotes ESTIMATES
+  ["organization.new", "organizations"],
+  ["estimate.delete", "estimates"],       // quotes are ESTIMATES on the wire
+  ["product.update", "products"],
   ["invoice.payment", "invoices"],
   ["asset.activate", "assets"],
   ["user.update", "users"],
@@ -83,7 +86,10 @@ for (const [event, entity] of PREFIXES) {
 }
 
 // A module that is present must still win, and nonsense must still be refused.
-ok("an explicit module still takes precedence", resolveRoute("JOB", "job.update")?.entity === "job_details");
+ok("an explicit module gives the same answer", resolveRoute("JOB", "job.update")?.entity === "jobs");
+// Properties are their own Zuper module, not organizations — and have no importer.
+const prop = resolveRoute("", "property.new");
+ok('"property.new" is skipped, not sent to organizations', prop?.entity !== "organizations" && !!prop?.skip);
 ok("an unknown event with no module is still refused", resolveRoute("", "nonsense.thing") === null);
 ok("an empty event with no module is refused", resolveRoute("", "") === null);
 

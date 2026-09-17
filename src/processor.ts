@@ -160,6 +160,12 @@ export async function syncOne(
   const payload = await e.transform(r, ctx);
   if (!payload) throw new Error(`${entityName} ${uid}: transform produced nothing`);
 
+  // Transforms write is_deleted but not deleted_at, while markDeleted stamps both.
+  // Without this a recovered record (estimate.recover, asset.recover, user.recover)
+  // would come back live yet still carry the date it was deleted. Only when the
+  // transform itself wrote is_deleted: every table that has it has deleted_at too.
+  if ((payload as any).is_deleted === false && !("deleted_at" in payload)) (payload as any).deleted_at = null;
+
   let id = map.get(rowUid) ?? null;
   const isNew = !id;
 
@@ -216,6 +222,46 @@ export async function syncOne(
   return { entity: entityName, uid: rowUid, action: isNew ? "created" : "updated", id };
 }
 
+/**
+ * One record at a time.
+ *
+ * Deliveries are processed as soon as they are acknowledged, and Zuper sends
+ * several for one change (a job completed fires a status update, a checklist
+ * update and a timelog within a second). The job writers clear a job's
+ * assignments, teams and status history and insert them again, so two rebuilds
+ * of the same job running at once can interleave. Chaining per uid makes the
+ * later delivery wait for the earlier one; it then re-reads Zuper and writes the
+ * newer state. One process serves the webhooks, so an in-memory chain suffices.
+ */
+const chains = new Map<string, Promise<unknown>>();
+export function oneAtATime<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prior = chains.get(key) ?? Promise.resolve();
+  const run = prior.catch(() => undefined).then(fn);
+  const tail = run.catch(() => undefined);
+  chains.set(key, tail);
+  void tail.then(() => { if (chains.get(key) === tail) chains.delete(key); });
+  return run;
+}
+
+/**
+ * Write a record, then run its second pass if it has one (job_details, for jobs).
+ * The result names the first entity, whose create/update is what happened.
+ */
+export async function syncRecord(
+  entity: string, uid: string, opts: { enrich?: string; detail?: ((uid: string) => string) | null; selfFetching?: boolean } = {},
+): Promise<SyncOneResult> {
+  return oneAtATime(uid, async () => {
+    const result = await syncOne(entity, uid, {
+      detail: opts.detail ?? detailPathFor(entity),
+      selfFetching: opts.selfFetching ?? isSelfFetching(entity),
+    });
+    if (opts.enrich) {
+      await syncOne(opts.enrich, uid, { detail: detailPathFor(opts.enrich), selfFetching: isSelfFetching(opts.enrich) });
+    }
+    return result;
+  });
+}
+
 /** Give a stub record the uid field its entity reads. */
 function stubUidFields(entityName: string, uid: string): Record<string, string> {
   const byEntity: Record<string, string> = {
@@ -241,7 +287,9 @@ async function markDeleted(entityName: string, uid: string): Promise<SyncOneResu
   if (!id) return { entity: entityName, uid, action: "skipped", id: null };
 
   const { error } = await client.schema(e.schema).from(e.table)
-    .update({ is_deleted: true }).eq("id", id).eq("tenant_id", tenantId);
+    // Only a live row is stamped, so a repeated delivery keeps the first deletion time.
+    .update({ is_deleted: true, deleted_at: new Date().toISOString() })
+    .eq("id", id).eq("tenant_id", tenantId).eq("is_deleted", false);
   if (error) throw error;
   return { entity: entityName, uid, action: "deleted", id };
 }
@@ -293,33 +341,22 @@ export async function processEvent(delivery: Delivery): Promise<SyncOneResult | 
       return { action: "skipped", reason: route.skip };
     }
 
-    const uid = delivery.uid || route.uidFields.map((f) => findUid(delivery.body, f)).find(Boolean) || null;
+    // The route's own fields come first. delivery.uid is the receiver's generic
+    // guess, which for a note deletion is the HOST's uid (job_uid), not note_uid —
+    // and flagging by that would miss, or worse, hit a different record.
+    const uid = route.uidFields.map((f) => findUid(delivery.body, f)).find(Boolean) || delivery.uid || null;
     if (!uid) {
       const reason = `none of ${route.uidFields.join(", ")} found in the delivered body`;
       await finish({ processed_at: new Date().toISOString(), sync_entity: route.entity, process_error: reason });
       return { action: "skipped", reason };
     }
 
-    let result: SyncOneResult;
-    if (route.deletion) {
-      result = await markDeleted(route.entity, uid);
-    } else {
-      try {
-        result = await syncOne(route.entity, uid, { detail: route.detail, selfFetching: route.fetch === "self" });
-      } catch (err) {
-        // enrichOnly entities refuse a record they have never imported — that is
-        // exactly what a "New …" webhook is, so fall back to the create entity.
-        const msg = err instanceof Error ? err.message : String(err);
-        if (route.createEntity && /is not imported yet/.test(msg)) {
-          const detail = detailPathFor(route.createEntity);
-          await syncOne(route.createEntity, uid, { detail, selfFetching: isSelfFetching(route.createEntity) });
-          result = await syncOne(route.entity, uid, { detail: route.detail, selfFetching: route.fetch === "self" });
-        } else throw err;
-      }
-    }
+    const result: SyncOneResult = route.deletion
+      ? await oneAtATime(uid, () => markDeleted(route.entity, uid))
+      : await syncRecord(route.entity, uid, { enrich: route.enrich, detail: route.detail, selfFetching: route.fetch === "self" });
 
     await finish({ processed_at: new Date().toISOString(), process_error: null, sync_entity: result.entity });
-    console.log(`[zupersync] ${delivery.module}/${delivery.event} → ${result.entity} ${result.action} ${result.id ?? ""}`.trim());
+    console.log(`[zupersync] ${route.module}/${delivery.event} → ${result.entity} ${result.action} ${result.id ?? ""}`.trim());
     return result;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

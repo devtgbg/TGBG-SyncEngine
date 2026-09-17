@@ -22,6 +22,7 @@ import { Router, type Request, type Response } from "express";
 import { timingSafeEqual } from "node:crypto";
 import { config, secretConfigured } from "./config.js";
 import { db } from "./supabase.js";
+import { resolveRoute } from "./routes.js";
 
 export const receiver = Router();
 
@@ -51,21 +52,23 @@ export function identify(body: unknown): {
     (vals.find((v) => typeof v === "string" && v.length > 0) as string | undefined) ?? null;
   const eventName = pick(b.webhook_event, b.event, b.event_type, b.action, b.trigger);
   // A real Zuper body has no module field at all (confirmed from webhook
-  // history). Its events are "<module>.<verb>", so fall back to the prefix —
-  // otherwise every stored row shows module "—" and the log is unreadable.
-  // Routing has the same fallback; this keeps the record honest too.
-  const fromEvent = eventName && eventName.includes(".") ? eventName.split(".")[0] : null;
+  // history), so the log would read module "—" throughout. Take the module
+  // routing assigns: the key's prefix is not always it (measurement.* is JOB,
+  // inspection_form.* is ASSETS), and routing knows every catalogued key.
+  const fromEvent = eventName
+    ? resolveRoute("", eventName)?.module ?? (eventName.includes(".") ? eventName.split(".")[0] : null)
+    : null;
 
   return {
     module: pick(b.webhook_module, b.module, b.entity, b.object_type, b.type) ?? fromEvent,
     event: eventName,
-    // Every uid Zuper's nine live webhook modules can carry. Missing one only
+    // Every uid Zuper's webhook modules can carry. Missing one only
     // costs the stored row its zuper_uid (processEvent re-scans the body against
     // the route's own uidFields), but that column is what the log is read by.
     uid: pick(
       d.job_uid, b.job_uid, d.customer_uid, b.customer_uid, d.asset_uid, b.asset_uid,
       d.request_uid, b.request_uid, d.user_uid, b.user_uid,
-      // Zuper calls organizations "PROPERTY" on the wire, so both spellings appear.
+      // Organizations and properties are separate Zuper modules with their own uids.
       d.organization_uid, b.organization_uid, d.property_uid, b.property_uid,
       d.estimate_uid, b.estimate_uid, d.invoice_uid, b.invoice_uid,
       // Service contracts identify by contract_uid in Zuper's own API.

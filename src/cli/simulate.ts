@@ -45,13 +45,13 @@ async function main() {
   console.log(`event  : ${eventName}`);
   if (!route) { console.log("route  : NONE — this module is not recognised"); process.exit(1); }
 
-  console.log(`route  : ${route.entity}${route.createEntity ? ` (creates via ${route.createEntity})` : ""}`);
+  console.log(`route  : ${route.entity}${route.enrich ? ` then ${route.enrich}` : ""}`);
   console.log(`fetch  : ${route.fetch}${route.deletion ? " + deletion" : ""}`);
   console.log(`uid in : ${route.uidFields.join(" or ")}`);
   if (route.skip) console.log(`skip   : ${route.skip}`);
 
-  const mapEntity = route.createEntity ?? route.entity;
-  const uid = opt("uid") ?? (await sampleUid(mapEntity === "job_details" ? "jobs" : mapEntity));
+  const mapEntity = route.entity;
+  const uid = opt("uid") ?? (await sampleUid(mapEntity));
   if (!uid) { console.log(`\nno uid: pass --uid, or import some ${mapEntity} first`); process.exit(1); }
   console.log(`uid    : ${uid}`);
 

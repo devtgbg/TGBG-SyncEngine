@@ -6,7 +6,7 @@
  * routes.ts names 18 sync entities as plain strings. TypeScript cannot check them
  * — ENTITIES is a Record<string, Entity>, so a typo compiles perfectly and fails
  * only when that particular webhook fires, in production, at whatever hour Zuper
- * chooses. This runs the whole 184-event catalogue through resolveRoute() and
+ * chooses. This runs Zuper's whole event catalogue through resolveRoute() and
  * asserts each result resolves.
  *
  * Deliberately imports nothing that needs env vars, so it runs anywhere.
@@ -27,7 +27,7 @@ for (const module of MODULE_NAMES) {
     if (!r) { bad.push(`${module}/${event}: resolveRoute returned null for a catalogued event`); continue; }
     if (r.skip) { skipped++; continue; }
     if (!registry.has(r.entity)) { bad.push(`${module}/${event} → "${r.entity}" is not in ENTITIES`); continue; }
-    if (r.createEntity && !registry.has(r.createEntity)) { bad.push(`${module}/${event} → createEntity "${r.createEntity}" is not in ENTITIES`); continue; }
+    if (r.enrich && !registry.has(r.enrich)) { bad.push(`${module}/${event} → enrich "${r.enrich}" is not in ENTITIES`); continue; }
     routed++;
     byEntity.set(r.entity, (byEntity.get(r.entity) ?? 0) + 1);
   }

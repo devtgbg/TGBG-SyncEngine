@@ -23,12 +23,15 @@
  *  3. NEVER TRANSFORM A LIST ROW. The list omits `organization`, `skills`,
  *     `parent_job` and the descriptions, and jobs.transform writes `job_skills`
  *     and `organization_id` unconditionally — so transforming a list row blanks
- *     real skills and unsets the organisation. Drifted jobs are re-fetched
- *     through job_details, which reads the full record.
+ *     real skills and unsets the organisation. Drifted jobs are re-fetched by
+ *     uid (GET /api/jobs/{uid}, the full record) and then enriched.
  *
- *  4. NOT EVERY JOB IS MAPPED. Zuper reports more jobs than zuper_sync_map holds
- *     (46,807 vs 46,756). job_details is enrichOnly and throws for an unmapped
- *     uid, so those fall back to `jobs` first — the same chain processEvent uses.
+ *  4. job_details ALONE IS NOT A RE-SYNC. It never writes the schedule, title,
+ *     priority or addresses — only `jobs` does. This sweep once ran job_details
+ *     alone and refreshed synced_at, so a rescheduled job read as current while
+ *     keeping its old times. Every job goes through `jobs` then `job_details`,
+ *     the same chain processEvent uses, which also imports an unmapped one
+ *     (Zuper reports 46,807 jobs; zuper_sync_map held 46,756).
  *
  * Rate limit on this account is 150/min (x-rate-limit), well under the 200-700
  * the docs advertise, and live webhook re-fetches are competing for it. The
@@ -39,7 +42,8 @@
  * WHAT ACTUALLY CONSTRAINS THIS, measured rather than assumed.
  *
  * Not Zuper's rate limit. A capped run of 25 re-syncs took 1,192s — about 48s
- * each — while making only ~53 counted requests. At 45 req/min the pacer would
+ * each — while making only ~53 counted requests (measured with job_details
+ * alone; each job now also runs `jobs`). At 45 req/min the pacer would
  * have allowed roughly 900 in that time, so it never bound. The cost is per-job
  * processing: job_details' afterWrite rebuilds assignments, status history,
  * custom fields, teams and tags, which is many Supabase round-trips per job.
@@ -57,8 +61,7 @@
 import { config } from "./config.js";
 import { db } from "./supabase.js";
 import { getSyncConfig, zuperGet } from "./lib/migration/zuper-sync.js";
-import { syncOne } from "./processor.js";
-import { detailPathFor, isSelfFetching } from "./routes.js";
+import { syncRecord } from "./processor.js";
 
 export interface SweepResult {
   window: { from: string; to: string };
@@ -91,12 +94,17 @@ function pacer(perMinute: number) {
  *
  * `dryRun` reports what it would do without writing anything — the same default
  * stance as the simulate CLI, because this writes rows four applications read.
+ *
+ * `force` re-syncs every job in the window, drifted or not. It exists for when
+ * synced_at itself cannot be trusted: jobs synced by job_details alone had it
+ * refreshed without their schedule being written, so they read as current.
  */
 export async function sweepJobs(opts: {
   minutesBack?: number;
   maxResyncs?: number;
   perMinute?: number;
   dryRun?: boolean;
+  force?: boolean;
 } = {}): Promise<SweepResult> {
   const minutesBack = opts.minutesBack ?? config.sweep.minutesBack;
   const maxResyncs = opts.maxResyncs ?? config.sweep.maxResyncs;
@@ -143,7 +151,7 @@ export async function sweepJobs(opts: {
       const syncedAt = seen.get(uid);
       if (syncedAt === undefined) { result.unmapped++; todo.push({ uid, mapped: false }); }
       // String comparison is valid: both are ISO-8601 UTC.
-      else if (String(r.updated_at ?? "") > String(syncedAt)) { result.drifted++; todo.push({ uid, mapped: true }); }
+      else if (opts.force || String(r.updated_at ?? "") > String(syncedAt)) { result.drifted++; todo.push({ uid, mapped: true }); }
     }
 
     const totalPages = Number(j?.total_pages ?? 0);
@@ -158,27 +166,12 @@ export async function sweepJobs(opts: {
     try {
       await wait();
       result.pagedRequests++;
-      await syncOne("job_details", item.uid, { selfFetching: isSelfFetching("job_details") });
+      // Both passes, whether or not the job is mapped — see note 4.
+      await syncRecord("jobs", item.uid, { enrich: "job_details" });
       result.resynced++;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      // An unmapped job cannot be enriched — import it first, exactly as
-      // processEvent does for a "New Job" webhook.
-      if (/is not imported yet/.test(msg)) {
-        try {
-          await wait();
-          result.pagedRequests++;
-          await syncOne("jobs", item.uid, { detail: detailPathFor("jobs") });
-          await syncOne("job_details", item.uid, { selfFetching: true });
-          result.resynced++;
-        } catch (err2) {
-          result.failed++;
-          console.warn(`[zupersync] sweep could not import job ${item.uid}: ${err2 instanceof Error ? err2.message : err2}`);
-        }
-      } else {
-        result.failed++;
-        console.warn(`[zupersync] sweep failed for job ${item.uid}: ${msg}`);
-      }
+      result.failed++;
+      console.warn(`[zupersync] sweep failed for job ${item.uid}: ${err instanceof Error ? err.message : err}`);
     }
   }
 

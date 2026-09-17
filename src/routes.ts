@@ -1,24 +1,41 @@
 /**
  * Zuper webhook → sync entity routing.
  *
- * The catalogue below was read out of Zuper's own New Webhook form (Settings ›
- * Developer › Webhooks) on 2026-09-16: 10 modules, 184 events. It is recorded in
- * full because Zuper does not document it, and because an event we have never
- * seen must be distinguishable from one we chose not to handle.
+ * The catalogue below is Zuper's own, not a transcription of its UI. It comes from
+ * `GET /api/misc/{MODULE}/events` — the endpoint Zuper's New Webhook form calls
+ * when a module is picked — which returns every event with its wire key and its
+ * display name. 12 modules, 203 events, captured 2026-09-17 and kept verbatim in
+ * src/cli/fixtures/zuper-events.json, which `npm run check-wire-routes` holds this
+ * file to.
  *
- * The routing principle: a webhook is a TRIGGER, not a payload. We take the
- * record's uid from the delivery and re-fetch that record from Zuper, which is
- * the system of record. That survives payload shapes Zuper has never published,
- * deliveries that arrive out of order, and the ones that arrive twice. It is also
- * why nearly all 35 Jobs events collapse onto one route: "New Note", "Assign
- * Users", "Status Update" and "Update Job Checklist" all mean "this job changed",
- * and job_details already re-reads the job and rebuilds its assignments, history,
- * custom fields, teams and tags.
+ * WHY KEYS, NOT LABELS. An earlier version was keyed by the form's display labels
+ * ("New Note", "Status Update"), but a real delivery carries the wire key
+ * (`job.new_note`, `job.status_update`) and the two rarely normalise to the same
+ * string. So most per-event rules never fired on live traffic: a job note would
+ * have been re-synced as a whole job instead of being recognised as a note.
  *
- * Every path below is taken from Zuper's OpenAPI specs, because the pattern
- * genuinely does not generalise: /customers but /organization, /products but
- * /service_contract, and service contracts identify by `contract_uid` rather than
- * `service_contract_uid`. Inferring a path from its sibling produces a silent 404.
+ * WHY AN EXACT INDEX, NOT THE PREFIX. A real delivery carries no module field, and
+ * the key's prefix is not always its module: `measurement.*` belongs to JOB,
+ * `inspection_form.*` to ASSETS, `timesheet_approval.*` to TIMESHEET and
+ * `import.organization` to ORGANIZATION. Every known key is therefore looked up
+ * exactly; the prefix is only a fallback for events Zuper adds later.
+ *
+ * WHY PROPERTY IS NOT ORGANIZATIONS. Zuper has both modules. This account has
+ * 1,008 organizations and one property, and `GET /api/organization/{uid}` answers
+ * 404 for a property uid — which is what an earlier mapping would have requested.
+ *
+ * The routing principle is unchanged: a webhook is a TRIGGER, not a payload. We
+ * take the record's uid and re-read it from Zuper, the system of record. Most
+ * events therefore mean "this record changed": a status rollback, a team
+ * assignment and a checklist update on a job all re-read the job.
+ *
+ * WHY A JOB RUNS TWO ENTITIES. `jobs` writes the row itself — title, schedule,
+ * priority, addresses, customer — and rebuilds assignments, status history,
+ * custom fields, teams and tags. `job_details` adds what only it resolves: the
+ * parent job, the linked asset, feedback, and the customer's organization. An
+ * earlier version ran job_details alone for every job event, and job_details
+ * never writes the schedule: 69 of 73 rescheduled jobs kept their old times while
+ * the log said "applied" (found 2026-09-17; WO 54200 read 16 Sep, Zuper 20 Sep).
  */
 
 /** How a single record can be obtained for an entity. */
@@ -33,19 +50,13 @@ export type FetchMode =
 /**
  * Where one record of each entity comes from.
  *
- * Held per ENTITY rather than per module because several modules route note and
- * attachment events to the same entity, and the fetch strategy belongs to the
- * thing being fetched.
- *
- * `unsupported` is a deliberate, load-bearing state: a webhook we cannot service
- * must be recorded as unserviced. The alternative — handing a bare uid stub to a
- * transform written for a full record — writes a near-empty payload OVER a live
- * row, which silently blanks real data.
+ * `unsupported` is load-bearing: a webhook we cannot service must be recorded as
+ * unserviced. Handing a bare uid stub to a transform written for a full record
+ * writes a near-empty payload OVER a live row, silently blanking real data.
  */
 const ENTITY_FETCH: Record<string, { mode: FetchMode; path?: (uid: string) => string; reason?: string }> = {
-  // Documented by-uid reads.
   job_details: { mode: "self" },                                            // transform GETs /api/jobs/{uid} itself
-  jobs: { mode: "detail", path: (u) => `/api/jobs/${u}` },
+  jobs: { mode: "detail", path: (u) => `/api/jobs/${u}` },               // never a list row — see sweep.ts
   customers: { mode: "detail", path: (u) => `/api/customers/${u}` },        // plural
   organizations: { mode: "detail", path: (u) => `/api/organization/${u}` }, // singular
   assets: { mode: "detail", path: (u) => `/api/assets/${u}` },              // plural
@@ -56,25 +67,13 @@ const ENTITY_FETCH: Record<string, { mode: FetchMode; path?: (uid: string) => st
   invoices: { mode: "detail", path: (u) => `/api/invoice/${u}` },
   requests: { mode: "detail", path: (u) => `/api/request/${u}` },
 
-  // No read-by-uid exists. These need a parent-scoped list fetch and a match on
-  // the uid, which is not built — so they are refused rather than guessed at.
-  notes: { mode: "unsupported", reason: "Zuper has no GET by note_uid — needs the parent's note list and a client-side match" },
+  // No read-by-uid exists. Changes are refused rather than guessed at; DELETIONS
+  // still work for mapped records, because marking a row deleted needs no fetch.
+  notes: { mode: "unsupported", reason: "note sync is not built — Zuper has no GET by note_uid" },
   timesheets: { mode: "unsupported", reason: "Zuper has no GET by timesheet_uid, and /timesheets has no uid filter" },
-  timeoff_requests: { mode: "unsupported", reason: "time off is only readable as a whole list" },
-  timeoff_types: { mode: "unsupported", reason: "time off types are only readable as a whole list" },
-  user_shifts: { mode: "unsupported", reason: "shifts are only readable by date window" },
-  master_shifts: { mode: "unsupported", reason: "master shifts are only readable as a whole list" },
-  product_transactions: { mode: "unsupported", reason: "Zuper has no GET by transaction uid" },
-  stock_locations: { mode: "unsupported", reason: "product locations are only readable as a whole list" },
 };
 
-/**
- * The by-uid path for an entity, or null when Zuper publishes none.
- *
- * Exported so callers that already know the entity (the create-fallback in
- * processor.ts) read the same table resolveRoute does, instead of keeping a
- * second copy of these paths that could drift out of step with it.
- */
+/** The by-uid path for an entity, or null when Zuper publishes none. */
 export function detailPathFor(entity: string): ((uid: string) => string) | null {
   const f = ENTITY_FETCH[entity];
   return f?.mode === "detail" ? f.path ?? null : null;
@@ -87,10 +86,12 @@ export function isSelfFetching(entity: string): boolean {
 
 /** A route says which sync entity to run, and how to get the record. */
 export interface Route {
+  /** Zuper's wire module the event belongs to (JOB, ESTIMATES, …). */
+  module: string;
   /** ENTITIES key in lib/migration/zuper-sync.ts. */
   entity: string;
-  /** Entity to run when the record has no jms_id yet (enrichOnly entities throw otherwise). */
-  createEntity?: string;
+  /** A second entity to run once `entity` has written the record (job_details, for jobs). */
+  enrich?: string;
   /** Candidate field names for the uid, in the order they should be tried. */
   uidFields: string[];
   fetch: FetchMode;
@@ -100,376 +101,458 @@ export interface Route {
   deletion: boolean;
   /** Set when this event will not be synced, with the reason. */
   skip?: string;
-  /** True when the event was not in the catalogue and the module default was used. */
+  /** True when the event is not in Zuper's catalogue and the module default was used. */
   inferred: boolean;
 }
 
-interface ModuleSpec {
-  entity: string;
-  createEntity?: string;
-  uidFields: string[];
-  overrides?: Record<string, { entity?: string; uidFields?: string[]; skip?: string }>;
-  deletions?: string[];
-  events: string[];
+interface EventRule {
+  /** Recorded as not synced, with this reason. */
+  skip?: string;
+  /** Mark the record deleted instead of re-reading it. */
+  deletion?: true;
+  /** A different entity than the module's. */
+  entity?: string;
+  uidFields?: string[];
 }
 
-/**
- * Zuper's WIRE module names -> the catalogue keys below.
- *
- * Read from the live API (GET /service/notifications/webhook, 98 configured
- * webhooks, 2026-09-16). Zuper's form labels and its wire names agree for exactly
- * one module out of nine, so this map is not optional: an unmatched module
- * resolves to null and the delivery is stored but never processed.
- *
- * PROPERTY is Zuper's name for Organizations, and ESTIMATES for the module its
- * own form calls "Quotes".
- */
-const MODULE_ALIASES: Record<string, string> = {
-  job: "Jobs", jobs: "Jobs",
-  customer: "Customers", customers: "Customers",
-  property: "Organizations", organization: "Organizations", organizations: "Organizations",
-  estimate: "Quotes", estimates: "Quotes", quote: "Quotes", quotes: "Quotes",
-  invoice: "Invoices", invoices: "Invoices",
-  servicecontract: "Contracts", servicecontracts: "Contracts", contract: "Contracts", contracts: "Contracts",
-  asset: "Assets", assets: "Assets",
-  user: "Users", users: "Users",
-  request: "Requests", requests: "Requests",
-  timesheet: "Timesheets", timesheets: "Timesheets",
-  product: "Products", products: "Products",
-};
+interface ModuleSpec {
+  /** Zuper's display name for the module. */
+  label: string;
+  entity: string;
+  enrich?: string;
+  uidFields: string[];
+  /** Every event Zuper offers, keyed by wire key: [display name, rule]. No rule = re-read the record. */
+  events: Record<string, [string, EventRule?]>;
+  /** Applies to every event in the module that has no rule of its own. */
+  skipAll?: string;
+}
+
+// Shared rules, so the same decision reads the same everywhere.
+const DELETE: EventRule = { deletion: true };
+const NOTE: EventRule = { skip: "note sync is not built — Zuper has no GET by note_uid" };
+// A deleted note needs no fetch: notes are mapped (38,712 at import), so the row
+// can be flagged by its note_uid.
+const NOTE_DELETE: EventRule = { entity: "notes", uidFields: ["note_uid"], deletion: true };
+const ATTACHMENT: EventRule = { skip: "attachments are linked at import time, not re-synced" };
+const NO_STATE: (what: string) => EventRule = (what) => ({ skip: `${what} changes nothing on the record` });
 
 const MODULES: Record<string, ModuleSpec> = {
-  // ── Jobs ──────────────────────────────────────────────────────────────────
-  // job_details is enrichOnly: it throws for a job with no jms_id, so a genuinely
-  // new job runs `jobs` first. Everything else is "re-read this job".
-  Jobs: {
-    entity: "job_details",
-    createEntity: "jobs",
+  JOB: {
+    label: "Jobs",
+    // `jobs` creates or updates the row from GET /api/jobs/{uid} — safe, because the
+    // detail carries organization, skills and parent_job, which a LIST row lacks.
+    entity: "jobs",
+    enrich: "job_details",
     uidFields: ["job_uid"],
-    deletions: ["Delete Job", "job.delete"],
-    overrides: {
-      "New Note": { entity: "notes", uidFields: ["note_uid", "job_uid"] },
-      "Update Note": { entity: "notes", uidFields: ["note_uid", "job_uid"] },
-      "Delete Note": { entity: "notes", uidFields: ["note_uid", "job_uid"] },
-      "New Job Message": { skip: "job chat is Stream Chat and was never imported" },
-      "New Measurement": { skip: "measurements have no sync entity" },
-      "Measurement Updated": { skip: "measurements have no sync entity" },
-      "Measurement Status Updated": { skip: "measurements have no sync entity" },
-      "Measurement Deleted": { skip: "measurements have no sync entity" },
+    events: {
+      "job.new": ["New Job"],
+      "job.update": ["Update Job"],
+      "job.schedule": ["Schedule Job"],
+      "job.update_schedule": ["Reschedule Job"],
+      "job.assign_users": ["Assign Users"],
+      "job.unassign_users": ["Unassign Users"],
+      "job.assign_teams": ["Assign Teams"],
+      "job.unassign_teams": ["Unassign Teams"],
+      "job.update_acceptance": ["Job Accept / Reject"],
+      "job.status_update": ["Status Update"],
+      "job.status_rollback": ["Status Rollback"],
+      "job.status_delete": ["Status Delete"],
+      "job.feedback": ["Job Feedback"],
+      "job.new_note": ["New Note", NOTE],
+      "job.update_note": ["Update Note", NOTE],
+      "job.delete_note": ["Delete Note", NOTE_DELETE],
+      "job.delete": ["Delete Job", DELETE],
+      "job.bulk_action": ["Job Bulk Action"],
+      // Checklist answers ride on the status history both entities rebuild.
+      "job.update_checklist": ["Update Job Checklist"],
+      "job.recurring_update": ["Update Recurring Job"],
+      "job.update_recurrence": ["Update Recurring Job Rule"],
+      "job.new_recurrence": ["New Recurring Job"],
+      // Deletes the recurrence rule, not the job.
+      "job.delete_recurrence": ["Delete Recurring Job"],
+      "job.status_alert": ["Status Alert", NO_STATE("sending an alert")],
+      "job.timelog_update": ["Update Job Timelog", { skip: "timelogs are not re-synced with the job" }],
+      "job.timelog": ["Create Job Timelog", { skip: "timelogs are not re-synced with the job" }],
+      "job.product_update": ["Update Job Product", { skip: "job line items are not re-synced with the job" }],
+      "job.new_attachment": ["New Job Attachment", ATTACHMENT],
+      "job.delete_attachment": ["Delete Job Attachment", ATTACHMENT],
+      "job.update_attachment": ["Update Job Attachment", ATTACHMENT],
+      "job.new_message": ["New Job Message", { skip: "job chat is Stream Chat and was never imported" }],
+      "measurement.new": ["New Measurement", { skip: "measurements have no sync entity" }],
+      "measurement.update": ["Measurement Updated", { skip: "measurements have no sync entity" }],
+      "measurement.status_update": ["Measurement Status Updated", { skip: "measurements have no sync entity" }],
+      "measurement.delete": ["Measurement Deleted", { skip: "measurements have no sync entity" }],
     },
-    events: [
-      "New Job", "Update Job", "Schedule Job", "Reschedule Job", "Assign Users", "Unassign Users",
-      "Assign Teams", "Unassign Teams", "Job Accept / Reject", "Status Update", "Status Rollback",
-      "Status Delete", "Job Feedback", "New Note", "Update Note", "Delete Note", "Delete Job",
-      "Job Bulk Action", "Update Job Checklist", "Update Recurring Job", "Update Recurring Job Rule",
-      "New Recurring Job", "Delete Recurring Job", "Status Alert", "Update Job Timelog",
-      "Create Job Timelog", "Update Job Product", "New Job Attachment", "Delete Job Attachment",
-      "Update Job Attachment", "New Job Message", "New Measurement", "Measurement Updated",
-      "Measurement Status Updated", "Measurement Deleted",
-    ],
   },
 
-  // ── Requests ──────────────────────────────────────────────────────────────
-  // Zuper's New Webhook form does NOT offer this module, but 8 request webhooks
-  // are configured and firing. The events below are therefore the real wire
-  // names, taken from the API rather than a form label.
-  Requests: {
-    entity: "requests",
-    uidFields: ["request_uid"],
-    deletions: ["request.delete", "Delete Request"],
-    overrides: {
-      "request.new_note": { entity: "notes", uidFields: ["note_uid", "request_uid"] },
-      "New Note": { entity: "notes", uidFields: ["note_uid", "request_uid"] },
-    },
-    events: [
-      "request.new", "request.update", "request.delete", "request.status_update",
-      "request.status_rollback", "request.assign_users", "request.unassign_users", "request.new_note",
-    ],
-  },
-
-  // ── Customers ─────────────────────────────────────────────────────────────
-  // Zuper has no customer delete — only Deactivate, which arrives as a field change.
-  Customers: {
+  CUSTOMER: {
+    label: "Customers",
+    // Zuper has no customer delete — only deactivate, which is a field change.
     entity: "customers",
     uidFields: ["customer_uid"],
-    overrides: {
-      "New Note": { entity: "notes", uidFields: ["note_uid", "customer_uid"] },
-      "Update Note": { entity: "notes", uidFields: ["note_uid", "customer_uid"] },
-      "Delete Note": { entity: "notes", uidFields: ["note_uid", "customer_uid"] },
-      "New Customer Card": { skip: "payment cards are not synced" },
-      "Remove Customer Card": { skip: "payment cards are not synced" },
+    events: {
+      "customer.create": ["New Customer"],
+      "customer.update": ["Customer Update"],
+      "customer.deactivate": ["Customer Deactivate"],
+      "customer.activate": ["Customer Activate"],
+      "customer.accounts_update": ["Customer Accounts Update"],
+      "customer.update_technician": ["Favourite Technician Update"],
+      "customer.new_note": ["New Note", NOTE],
+      "customer.update_note": ["Update Note", NOTE],
+      "customer.delete_note": ["Delete Note", NOTE_DELETE],
+      "customer.add_card": ["New Customer Card", { skip: "payment cards are not synced" }],
+      "customer.delete_card": ["Remove Customer Card", { skip: "payment cards are not synced" }],
+      "customer.new_attachment": ["New Customer Attachment", ATTACHMENT],
+      "customer.delete_attachment": ["Delete Customer Attachment", ATTACHMENT],
+      "customer.update_attachment": ["Update Customer Attachment", ATTACHMENT],
+      "customer.bulk_action": ["Customer Bulk Action"],
     },
-    events: [
-      "New Customer", "Customer Update", "Customer Deactivate", "Customer Activate",
-      "Customer Accounts Update", "Favourite Technician Update", "New Note", "Update Note",
-      "Delete Note", "New Customer Card", "Remove Customer Card", "New Customer Attachment",
-      "Delete Customer Attachment", "Update Customer Attachment", "Customer Bulk Action",
-    ],
   },
 
-  // ── Organizations ─────────────────────────────────────────────────────────
-  Organizations: {
+  ORGANIZATION: {
+    label: "Organizations",
     entity: "organizations",
     uidFields: ["organization_uid"],
-    deletions: ["Organization Delete", "property.delete"],
-    events: [
-      "New Organization", "Organization Update", "Organization Delete", "Organization Bulk Action",
-      "Assign Users", "Unassign Users", "New Organization Attachment", "Update Organization Attachment",
-      "Delete Organization Attachment", "Import Organization",
-    ],
-  },
-
-  // ── Assets ────────────────────────────────────────────────────────────────
-  // "Delete Aseet Attachment" / "Update Aseet Attachment" are Zuper's own typos,
-  // kept verbatim — that is the string the webhook will actually send.
-  Assets: {
-    entity: "assets",
-    uidFields: ["asset_uid"],
-    deletions: ["Asset Delete", "asset.delete"],
-    overrides: {
-      "Asset New Note": { entity: "notes", uidFields: ["note_uid", "asset_uid"] },
-      "Asset Update Note": { entity: "notes", uidFields: ["note_uid", "asset_uid"] },
-      "Asset Delete Note": { entity: "notes", uidFields: ["note_uid", "asset_uid"] },
-      "Inspection Form Submission": { skip: "filling inspections is not built" },
-      "Inspection Form Update": { skip: "filling inspections is not built" },
+    events: {
+      "organization.new": ["New Organization"],
+      "organization.update": ["Organization Update"],
+      "organization.delete": ["Organization Delete", DELETE],
+      "organization.bulk_action": ["Organization Bulk Action"],
+      "organization.assign_users": ["Assign Users"],
+      "organization.unassign_users": ["Unassign Users"],
+      "organization.new_attachment": ["New Organization Attachment", ATTACHMENT],
+      "organization.update_attachment": ["Update Organization Attachment", ATTACHMENT],
+      "organization.delete_attachment": ["Delete Organization Attachment", ATTACHMENT],
+      "import.organization": ["Import Organization", { skip: "a bulk import notice carries no single record" }],
     },
-    events: [
-      "New Asset", "Asset Update", "Asset Delete", "Asset activate", "Asset Deactivate",
-      "New Asset Attachment", "Delete Aseet Attachment", "Update Aseet Attachment", "Asset Bulk Action",
-      "Asset Status Update", "Asset History", "Asset Recover", "Asset New Note", "Asset Update Note",
-      "Asset Delete Note", "Inspection Form Submission", "Inspection Form Update",
-    ],
   },
 
-  // ── Quotes → the `estimates` entity (jms.quotes) ───────────────────────────
-  Quotes: {
-    entity: "estimates",
-    uidFields: ["estimate_uid"],
-    deletions: ["Quote Delete", "estimate.delete"],
-    overrides: {
-      "Quote New Note": { entity: "notes", uidFields: ["note_uid", "estimate_uid"] },
-      "Quote Delete Note": { entity: "notes", uidFields: ["note_uid", "estimate_uid"] },
-      "Print Quote": { skip: "printing changes nothing on the record" },
+  PROPERTY: {
+    label: "Properties",
+    // A separate Zuper record, not an organization. No importer exists, and this
+    // account has exactly one property.
+    entity: "properties",
+    uidFields: ["property_uid"],
+    skipAll: "properties have no importer (this account has one)",
+    events: {
+      "property.new": ["New Property"],
+      "property.update": ["Update Property"],
+      "property.activate": ["Property Activate"],
+      "property.deactivate": ["Property Deactivate"],
+      "property.delete": ["Property Delete"],
+      "property.bulk_action": ["Property Bulk Action"],
+      "property.assign_users": ["Assign Users"],
+      "property.unassign_users": ["Unassign Users"],
+      "property.new_attachment": ["New Property Attachment"],
+      "property.update_attachment": ["Update Property Attachment"],
+      "property.delete_attachment": ["Delete Property Attachment"],
     },
-    events: [
-      "New Quote", "Quote Update", "Quote Status Update", "Quote Deposit Payment", "Print Quote",
-      "Send Quote", "Quote New Note", "Quote New Attachment", "Quote Delete Attachment",
-      "Quote Delete Note", "Quote Delete", "Quote Bulk Action", "Quote Recover",
-    ],
   },
 
-  // ── Invoices ──────────────────────────────────────────────────────────────
-  Invoices: {
-    entity: "invoices",
-    uidFields: ["invoice_uid"],
-    deletions: ["Invoice Delete", "invoice.delete"],
-    overrides: {
-      "Invoice New Note": { entity: "notes", uidFields: ["note_uid", "invoice_uid"] },
-      "Invoice Delete Note": { entity: "notes", uidFields: ["note_uid", "invoice_uid"] },
-      "Invoice Update Note": { entity: "notes", uidFields: ["note_uid", "invoice_uid"] },
-      "Print Invoice": { skip: "printing changes nothing on the record" },
-    },
-    events: [
-      "New Invoice", "Invoice Update", "Invoice Status Update", "Invoice Payment", "Print Invoice",
-      "Send Invoice", "Invoice New Note", "Invoice Attachment", "Invoice Delete Attachment",
-      "Invoice Delete Note", "Invoice Delete", "Invoice Bulk Action", "Invoice New Payment Mode",
-      "Invoice Update Payment Mode", "Invoice Delete Payment Mode", "Invoice New Payment Term",
-      "Invoice Update Payment Term", "Invoice Delete Payment Term", "Invoice Update Note",
-    ],
-  },
-
-  // ── Contracts → the `contracts` entity (jms.service_contracts) ─────────────
-  // Zuper's own API calls this one `contract_uid`, not `service_contract_uid`;
-  // the webhook body is undocumented, so both are tried.
-  Contracts: {
-    entity: "contracts",
-    uidFields: ["service_contract_uid", "contract_uid"],
-    deletions: ["Service Contract Delete", "service_contract.delete"],
-    overrides: {
-      "Service Contract New Note": { entity: "notes", uidFields: ["note_uid", "contract_uid"] },
-      "Service Contract Delete Note": { entity: "notes", uidFields: ["note_uid", "contract_uid"] },
-      "Service Contract Update Note": { entity: "notes", uidFields: ["note_uid", "contract_uid"] },
-    },
-    events: [
-      "New Service Contract", "Service Contract Update", "Service Contract Delete",
-      "Service Contract Status Update", "Service Contract Renewal", "Service Contract New Note",
-      "Service Contract Delete Note", "Service Contract Update Note", "Service Contract Bulk Action",
-      "Service Contract Activate", "Service Contract Deactivate",
-    ],
-  },
-
-  // ── Products ──────────────────────────────────────────────────────────────
-  Products: {
-    entity: "products",
-    uidFields: ["product_uid"],
-    deletions: ["Product Delete", "product.delete"],
-    overrides: {
-      "New Product Location": { entity: "stock_locations", uidFields: ["location_uid"] },
-      "Product Location Update": { entity: "stock_locations", uidFields: ["location_uid"] },
-      "Product Location Delete": { entity: "stock_locations", uidFields: ["location_uid"] },
-      "Product Transaction Inward": { entity: "product_transactions", uidFields: ["transaction_uid"] },
-      "Product Transaction Outward": { entity: "product_transactions", uidFields: ["transaction_uid"] },
-      "Product Transaction Transfer": { entity: "product_transactions", uidFields: ["transaction_uid"] },
-      "Product Consumption": { entity: "product_transactions", uidFields: ["transaction_uid"] },
-    },
-    events: [
-      "New Product", "Product Update", "Product Delete", "New Product Location",
-      "Product Location Update", "Product Location Delete", "Product Transaction Inward",
-      "Product Transaction Outward", "Product Transaction Transfer", "Product Consumption",
-      "Update Product Stock", "Product Bulk Action",
-    ],
-  },
-
-  // ── Users ─────────────────────────────────────────────────────────────────
-  Users: {
-    entity: "users",
-    uidFields: ["user_uid"],
-    deletions: ["User Delete", "user.delete"],
-    overrides: {
-      "User Login": { skip: "a login changes nothing on the record" },
-      "User Sos Trigger": { skip: "an SOS alert is not record state" },
-      "User Preference Update": { skip: "Zuper-side UI preferences are not synced" },
-    },
-    events: [
-      "New User Resource", "User Resource Delete", "User Resource Update", "User Sos Trigger",
-      "User Activate", "User Deactivate", "User Delete", "New User", "User Update",
-      "User Work Hours Update", "User Login", "User Recover", "User New Skill", "User Delete Skill",
-      "User Update Skill", "User Preference Update",
-    ],
-  },
-
-  // ── Timesheets ────────────────────────────────────────────────────────────
-  // The widest module — one Zuper "module" spanning four of our entities. None of
-  // them has a documented read-by-uid, so every route here currently resolves to
-  // `unsupported`; the deliveries are still stored, so nothing is lost when the
-  // parent-scoped fetch is built.
-  Timesheets: {
+  TIMESHEET: {
+    label: "Timesheets",
+    // One Zuper module spanning timesheets, approvals, time off, shifts and GPS.
+    // None has a read-by-uid, so the whole module is recorded but not synced.
     entity: "timesheets",
     uidFields: ["timesheet_uid", "user_uid"],
-    overrides: {
-      "New Timeoff": { entity: "timeoff_requests", uidFields: ["timeoff_uid"] },
-      "Approve Timeoff": { entity: "timeoff_requests", uidFields: ["timeoff_uid"] },
-      "Reject Timeoff": { entity: "timeoff_requests", uidFields: ["timeoff_uid"] },
-      "Update Timeoff": { entity: "timeoff_requests", uidFields: ["timeoff_uid"] },
-      "Delete Timeoff": { entity: "timeoff_requests", uidFields: ["timeoff_uid"] },
-      "New Timeoff Type": { entity: "timeoff_types", uidFields: ["timeoff_type_uid"] },
-      "Edit Timeoff Type": { entity: "timeoff_types", uidFields: ["timeoff_type_uid"] },
-      "Delete Timeoff Type": { entity: "timeoff_types", uidFields: ["timeoff_type_uid"] },
-      "New User Shift": { entity: "user_shifts", uidFields: ["shift_uid"] },
-      "Delete User Shift": { entity: "user_shifts", uidFields: ["shift_uid"] },
-      "Timesheet Master Shift Create": { entity: "master_shifts", uidFields: ["shift_uid"] },
-      "Timesheet Master Shift Updating": { entity: "master_shifts", uidFields: ["shift_uid"] },
-      "Timesheet Master Shift Delete": { entity: "master_shifts", uidFields: ["shift_uid"] },
-      "New Timeoff Availability": { skip: "availability windows have no sync entity" },
-      "Edit Timeoff Availability": { skip: "availability windows have no sync entity" },
-      "Delete Timeoff Availability": { skip: "availability windows have no sync entity" },
-      "Timesheet New Location": { skip: "GPS breadcrumbs are not synced" },
-      "Timesheet Edit Location": { skip: "GPS breadcrumbs are not synced" },
-      "Timesheet Delete Location": { skip: "GPS breadcrumbs are not synced" },
-      "New Timesheet Location": { skip: "GPS breadcrumbs are not synced" },
-      "Delete Timesheet Location": { skip: "GPS breadcrumbs are not synced" },
+    skipAll: "timesheets, time off and shifts have no read-by-uid in Zuper",
+    events: {
+      "timesheet_approval.new": ["New Timesheet Approval"],
+      "timesheet_approval.update": ["Update Timesheet Approval"],
+      "timesheet_approval.delete": ["Delete Timesheet approval"],
+      "timesheet_approval.status_update": ["Timesheet Approval Status Update"],
+      "timesheet.update": ["Timesheet Update"],
+      "timesheet.delete": ["Timesheet Delete"],
+      "timesheet.new_location": ["Timesheet New Location"],
+      "timesheet.edit_location": ["Timesheet Edit Location"],
+      "timesheet.delete_location": ["Timesheet Delete Location"],
+      "timesheet.new_timeoff": ["New Timeoff"],
+      "timesheet.approve_timeoff": ["Approve Timeoff"],
+      "timesheet.reject_timeoff": ["Reject Timeoff"],
+      "timesheet.update_timeoff": ["Update Timeoff"],
+      "timesheet.delete_timeoff": ["Delete Timeoff"],
+      "timesheet.user_shift_create": ["New User Shift"],
+      "timesheet.user_shift_delete": ["Delete User Shift"],
+      "timesheet.new_timeoff_availability": ["New Timeoff Availability"],
+      "timesheet.edit_timeoff_availability": ["Edit Timeoff Availability"],
+      "timesheet.delete_timeoff_availability": ["Delete Timeoff Availability"],
+      "timesheet.new_timeoff_type": ["New Timeoff Type"],
+      "timesheet.edit_timeoff_type": ["Edit Timeoff Type"],
+      "timesheet.delete_timeoff_type": ["Delete Timeoff Type"],
+      "timesheet.employee_location_create": ["New Timesheet Location"],
+      "timesheet.employee_location_delete": ["Delete Timesheet Location"],
+      "timesheet.day_activity": ["Timesheet Day Activity"],
+      "timesheet.check_in": ["Timesheet Check In"],
+      "timesheet.check_out": ["Timesheet Check Out"],
+      "timesheet.break": ["Timesheet Break"],
+      "timesheet.resume_work": ["Timesheet Resume Work"],
+      "timesheet.master_shift_create": ["Timesheet Master Shift Create"],
+      "timesheet.master_shift_update": ["Timesheet Master Shift Updating"],
+      "timesheet.master_shift_delete": ["Timesheet Master Shift Delete"],
+      "timesheet.bulk_check_in": ["Timesheet Bulk Check In"],
+      "timesheet.bulk_check_out": ["Timesheet Bulk Check Out"],
+      "timesheet.bulk_resume_work": ["Timesheet Bulk Resume Work"],
+      "timesheet.bulk_break": ["Timesheet Bulk Break"],
     },
-    events: [
-      "New Timesheet Approval", "Update Timesheet Approval", "Delete Timesheet approval",
-      "Timesheet Approval Status Update", "Timesheet Update", "Timesheet Delete",
-      "Timesheet New Location", "Timesheet Edit Location", "Timesheet Delete Location",
-      "New Timeoff", "Approve Timeoff", "Reject Timeoff", "Update Timeoff", "Delete Timeoff",
-      "New User Shift", "Delete User Shift", "New Timeoff Availability", "Edit Timeoff Availability",
-      "Delete Timeoff Availability", "New Timeoff Type", "Edit Timeoff Type", "Delete Timeoff Type",
-      "New Timesheet Location", "Delete Timesheet Location", "Timesheet Day Activity",
-      "Timesheet Check In", "Timesheet Check Out", "Timesheet Break", "Timesheet Resume Work",
-      "Timesheet Master Shift Create", "Timesheet Master Shift Updating", "Timesheet Master Shift Delete",
-      "Timesheet Bulk Check In", "Timesheet Bulk Check Out", "Timesheet Bulk Resume Work",
-      "Timesheet Break",
-    ],
+  },
+
+  PRODUCTS: {
+    label: "Products",
+    entity: "products",
+    uidFields: ["product_uid"],
+    events: {
+      "product.new": ["New Product"],
+      "product.update": ["Product Update"],
+      "product.delete": ["Product Delete", DELETE],
+      "product.location_new": ["New Product Location", { skip: "product locations are only readable as a whole list" }],
+      "product.location_update": ["Product Location Update", { skip: "product locations are only readable as a whole list" }],
+      "product.location_delete": ["Product Location Delete", { skip: "product locations are only readable as a whole list" }],
+      // "transcation" is Zuper's spelling, kept because it is what arrives.
+      "product.transcation_inward": ["Product Transaction Inward", { skip: "Zuper has no GET by transaction uid" }],
+      "product.transcation_outward": ["Product Transaction Outward", { skip: "Zuper has no GET by transaction uid" }],
+      "product.transcation_transfer": ["Product Transaction Transfer", { skip: "Zuper has no GET by transaction uid" }],
+      "product.consumption": ["Product Consumption", { skip: "Zuper has no GET by transaction uid" }],
+      "product.update_stock": ["Update Product Stock"],
+      "product.bulk_action": ["Product Bulk Action"],
+    },
+  },
+
+  ESTIMATES: {
+    label: "Quotes",
+    entity: "estimates",
+    uidFields: ["estimate_uid"],
+    events: {
+      "estimate.new": ["New Quote"],
+      "estimate.update": ["Quote Update"],
+      "estimate.status_update": ["Quote Status Update"],
+      "estimate.deposit": ["Quote Deposit Payment"],
+      "estimate.print": ["Print Quote", NO_STATE("printing")],
+      "estimate.send": ["Send Quote"],
+      "estimate.new_note": ["Quote New Note", NOTE],
+      "estimate.new_attachment": ["Quote New Attachment", ATTACHMENT],
+      "estimate.delete_attachment": ["Quote Delete Attachment", ATTACHMENT],
+      "estimate.delete_note": ["Quote Delete Note", NOTE_DELETE],
+      "estimate.delete": ["Quote Delete", DELETE],
+      "estimate.bulk_action": ["Quote Bulk Action"],
+      // Undelete: re-reading restores is_deleted from Zuper.
+      "estimate.recover": ["Quote Recover"],
+    },
+  },
+
+  INVOICE: {
+    label: "Invoices",
+    entity: "invoices",
+    uidFields: ["invoice_uid"],
+    events: {
+      "invoice.new": ["New Invoice"],
+      "invoice.update": ["Invoice Update"],
+      "invoice.status_update": ["Invoice Status Update"],
+      "invoice.payment": ["Invoice Payment"],
+      "invoice.print": ["Print Invoice", NO_STATE("printing")],
+      "invoice.send": ["Send Invoice"],
+      "invoice.new_note": ["Invoice New Note", NOTE],
+      "invoice.new_attachment": ["Invoice Attachment", ATTACHMENT],
+      "invoice.delete_attachment": ["Invoice Delete Attachment", ATTACHMENT],
+      "invoice.delete_note": ["Invoice Delete Note", NOTE_DELETE],
+      "invoice.delete": ["Invoice Delete", DELETE],
+      "invoice.bulk_action": ["Invoice Bulk Action"],
+      // Company-level payment settings, not an invoice.
+      "invoice.payment_mode_create": ["Invoice New Payment Mode", { skip: "payment modes are company settings, not invoices" }],
+      "invoice.payment_mode_update": ["Invoice Update Payment Mode", { skip: "payment modes are company settings, not invoices" }],
+      "invoice.payment_mode_delete": ["Invoice Delete Payment Mode", { skip: "payment modes are company settings, not invoices" }],
+      "invoice.payment_term_create": ["Invoice New Payment Term", { skip: "payment terms are company settings, not invoices" }],
+      "invoice.payment_term_update": ["Invoice Update Payment Term", { skip: "payment terms are company settings, not invoices" }],
+      "invoice.payment_term_delete": ["Invoice Delete Payment Term", { skip: "payment terms are company settings, not invoices" }],
+      "invoice.update_note": ["Invoice Update Note", NOTE],
+    },
+  },
+
+  SERVICE_CONTRACTS: {
+    label: "Contracts",
+    // Zuper's own API calls this contract_uid; the body is undocumented, so both.
+    entity: "contracts",
+    uidFields: ["service_contract_uid", "contract_uid"],
+    events: {
+      "service_contract.new": ["New Service Contract"],
+      "service_contract.update": ["Service Contract Update"],
+      "service_contract.delete": ["Service Contract Delete", DELETE],
+      "service_contract.status_update": ["Service Contract Status Update"],
+      "service_contract.renew": ["Service Contract Renewal"],
+      "service_contract.new_note": ["Service Contract New Note", NOTE],
+      "service_contract.delete_note": ["Service Contract Delete Note", NOTE_DELETE],
+      "service_contract.update_note": ["Service Contract Update Note", NOTE],
+      "service_contract.bulk_action": ["Service Contract Bulk Action"],
+      "service_contract.activate": ["Service Contract Activate"],
+      "service_contract.deactivate": ["Service Contract Deactivate"],
+    },
+  },
+
+  ASSETS: {
+    label: "Assets",
+    entity: "assets",
+    uidFields: ["asset_uid"],
+    events: {
+      "asset.new": ["New Asset"],
+      "asset.update": ["Asset Update"],
+      "asset.delete": ["Asset Delete", DELETE],
+      "asset.activate": ["Asset activate"],
+      "asset.deactivate": ["Asset Deactivate"],
+      "asset.new_attachment": ["New Asset Attachment", ATTACHMENT],
+      // "Aseet" is Zuper's typo in the display name; the keys are spelled correctly.
+      "asset.delete_attachment": ["Delete Aseet Attachment", ATTACHMENT],
+      "asset.update_attachment": ["Update Aseet Attachment", ATTACHMENT],
+      "asset.bulk_action": ["Asset Bulk Action"],
+      "asset.status_update": ["Asset Status Update"],
+      "asset.history": ["Asset History"],
+      "asset.recover": ["Asset Recover"],
+      "asset.new_note": ["Asset New Note", NOTE],
+      "asset.update_note": ["Asset Update Note", NOTE],
+      "asset.delete_note": ["Asset Delete Note", NOTE_DELETE],
+      "inspection_form.submit": ["Inspection Form Submission", { skip: "filling inspections is not built" }],
+      "inspection_form.update": ["Inspection Form Update", { skip: "filling inspections is not built" }],
+    },
+  },
+
+  USER: {
+    label: "Users",
+    entity: "users",
+    uidFields: ["user_uid"],
+    events: {
+      "user.resource_create": ["New User Resource", { skip: "user resources are not synced" }],
+      "user.resource_delete": ["User Resource Delete", { skip: "user resources are not synced" }],
+      "user.resource_edit": ["User Resource Update", { skip: "user resources are not synced" }],
+      "user.trigger_sos": ["User Sos Trigger", NO_STATE("an SOS alert")],
+      "user.activate": ["User Activate"],
+      "user.deactivate": ["User Deactivate"],
+      "user.delete": ["User Delete", DELETE],
+      "user.new": ["New User"],
+      "user.update": ["User Update"],
+      "user.work_hours_update": ["User Work Hours Update"],
+      "user.login": ["User Login", NO_STATE("a login")],
+      "user.recover": ["User Recover"],
+      "user.add_skill": ["User New Skill"],
+      "user.remove_skill": ["User Delete Skill"],
+      "user.update_skill": ["User Update Skill"],
+      "user.preference_edit": ["User Preference Update", { skip: "Zuper-side UI preferences are not synced" }],
+    },
+  },
+
+  REQUEST: {
+    label: "Requests",
+    entity: "requests",
+    uidFields: ["request_uid"],
+    events: {
+      "request.new": ["New Request"],
+      "request.update": ["Update Request"],
+      "request.status_update": ["Update request status"],
+      "request.status_rollback": ["Status Rollback"],
+      "request.assign_users": ["Assign Users"],
+      "request.unassign_users": ["Unassign Users"],
+      "request.new_note": ["New Note", NOTE],
+      "request.delete": ["Delete Request", DELETE],
+    },
   },
 };
 
-/** Zuper's module names, exactly as its webhook form spells them. */
+/** Zuper's wire module names. */
 export const MODULE_NAMES = Object.keys(MODULES);
 
-/** Every event Zuper can send, by module — 184 in total. */
+/** Every event Zuper can send, by wire module, as wire keys. */
 export const EVENT_CATALOGUE: Record<string, string[]> = Object.fromEntries(
-  Object.entries(MODULES).map(([m, s]) => [m, s.events]),
+  Object.entries(MODULES).map(([m, s]) => [m, Object.keys(s.events)]),
 );
 
 export const EVENT_COUNT = Object.values(EVENT_CATALOGUE).reduce((n, e) => n + e.length, 0);
 
-/**
- * Case/spacing/punctuation-insensitive.
- *
- * Zuper's catalogue below holds the DISPLAY labels from its New Webhook form
- * ("Asset activate"), but the wire format is lowercase dotted — the live API
- * returns module "ASSETS", event "asset.activate". Dots must be stripped too, or
- * nothing a real delivery says would ever match.
- */
+/** Case/spacing/punctuation-insensitive: "job.update", "JOB_UPDATE", "Job Update". */
 const norm = (s: string) => String(s ?? "").toLowerCase().replace(/[\s_\-/.]+/g, "");
+
+/** Wire key → its module. Keys are globally unique; check-wire-routes asserts it. */
+const EVENT_INDEX = new Map<string, { module: string; key: string }>();
+for (const [module, spec] of Object.entries(MODULES)) {
+  for (const key of Object.keys(spec.events)) EVENT_INDEX.set(norm(key), { module, key });
+}
+
+/**
+ * Other spellings of a module → its wire name: the form labels, singulars, and the
+ * key prefixes (used only for events Zuper adds after the catalogue was captured).
+ * `measurement` is deliberately absent — measurements have nowhere to go, so an
+ * unknown measurement event should be unroutable, not a job re-sync.
+ */
+const MODULE_ALIASES: Record<string, string> = {
+  job: "JOB", jobs: "JOB",
+  customer: "CUSTOMER", customers: "CUSTOMER",
+  organization: "ORGANIZATION", organizations: "ORGANIZATION",
+  property: "PROPERTY", properties: "PROPERTY",
+  timesheet: "TIMESHEET", timesheets: "TIMESHEET", timesheetapproval: "TIMESHEET",
+  product: "PRODUCTS", products: "PRODUCTS",
+  estimate: "ESTIMATES", estimates: "ESTIMATES", quote: "ESTIMATES", quotes: "ESTIMATES",
+  invoice: "INVOICE", invoices: "INVOICE",
+  servicecontract: "SERVICE_CONTRACTS", servicecontracts: "SERVICE_CONTRACTS",
+  contract: "SERVICE_CONTRACTS", contracts: "SERVICE_CONTRACTS",
+  asset: "ASSETS", assets: "ASSETS", inspectionform: "ASSETS",
+  user: "USER", users: "USER",
+  request: "REQUEST", requests: "REQUEST",
+};
+
+function build(module: string, rule: EventRule | undefined, inferred: boolean): Route {
+  const spec = MODULES[module];
+  const entity = rule?.entity ?? spec.entity;
+  const fetchSpec = ENTITY_FETCH[entity] ?? { mode: "unsupported" as FetchMode, reason: `no fetch strategy for "${entity}"` };
+  const deletion = rule?.deletion === true;
+  const skip = rule?.skip
+    ?? spec.skipAll
+    // A deletion needs no fetch, so an unsupported read does not block it.
+    ?? (fetchSpec.mode === "unsupported" && !deletion ? fetchSpec.reason : undefined);
+  return {
+    module,
+    entity,
+      // An override points at a different entity (notes), so the module's second
+    // pass must not follow it. Nor does a deletion need one.
+    enrich: rule?.entity || deletion ? undefined : spec.enrich,
+    uidFields: rule?.uidFields ?? spec.uidFields,
+    fetch: fetchSpec.mode,
+    detail: fetchSpec.mode === "detail" ? fetchSpec.path ?? null : null,
+    deletion,
+    skip,
+    inferred,
+  };
+}
 
 /**
  * Resolve a delivery to a route.
  *
- * Returns null for an unknown module — deliberately, so an unrecognised module is
- * recorded as unroutable rather than falling through to a default entity that
- * would write the wrong table.
+ * 1. A catalogued event key wins outright — keys are unique, and a real delivery
+ *    has no module field to consult anyway.
+ * 2. Otherwise a known module plus a display name (older synthetic deliveries and
+ *    the simulator send those).
+ * 3. Otherwise a known module — from the delivery, or the key's prefix — with an
+ *    uncatalogued event means "this record changed": re-read it.
+ * 4. Otherwise null, so the delivery is stored as unroutable rather than sent to a
+ *    default entity that would write the wrong table.
  */
 export function resolveRoute(module: string, event: string): Route | null {
-  // A real delivery carries NO module field.
-  //
-  // Verified against a genuine payload pulled from Zuper's webhook history: its
-  // top-level keys are job_uid, event, work_order_number, scheduled_start_time,
-  // triggered_by … and nothing resembling a module. (`type` appears on the
-  // history ROW, not in the body — which is what misled identify().)
-  //
-  // Zuper's wire events are "<module>.<verb>", so the prefix is the module:
-  // job.update, customer.create, property.new, service_contract.renew. Every one
-  // of the nine live modules is already in MODULE_ALIASES.
-  //
-  // Without this fallback every real delivery resolves to no route and is stored
-  // but never processed — silently, because nothing errors.
-  const fromEvent = String(event ?? "").split(".")[0];
-  const key = MODULE_ALIASES[norm(module)]
-    ?? MODULE_NAMES.find((m) => norm(m) === norm(module))
-    ?? MODULE_ALIASES[norm(fromEvent)];
-  if (!key) return null;
-  const spec = MODULES[key];
+  const hit = EVENT_INDEX.get(norm(event));
+  if (hit) return build(hit.module, MODULES[hit.module].events[hit.key][1], false);
 
-  const override = spec.overrides
-    ? Object.entries(spec.overrides).find(([e]) => norm(e) === norm(event))?.[1]
-    : undefined;
+  const fromModule = MODULE_ALIASES[norm(module)] ?? MODULE_NAMES.find((m) => norm(m) === norm(module));
+  if (fromModule) {
+    const byName = Object.values(MODULES[fromModule].events).find(([name]) => norm(name) === norm(event));
+    return build(fromModule, byName?.[1], !byName);
+  }
 
-  // Is this an event we actually catalogued? Zuper's wire names are not always a
-  // word-for-word match for its form labels ("New Asset" may arrive as
-  // "asset.create"), so an uncatalogued event on a KNOWN module is not an error:
-  // in a trigger-based design it still means "this record changed", and
-  // re-reading the record is the right answer. Dropping it would lose data.
-  const known = spec.events.some((e) => norm(e) === norm(event));
-
-  const entity = override?.entity ?? spec.entity;
-  const fetchSpec = ENTITY_FETCH[entity] ?? { mode: "unsupported" as FetchMode, reason: `no fetch strategy defined for "${entity}"` };
-  const deletion = (spec.deletions ?? []).some((e) => norm(e) === norm(event));
-
-  return {
-    entity,
-    // An override points at a different entity, so the module's create fallback
-    // (jobs, for job_details) must not leak into it.
-    createEntity: override?.entity ? undefined : spec.createEntity,
-    uidFields: override?.uidFields ?? spec.uidFields,
-    fetch: fetchSpec.mode,
-    detail: fetchSpec.mode === "detail" ? fetchSpec.path ?? null : null,
-    deletion,
-    // A deletion needs no fetch, so an unsupported read does not block it.
-    skip: override?.skip ?? (fetchSpec.mode === "unsupported" && !deletion ? fetchSpec.reason : undefined),
-    inferred: !known,
-  };
+  const prefix = String(event ?? "").split(".")[0];
+  const fromPrefix = MODULE_ALIASES[norm(prefix)];
+  return fromPrefix ? build(fromPrefix, undefined, true) : null;
 }
 
 /** Events that will not be synced, and why — so the log UI can show it plainly. */
 export function unroutedEvents(): { module: string; event: string; reason: string }[] {
   const out: { module: string; event: string; reason: string }[] = [];
-  for (const [m, spec] of Object.entries(MODULES)) {
-    for (const e of spec.events) {
-      const r = resolveRoute(m, e);
-      if (r?.skip) out.push({ module: m, event: e, reason: r.skip });
+  for (const [module, spec] of Object.entries(MODULES)) {
+    for (const key of Object.keys(spec.events)) {
+      const r = resolveRoute(module, key);
+      if (r?.skip) out.push({ module, event: key, reason: r.skip });
     }
   }
   return out;

@@ -5,6 +5,7 @@
  *   npm run sweep -- --minutes 180
  *   npm run sweep -- --apply               # actually re-sync the drifted jobs
  *   npm run sweep -- --apply --max 50      # bounded first run
+ *   npm run sweep -- --apply --force       # every job in the window, drifted or not
  *
  * DRY RUN IS THE DEFAULT, as with simulate: there is no local database, so a
  * sweep writes the live jms.* rows four applications read.
@@ -32,29 +33,30 @@ async function main() {
   const minutesBack = num("minutes", config.sweep.minutesBack);
   const maxResyncs = num("max", config.sweep.maxResyncs);
   const perMinute = num("rate", config.sweep.perMinute);
+  const force = has("force");
 
   console.log(`window     : last ${minutesBack} minute(s)`);
   console.log(`pace       : ${perMinute} req/min (Zuper allows 150 on this account)`);
   console.log(`cap        : ${maxResyncs} re-sync(es) per run`);
-  console.log(`mode       : ${dryRun ? "DRY RUN — nothing will be written" : "APPLY — writes live jms.* rows"}`);
+  console.log(`mode       : ${dryRun ? "DRY RUN — nothing will be written" : "APPLY — writes live jms.* rows"}${force ? " (FORCE: every job in the window)" : ""}`);
   console.log("");
 
   const started = Date.now();
-  const r = await sweepJobs({ minutesBack, maxResyncs, perMinute, dryRun });
+  const r = await sweepJobs({ minutesBack, maxResyncs, perMinute, dryRun, force });
   const secs = Math.round((Date.now() - started) / 1000);
 
   console.log(`from       : ${r.window.from}`);
   console.log(`to         : ${r.window.to}`);
   console.log(`in window  : ${r.inWindow}`);
   console.log(`examined   : ${r.examined}`);
-  console.log(`drifted    : ${r.drifted}   (Zuper newer than our synced_at)`);
+  console.log(`drifted    : ${r.drifted}   (${force ? "mapped — forced" : "Zuper newer than our synced_at"})`);
   console.log(`unmapped   : ${r.unmapped}   (never imported)`);
   if (!dryRun) {
     console.log(`re-synced  : ${r.resynced}`);
     console.log(`failed     : ${r.failed}`);
     if (r.stoppedEarly) console.log(`capped     : yes — ${r.drifted + r.unmapped - r.resynced - r.failed} left for the next run`);
   }
-  console.log(`page reqs  : ${r.pagedRequests} in ${secs}s  (re-syncs make further Zuper calls inside job_details, not counted here)`);
+  console.log(`page reqs  : ${r.pagedRequests} in ${secs}s  (each re-sync makes further Zuper calls, not counted here)`);
 
   if (dryRun && (r.drifted || r.unmapped)) {
     console.log("");

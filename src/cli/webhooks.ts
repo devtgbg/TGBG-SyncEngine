@@ -6,13 +6,14 @@
  *   npm run webhooks -- apply --only JOB/job.update
  *   npm run webhooks -- apply             # create everything still missing
  *
- * PLAN IS THE DEFAULT. Creating webhooks is a write to Zuper, and 73 of them is
- * not something a command should do because you forgot a flag.
+ * PLAN IS THE DEFAULT. Creating webhooks is a write to Zuper, and dozens of them
+ * is not something a command should do because you forgot a flag.
  *
- * Scope: the event names Zuper is ALREADY emitting to its other subscribers (the
- * client portal and DataHouse). Nothing new is switched on in Zuper — Zupersync
- * becomes a third subscriber to events that already fire. Those other webhooks
- * are never touched.
+ * Scope: every event in Zuper's catalogue (routes.ts) that Zupersync acts on.
+ * Events it would only store and skip are not subscribed — timesheet check-ins
+ * and GPS locations alone would flood the log. Webhooks already registered for a
+ * now-skipped event are listed but left alone. Other subscribers' webhooks (the
+ * client portal, DataHouse) are never touched.
  *
  * The header is the whole game. Production refuses a delivery whose
  * x-zupersync-key does not match, so a webhook created without it — or with it
@@ -66,19 +67,19 @@ async function existing(): Promise<Existing[]> {
 }
 
 /**
- * The events to subscribe to: exactly those Zuper already emits. Reading them
- * from the live configuration rather than from our catalogue matters — our
- * catalogue holds the FORM's display labels ("Quote Delete"), and Zuper's wire
- * names are different ("estimate.delete"). Registering a label would create a
- * webhook for an event that never fires.
+ * The events to subscribe to: every catalogued event that routes to real work.
+ * The catalogue holds Zuper's wire keys and module names, exactly as
+ * GET /api/misc/{MODULE}/events returns them, so a webhook made from it fires.
  */
-function wanted(rows: Existing[]): { module: string; event: string }[] {
-  const seen = new Map<string, { module: string; event: string }>();
-  for (const w of rows) {
-    if (!w.webhook_module || !w.webhook_event) continue;
-    seen.set(`${w.webhook_module}|${w.webhook_event}`, { module: w.webhook_module, event: w.webhook_event });
+function wanted(): { module: string; event: string }[] {
+  const out: { module: string; event: string }[] = [];
+  for (const [module, events] of Object.entries(EVENT_CATALOGUE)) {
+    for (const event of events) {
+      const r = resolveRoute(module, event);
+      if (r && !r.skip) out.push({ module, event });
+    }
   }
-  return [...seen.values()].sort((a, b) => (a.module + a.event).localeCompare(b.module + b.event));
+  return out;
 }
 
 async function create(module: string, event: string): Promise<{ ok: boolean; detail: string }> {
@@ -137,11 +138,21 @@ async function main() {
 
   const have = new Set(ours.map((w) => `${w.webhook_module}|${w.webhook_event}`));
   const only = opt("only");
-  let targets = wanted(rows);
+  let targets = wanted();
   if (only) {
     const [m, e] = only.split("/");
     targets = targets.filter((t) => t.module === m && t.event === e);
-    if (!targets.length) { console.log(`No live event matches ${only}. Use \`list\` to see what Zuper emits.`); process.exit(1); }
+    if (!targets.length) { console.log(`${only} is not a synced event in the catalogue (routes.ts).`); process.exit(1); }
+  }
+
+  // Registered earlier for events that are now skipped: harmless (stored with the
+  // reason), kept so they start working when that sync is built.
+  const inScope = new Set(wanted().map((t) => `${t.module}|${t.event}`));
+  const idle = ours.filter((w) => !inScope.has(`${w.webhook_module}|${w.webhook_event}`));
+  if (idle.length && !only) {
+    console.log(`${idle.length} of ours are for events Zupersync stores but skips:`);
+    for (const w of idle) console.log(`  ${w.webhook_module.padEnd(18)} ${w.webhook_event.padEnd(34)} ${resolveRoute(w.webhook_module, w.webhook_event)?.skip?.slice(0, 48) ?? "NO ROUTE"}`);
+    console.log("");
   }
 
   const missing = targets.filter((t) => !have.has(`${t.module}|${t.event}`));
@@ -152,7 +163,7 @@ async function main() {
   // would only be stored and skipped.
   for (const t of missing) {
     const r = resolveRoute(t.module, t.event);
-    const note = !r ? "NO ROUTE" : r.skip ? `skipped: ${r.skip.slice(0, 48)}` : `-> ${r.entity}${r.inferred ? " (inferred)" : ""}`;
+    const note = !r ? "NO ROUTE" : r.deletion ? `-> ${r.entity} (mark deleted)` : `-> ${r.entity}${r.enrich ? ` + ${r.enrich}` : ""}`;
     console.log(`  ${t.module.padEnd(18)} ${t.event.padEnd(34)} ${note}`);
   }
   console.log("");
@@ -160,7 +171,7 @@ async function main() {
   if (cmd !== "apply") {
     console.log("PLAN ONLY — nothing was created. Re-run with `apply` to create them.");
     console.log("Create one first and confirm a real delivery verifies before doing all of them:");
-    console.log("  npm run webhooks -- apply --only JOB/job.update");
+    console.log("  npm run webhooks -- apply --only ORGANIZATION/organization.update");
     return;
   }
 
@@ -179,9 +190,14 @@ async function main() {
   console.log("");
   console.log(`${made} created, ${failed} failed.`);
 
-  // Read back: the only way to know Zuper actually stored the header.
+  // Read back what Zuper stored. The header value itself is checked by a real
+  // delivery arriving verified; the list only proves the rows exist.
   const after = (await existing()).filter((w) => w.webhook_url === ENDPOINT);
-  console.log(`${after.length} webhook(s) now point at ${ENDPOINT}.`);
+  const nowHave = new Set(after.map((w) => `${w.webhook_module}|${w.webhook_event}`));
+  const absent = missing.filter((t) => !nowHave.has(`${t.module}|${t.event}`));
+  console.log(`${after.length} webhook(s) now point at ${ENDPOINT}; ${absent.length} requested but not listed.`);
+  for (const t of absent) console.log(`  not listed: ${t.module}/${t.event}`);
+  if (failed || absent.length) process.exit(1);
 }
 
 main().catch((err) => { console.error(err instanceof Error ? err.message : err); process.exit(1); });
