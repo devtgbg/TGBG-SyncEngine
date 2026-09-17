@@ -1668,7 +1668,18 @@ async function writeZuperActivity(ctx: Ctx, entityType: string, entityId: string
 }
 /** A job's Zuper punches (CLOCK_IN / CLOCK_OUT events) → jms.job_timelogs, each punch in with the person's next punch
  *  out (none yet: still open). Map entity `timelogs`, keyed by the punch in, so a re-run updates its row. */
+/** Some technicians' phones report punches in the Thai Buddhist calendar: the same day and time, 543 years
+ *  ahead (2026 → 2569). Five imported logs carried it (WO 41203, 42147, 44191, 45004, 47301), each on the day the
+ *  job was scheduled. A year that far out can only be that, so it is brought back. */
+export function punchTime(v: unknown): string {
+  const d = new Date(String(v));
+  if (Number.isNaN(d.getTime())) return String(v);
+  if (d.getUTCFullYear() - new Date().getUTCFullYear() > 400) d.setUTCFullYear(d.getUTCFullYear() - 543);
+  return d.toISOString();
+}
+
 async function writeJobTimelogs(ctx: Ctx, jobId: string, punches: any[]): Promise<void> {
+  punches = punches.map((p) => (p?.checked_time ? { ...p, checked_time: punchTime(p.checked_time) } : p));
   const users = await ctxMap(ctx, "users");
   const map = await ctxMap(ctx, "timelogs");
   const tbl = () => ctx.client.schema("jms").from("job_timelogs");

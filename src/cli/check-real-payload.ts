@@ -29,6 +29,7 @@
  */
 
 import { resolveRoute } from "../routes.js";
+import { punchTime } from "../lib/migration/zuper-sync.js";
 
 /** The real delivery, with identifying values replaced. Shape is verbatim. */
 const REAL_JOB_PAYLOAD: Record<string, unknown> = {
@@ -93,6 +94,9 @@ ok('"property.new" is skipped, not sent to organizations', prop?.entity !== "org
 ok("an unknown event with no module is still refused", resolveRoute("", "nonsense.thing") === null);
 ok("an empty event with no module is refused", resolveRoute("", "") === null);
 
+// Punch times from phones set to the Buddhist calendar come 543 years ahead.
+ok("a Buddhist-calendar punch (2569) is read as 2026", punchTime("2569-07-17T10:08:29Z") === "2026-07-17T10:08:29.000Z");
+ok("an ordinary punch is left alone", punchTime("2026-09-17T10:15:35Z") === "2026-09-17T10:15:35.000Z");
 console.log("");
 console.log(`${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);
