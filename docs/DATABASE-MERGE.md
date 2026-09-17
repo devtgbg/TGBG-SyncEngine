@@ -149,8 +149,8 @@ portal mirror's own uuid. After the move:
   `jms_asset_id`, `jms_job_id`, `jms_user_id`), resolved at copy time through
   `jms.zuper_sync_map` (`entity`, `zuper_uid` → `jms_id`). Portal values of the form
   `tuper:<id>` are already jms ids.
-- The **Zuper uid columns stay** alongside: the applications still write to Zuper and need
-  them, and they keep the rows traceable.
+- The **Zuper uid columns stay** alongside: they keep the rows traceable and match
+  Zupersync's map (`jms.v_uid`).
 - **No foreign-key constraints into `jms`.** `jms` rows are never hard-deleted (they are
   soft-deleted), and the Business OS rule is that module schemas stay independent of each
   other's migrations. The copy script reports any reference it cannot resolve.
@@ -306,8 +306,11 @@ then deploy the version that reads Supabase.
 ## Briefs for the application sessions
 
 Start each session by reading this file. The data is already in Supabase; the job is to point
-the application at it. Keep each change behind a switch until cutover, and never write to
-`jms.*` — Zupersync is its only writer.
+the application at it. **Owner decision 5 applies to every brief: the applications stop
+calling the Zuper API entirely** — reads come from `jms`, and changes to Zuper-owned records
+go through the write path described under *Writes to Zuper-owned records*. Never write to
+`jms.*` tables directly — Zupersync is their only writer. Don't deploy the Supabase version
+until the owner schedules that application's cutover (the copy is refreshed right before).
 
 ### Client Portal (`C:\Projects\tgbg-portal\apps\client-portal`)
 
@@ -318,8 +321,10 @@ the application at it. Keep each change behind a switch until cutover, and never
   (`customer-mirror.ts`, `records/zuper.ts` reads) and the webhook receiver after cutover.
 - Customer identity: `client.users.customer_id` is a `jms.customers.id`. Sign-in lookups by
   email go to `jms.customers` / `jms.customer_contacts`, not to Zuper's API.
-- Keep: quote decisions and new requests are still sent to Zuper; the result arrives in
-  `jms` through Zupersync.
+- Writes to Zuper-owned records (new requests, quote decisions): no Zuper call — see
+  *Writes to Zuper-owned records*.
+- Remove after cutover: `packages/zuper` reads, `records/zuper.ts`, `customer-mirror.ts`,
+  `scripts/sync-zuper-mirror.ts`, the webhook receiver and the `tgbg_portal` PostgREST path.
 
 ### Staff Portal (`C:\Projects\tgbg-portal\apps\staff-portal`)
 
@@ -332,7 +337,10 @@ the application at it. Keep each change behind a switch until cutover, and never
   with reads from `jms` (`jms.v_job_summary`, `jms.jobs` + checklist history). The immutable
   `engine_snapshots.raw_payload` should be built from `jms` data from now on; existing
   snapshots stay as they are.
-- Keep: status and checklist pushes to Zuper (`packages/zuper/src/jobStatusWrite.ts`).
+- Writes to Zuper-owned records (job status, checklist answers from
+  `packages/zuper/src/jobStatusWrite.ts`): no Zuper call — see *Writes to Zuper-owned
+  records*. Checklist answers live in `jms.form_responses`, status changes in
+  `jms.job_status_history`.
 
 ### AMC Engine (`C:\Projects\TGBG-AmcEngine`)
 
@@ -347,7 +355,29 @@ the application at it. Keep each change behind a switch until cutover, and never
   `INSERT OR IGNORE` / `INSERT OR REPLACE` (the latter changes ids today),
   `datetime('now', …)`, `lastInsertRowid` (→ `RETURNING id`) and case-insensitive `LIKE`
   (→ `ILIKE`). The default-user seed in `database.js` must never run against `amc.*`.
-- Keep: bookings still write to Zuper (`src/clients/zuper-write.js`).
+- Writes to Zuper-owned records (booking jobs, child jobs, assignments from
+  `src/clients/zuper-write.js`): no Zuper call — see *Writes to Zuper-owned records*.
+  Secrets come from Vault: `SELECT amc.secret('amc/booking_secret_key')`,
+  `amc.secret('amc/location/<id>/whatsapp_api_key')`.
+
+### Writes to Zuper-owned records
+
+The applications no longer call Zuper (owner decision 5), and their roles cannot write
+`jms.*`. Until a write path exists, each application:
+
+1. lists every change it makes to a Zuper-owned record today — the user action, the Zuper
+   call, and the `jms` table and columns it corresponds to;
+2. routes those changes through one module whose functions fail with a clear "not available
+   yet" error (no Zuper call, no silent drop), so the rest of the switch can be built and
+   tested;
+3. reports the list to the owner.
+
+The write path is then added on the Supabase side (database functions in `jms`, granted to
+the application's role, recorded in `jms.zuper_outbox`), and Zupersync carries the change to
+Zuper. **Zupersync's push to Zuper is off today (`PUSH_MODE=off`)**, so a change written this
+way does not reach Zuper — or the Zuper mobile app the technicians use — until the owner turns
+it on for that kind of change. An application whose core flow depends on such a write
+(AMC bookings, Staff Portal status/checklist updates) is not cut over before that.
 
 ## Risks and how the plan handles them
 
@@ -369,8 +399,8 @@ the application at it. Keep each change behind a switch until cutover, and never
   container name `g13ju6epg6wnum4nabolt8se` — but local development that uses the public host
   must switch to the repo's `db:tunnel`.
 - AMC's `settings` / `location_settings` hold the Zuper API token, WhatsApp key and booking
-  secret. They are **not** copied into `amc.settings`; the application reads them from
-  environment variables after the move.
+  secret. They are **not** copied into `amc.settings`; they are in Vault and the application
+  reads them with `amc.secret(name)`.
 - AMC's `zuper_webhook_events.headers` can hold the webhook secret. The table is retired and
   not copied.
 - `database.js` in AMC creates four default users with a shared password when `users` is
@@ -383,3 +413,7 @@ the application at it. Keep each change behind a switch until cutover, and never
 3. **Cutover order:** Client Portal → AMC Engine reads → Staff Portal → AMC Engine own tables.
 4. **Each application's Zuper webhooks are removed after its cutover** (once it has run
    cleanly for a day). DataHouse's webhooks are never touched.
+5. **The applications stop using the Zuper API** (2026-09-17), for reads and writes, and stop
+   using their own databases (`gbg`, the AMC SQLite file): Supabase is their only database.
+   The old databases are kept, untouched, as the fallback for two weeks after each cutover,
+   then archived and removed.
