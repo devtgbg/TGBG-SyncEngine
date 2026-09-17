@@ -122,6 +122,18 @@ async function setMap(ctx: Ctx, entity: string, uid: string, jmsId: string): Pro
   await ctx.client.schema("jms").from("zuper_sync_map").upsert({ tenant_id: ctx.tenantId, entity, zuper_uid: uid, jms_id: jmsId, synced_at: new Date().toISOString() }, { onConflict: "tenant_id,entity,zuper_uid" });
 }
 const mapGet = (m: Map<string, string>, key: unknown): string | null => (key ? m.get(String(key)) ?? null : null);
+/** The map rows for just these uids - complete for them, so an absent uid really is unmapped. */
+async function mapForUids(ctx: Ctx, entity: string, uids: (string | null | undefined)[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const list = [...new Set(uids.filter((u): u is string => Boolean(u)))];
+  for (let i = 0; i < list.length; i += 100) {
+    const { data, error } = await ctx.client.schema("jms").from("zuper_sync_map").select("zuper_uid, jms_id")
+      .eq("tenant_id", ctx.tenantId).eq("entity", entity).in("zuper_uid", list.slice(i, i + 100));
+    if (error) throw error;
+    for (const m of (data ?? []) as { zuper_uid: string; jms_id: string }[]) out.set(m.zuper_uid, m.jms_id);
+  }
+  return out;
+}
 /** One in-flight create per key, so rows processed side by side never create the same record twice. */
 function once(ctx: Ctx, key: string, make: () => Promise<string | null>): Promise<string | null> {
   const inflight: Map<string, Promise<string | null>> = (ctx.extra.inflight ??= new Map());
@@ -978,6 +990,9 @@ export const ENTITIES: Record<string, Entity> = {
       await writeCustomFieldValues(ctx, "JOB", id, r.custom_fields);
       await writeJobTeams(ctx, id, r, isNew);
       await writeJobTags(ctx, id, r.job_tags);
+      // Files attached to the job itself (not to a note or a checklist). Only a full job read carries them - the
+      // list the bulk import pages through does not - and linking is additive: a file removed in Zuper stays.
+      if (Array.isArray(r.attachments) && r.attachments.length) await writeZuperFiles(ctx, { type: "job", id }, r.attachments, {});
     },
     async afterAll(ctx) {
       const jobs = await ctxMap(ctx, "jobs");
@@ -1706,7 +1721,12 @@ ENTITIES.job_activity = {
   },
   async afterWrite(ctx, id, r) {
     await writeZuperActivity(ctx, "job", id, r._activity ?? []);
-    if (Array.isArray(r._timelog)) await writeJobTimelogs(ctx, id, r._timelog);
+    if (Array.isArray(r._timelog)) {
+      // One job's punches, not the whole timelog map: the bulk run loads that up front (a dependency), a
+      // single-record sync does not, and ctxMap would otherwise page through every timelog to find a few.
+      if (!ctx.maps.timelogs) ctx.maps.timelogs = await mapForUids(ctx, "timelogs", r._timelog.map((p: any) => T(p?.timelog_uid)));
+      await writeJobTimelogs(ctx, id, r._timelog);
+    }
   },
 };
 // Every imported request's activity.

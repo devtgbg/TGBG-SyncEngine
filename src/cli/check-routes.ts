@@ -27,7 +27,8 @@ for (const module of MODULE_NAMES) {
     if (!r) { bad.push(`${module}/${event}: resolveRoute returned null for a catalogued event`); continue; }
     if (r.skip) { skipped++; continue; }
     if (!registry.has(r.entity)) { bad.push(`${module}/${event} → "${r.entity}" is not in ENTITIES`); continue; }
-    if (r.enrich && !registry.has(r.enrich)) { bad.push(`${module}/${event} → enrich "${r.enrich}" is not in ENTITIES`); continue; }
+    const missing = (r.enrich ?? []).filter((e) => !registry.has(e));
+    if (missing.length) { bad.push(`${module}/${event} → enrich ${missing.join(", ")} not in ENTITIES`); continue; }
     routed++;
     byEntity.set(r.entity, (byEntity.get(r.entity) ?? 0) + 1);
   }

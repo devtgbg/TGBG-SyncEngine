@@ -292,11 +292,11 @@ export async function whenIdle(key: string): Promise<void> {
 export const JOB_CREATE_LOCK = "push:job-create";
 
 /**
- * Write a record, then run its second pass if it has one (job_details, for jobs).
+ * Write a record, then run its later passes if it has any (job_details and job_activity, for jobs).
  * The result names the first entity, whose create/update is what happened.
  */
 export async function syncRecord(
-  entity: string, uid: string, opts: { enrich?: string; detail?: ((uid: string) => string) | null; selfFetching?: boolean } = {},
+  entity: string, uid: string, opts: { enrich?: string[]; detail?: ((uid: string) => string) | null; selfFetching?: boolean } = {},
 ): Promise<SyncOneResult> {
   return oneAtATime(uid, async () => {
     const selfFetching = opts.selfFetching ?? isSelfFetching(entity);
@@ -310,8 +310,8 @@ export async function syncRecord(
       if (!raw) throw new Error(`Zuper returned no record for ${entity} ${uid}`);
     }
     const result = await syncOne(entity, uid, raw ? { raw } : { detail, selfFetching });
-    if (opts.enrich) {
-      await syncOne(opts.enrich, uid, { detail: detailPathFor(opts.enrich), selfFetching: isSelfFetching(opts.enrich), seed: raw });
+    for (const next of opts.enrich ?? []) {
+      await syncOne(next, uid, { detail: detailPathFor(next), selfFetching: isSelfFetching(next), seed: raw });
     }
     return result;
   });

@@ -94,10 +94,12 @@ for (const [m, events] of Object.entries(fixture.modules)) {
     if (!r.deletion && wantDelete) problems.push(`${key}: NOT treated as a deletion — it would re-fetch a removed record`);
     if (wantDelete && r.entity !== wantDelete) problems.push(`${key}: deletes from ${r.entity}, expected ${wantDelete}`);
     if (wantDelete && r.skip) problems.push(`${key}: a deletion is skipped (${r.skip})`);
-    if (wantDelete && r.enrich) problems.push(`${key}: a deletion must not re-read the record it removed`);
-    // Every job change must write the row itself: job_details alone never writes the schedule.
-    if (m === "JOB" && !r.skip && !r.deletion && !r.noteHost && (r.entity !== "jobs" || r.enrich !== "job_details")) {
-      problems.push(`${key}: a job change must run jobs then job_details, got ${r.entity}${r.enrich ? ` then ${r.enrich}` : ""}`);
+    if (wantDelete && r.enrich?.length) problems.push(`${key}: a deletion must not re-read the record it removed`);
+    // Every job change must write the row itself (job_details alone never writes the schedule), and refresh
+    // the activity feed and time logs (job_activity).
+    const passes = [r.entity, ...(r.enrich ?? [])].join(" > ");
+    if (m === "JOB" && !r.skip && !r.deletion && !r.noteHost && passes !== "jobs > job_details > job_activity") {
+      problems.push(`${key}: a job change must run jobs > job_details > job_activity, got ${passes}`);
     }
 
     // A note event re-reads the notes of the record it names, by that record's uid.
@@ -126,6 +128,15 @@ for (const [key] of fixture.modules.PROPERTY ?? []) {
 }
 
 // 5. Events Zuper adds later: a known module re-reads the record; the rest are refused.
+// Punches and attachments are job changes now; line items are deliberately not.
+for (const key of ["job.timelog", "job.timelog_update", "job.new_attachment", "job.update_attachment"]) {
+  const r = resolveRoute("", key);
+  if (!r || r.skip || r.entity !== "jobs") problems.push(`${key}: expected a full job re-read, got ${r?.entity ?? "none"}${r?.skip ? ` (skipped: ${r.skip})` : ""}`);
+}
+for (const key of ["job.product_update", "job.delete_attachment"]) {
+  if (!resolveRoute("", key)?.skip) problems.push(`${key}: must stay skipped`);
+}
+
 const future: [string, string | null, boolean][] = [
   ["job.some_new_event", "jobs", true],
   ["organization.some_new_event", "organizations", true],

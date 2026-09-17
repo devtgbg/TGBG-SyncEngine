@@ -39,7 +39,7 @@ documents no verification scheme for it, so the header is the usable mechanism.
 ### Routing
 
 `src/routes.ts` holds Zuper's whole event catalogue: **12 modules, 203 events** —
-97 synced (12 of them deletions), 106 stored with a reason and skipped.
+101 synced (12 of them deletions), 102 stored with a reason and skipped.
 
 The catalogue is Zuper's own, not transcribed from its UI. `GET
 /api/misc/{MODULE}/events` — the call Zuper's New Webhook form makes when a module
@@ -59,9 +59,16 @@ Things that break routing silently if assumed otherwise:
 - **`PROPERTY` is not organizations.** They are separate Zuper records (1,008
   organizations, one property here), and `GET /api/organization/{property_uid}`
   answers 404. Properties have no importer, so their events are skipped.
-- **Every job change runs `jobs`, then `job_details`.** `job_details` never writes
-  the schedule, title, priority or addresses. Running it alone left 69 of 73
-  rescheduled jobs on their old times while the log said "applied".
+- **Every job change runs `jobs`, then `job_details`, then `job_activity`.**
+  `job_details` never writes the schedule, title, priority or addresses — running
+  it alone left 69 of 73 rescheduled jobs on their old times while the log said
+  "applied". `job_activity` rebuilds the job's Zuper activity feed and its time
+  logs (`GET /api/jobs/{uid}/timelog`); nothing refreshed either after the import
+  until 2026-09-17. Punches (`job.timelog*`) and job attachments re-read the job.
+- **Job line items are not synced.** None of 12,000 jobs changed since 2025 has
+  one, and replacing Tuper's job line items with Zuper's empty list would lose
+  data. Photos reach Tuper through checklist answers and note attachments (53 of
+  53 checked on 2026-09-17); files attached to the job itself are linked too.
 
 Entities Zuper offers no by-uid read for (timesheets, timelogs) are **refused,
 not stubbed**. Handing a bare uid to a transform written for a full record would

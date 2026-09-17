@@ -63,7 +63,7 @@ ok("a real Zuper body carries NO module field",
 const r = resolveRoute("", String(REAL_JOB_PAYLOAD.event));
 ok("routes with an EMPTY module, from the event prefix alone", r !== null);
 // jobs writes the schedule; job_details alone never did (69 of 73 reschedules lost).
-ok("…to the full job import, then its enrichment", r?.entity === "jobs" && r?.enrich === "job_details");
+ok("…to the full job import, then its details and its activity", r?.entity === "jobs" && (r?.enrich ?? []).join() === "job_details,job_activity");
 ok("…and looks for job_uid", (r?.uidFields ?? []).includes("job_uid"));
 ok("…and is not treated as a deletion", r?.deletion === false);
 

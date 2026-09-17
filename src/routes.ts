@@ -29,13 +29,17 @@
  * events therefore mean "this record changed": a status rollback, a team
  * assignment and a checklist update on a job all re-read the job.
  *
- * WHY A JOB RUNS TWO ENTITIES. `jobs` writes the row itself — title, schedule,
- * priority, addresses, customer — and rebuilds assignments, status history,
- * custom fields, teams and tags. `job_details` adds what only it resolves: the
- * parent job, the linked asset, feedback, and the customer's organization. An
- * earlier version ran job_details alone for every job event, and job_details
- * never writes the schedule: 69 of 73 rescheduled jobs kept their old times while
- * the log said "applied" (found 2026-09-17; WO 54200 read 16 Sep, Zuper 20 Sep).
+ * WHY A JOB RUNS THREE ENTITIES. `jobs` writes the row itself — title, schedule,
+ * priority, addresses, customer, actual times — and rebuilds assignments, status
+ * history (with checklist photos), custom fields, teams, tags and the job's own
+ * attachments. `job_details` adds what only it resolves: the parent job, the
+ * linked asset, feedback, and the customer's organization. `job_activity`
+ * rebuilds the job's Zuper activity feed and, when the feed shows punches, its
+ * time logs. An earlier version ran job_details alone for every job event, and
+ * job_details never writes the schedule: 69 of 73 rescheduled jobs kept their old
+ * times while the log said "applied" (found 2026-09-17; WO 54200 read 16 Sep,
+ * Zuper 20 Sep). Until 2026-09-17 nothing refreshed activity or time logs after
+ * the import either.
  */
 
 /** How a single record can be obtained for an entity. */
@@ -58,6 +62,7 @@ export type FetchMode =
  */
 const ENTITY_FETCH: Record<string, { mode: FetchMode; path?: (uid: string) => string; reason?: string }> = {
   job_details: { mode: "self" },                                            // transform GETs /api/jobs/{uid} itself
+  job_activity: { mode: "self" },                                           // GETs the job's activity feed (+ /timelog)
   jobs: { mode: "detail", path: (u) => `/api/jobs/${u}` },               // never a list row — see sweep.ts
   customers: { mode: "detail", path: (u) => `/api/customers/${u}` },        // plural
   organizations: { mode: "detail", path: (u) => `/api/organization/${u}` }, // singular
@@ -93,8 +98,8 @@ export interface Route {
   module: string;
   /** ENTITIES key in lib/migration/zuper-sync.ts. */
   entity: string;
-  /** A second entity to run once `entity` has written the record (job_details, for jobs). */
-  enrich?: string;
+  /** Entities to run, in order, once `entity` has written the record (job_details and job_activity, for jobs). */
+  enrich?: string[];
   /** Candidate field names for the uid, in the order they should be tried. */
   uidFields: string[];
   fetch: FetchMode;
@@ -128,7 +133,7 @@ interface ModuleSpec {
   /** Zuper's display name for the module. */
   label: string;
   entity: string;
-  enrich?: string;
+  enrich?: string[];
   uidFields: string[];
   /** Every event Zuper offers, keyed by wire key: [display name, rule]. No rule = re-read the record. */
   events: Record<string, [string, EventRule?]>;
@@ -145,8 +150,11 @@ const DELETE: EventRule = { deletion: true };
 const NOTE = (host: NoteHost): EventRule => ({ entity: "notes", uidFields: [`${host}_uid`], noteHost: host });
 const NOTE_DELETE = (host: NoteHost): EventRule => ({ ...NOTE(host), deletion: true });
 const NO_NOTES: EventRule = { skip: "Tuper keeps no notes on quotes, invoices or contracts" };
-const ATTACHMENT: EventRule = { skip: "attachments are linked at import time, not re-synced" };
+const ATTACHMENT: EventRule = { skip: "files attached to this kind of record are not synced (job files and note files are)" };
 const NO_STATE: (what: string) => EventRule = (what) => ({ skip: `${what} changes nothing on the record` });
+
+/** The passes after `jobs` for every job change. */
+export const JOB_ENRICH = ["job_details", "job_activity"];
 
 const MODULES: Record<string, ModuleSpec> = {
   JOB: {
@@ -154,7 +162,7 @@ const MODULES: Record<string, ModuleSpec> = {
     // `jobs` creates or updates the row from GET /api/jobs/{uid} — safe, because the
     // detail carries organization, skills and parent_job, which a LIST row lacks.
     entity: "jobs",
-    enrich: "job_details",
+    enrich: JOB_ENRICH,
     uidFields: ["job_uid"],
     events: {
       "job.new": ["New Job"],
@@ -183,12 +191,16 @@ const MODULES: Record<string, ModuleSpec> = {
       // Deletes the recurrence rule, not the job.
       "job.delete_recurrence": ["Delete Recurring Job"],
       "job.status_alert": ["Status Alert", NO_STATE("sending an alert")],
-      "job.timelog_update": ["Update Job Timelog", { skip: "timelogs are not re-synced with the job" }],
-      "job.timelog": ["Create Job Timelog", { skip: "timelogs are not re-synced with the job" }],
-      "job.product_update": ["Update Job Product", { skip: "job line items are not re-synced with the job" }],
-      "job.new_attachment": ["New Job Attachment", ATTACHMENT],
-      "job.delete_attachment": ["Delete Job Attachment", ATTACHMENT],
-      "job.update_attachment": ["Update Job Attachment", ATTACHMENT],
+      // A punch also sets the job's actual start/end, so it re-reads the whole job; job_activity writes the log.
+      "job.timelog_update": ["Update Job Timelog"],
+      "job.timelog": ["Create Job Timelog"],
+      // None of 12,000 jobs changed since 2025 carried a line item (checked 2026-09-17), and Tuper's own job
+      // line items would be replaced by Zuper's empty list - so these stay out until someone uses them.
+      "job.product_update": ["Update Job Product", { skip: "Zuper jobs here carry no line items; syncing them would replace Tuper's" }],
+      // The job's own files are linked on a full re-read. A removal is not synced.
+      "job.new_attachment": ["New Job Attachment"],
+      "job.update_attachment": ["Update Job Attachment"],
+      "job.delete_attachment": ["Delete Job Attachment", { skip: "removing a job attachment is not synced" }],
       "job.new_message": ["New Job Message", { skip: "job chat is Stream Chat and was never imported" }],
       "measurement.new": ["New Measurement", { skip: "measurements have no sync entity" }],
       "measurement.update": ["Measurement Updated", { skip: "measurements have no sync entity" }],

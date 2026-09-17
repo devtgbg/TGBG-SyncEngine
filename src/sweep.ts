@@ -62,6 +62,7 @@ import { config, errorText } from "./config.js";
 import { db } from "./supabase.js";
 import { getSyncConfig, zuperGet } from "./lib/migration/zuper-sync.js";
 import { syncRecord } from "./processor.js";
+import { JOB_ENRICH } from "./routes.js";
 
 export interface SweepResult {
   window: { from: string; to: string };
@@ -167,7 +168,7 @@ export async function sweepJobs(opts: {
       await wait();
       result.pagedRequests++;
       // Both passes, whether or not the job is mapped — see note 4.
-      await syncRecord("jobs", item.uid, { enrich: "job_details" });
+      await syncRecord("jobs", item.uid, { enrich: JOB_ENRICH });
       result.resynced++;
     } catch (err) {
       result.failed++;
