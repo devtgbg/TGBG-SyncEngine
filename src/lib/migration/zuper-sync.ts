@@ -1092,7 +1092,11 @@ export const ENTITIES: Record<string, Entity> = {
       const description = T(r.plain_text_description) ?? stripHtml(r.job_description);
       return {
         work_order_number: String(r.work_order_number ?? r.job_uid), prefix: T(r.prefix), title: T(r.job_title) ?? "Job",
-        ...(description ? { description, plain_text_description: description, markdown_description: T(r.markdown_description) } : {}),
+        // Zuper writes a job's description as rich text and keeps a plain copy beside it. Only the plain copy was
+        // kept, so every imported job lost its formatting — the detail page and the job card both print the rich one.
+        ...(description
+          ? { description, plain_text_description: description, description_html: T(r.job_description), markdown_description: T(r.markdown_description) }
+          : {}),
         category_id, current_status_id: await jobStatusId(ctx, r.current_job_status, category_id),
         // The colour the status had when it was set, which Zuper keeps with the job (migration 00100).
         current_status_color: hexColor(r.current_job_status?.status_color),
