@@ -1,6 +1,9 @@
 # Merging the Client Portal, Staff Portal and AMC Engine databases into Supabase
 
-**Status:** plan, 2026-09-17. Nothing below has been created or copied yet unless marked **done**.
+**Status (2026-09-17):** Phase 1 is **done** — the `portal` and `amc` schemas exist in
+Supabase with a full copy of both applications' data, the application roles can log in, and the
+read views are in place. **No application uses them yet**: the Client Portal, Staff Portal and
+AMC Engine still run on `gbg` and SQLite, which were not changed. Phases 2–4 are next.
 **Audience:** the owner, and the Claude Code sessions that will change each application.
 
 ## Goal
@@ -11,8 +14,9 @@ One database — the self-hosted Supabase Postgres on `tgbgaws` — serving ever
   users, statuses, checklists, notes, quotes, invoices, contracts, requests, products,
   time logs, timesheets, time off). **Zupersync is its only writer**; it is kept live from
   Zuper's webhooks plus a 30-minute sweep.
-- **`client.*`**, **`staff.*`** and **`amc.*`** hold only what each application creates
-  itself. Nothing that exists in Zuper is copied into them.
+- **`portal.*`** (both portals — they are one codebase with one database today) and
+  **`amc.*`** hold only what each application creates itself. Nothing that exists in Zuper is
+  copied into them.
 - Every place an application calls Zuper's API **to read**, it reads `jms.*` instead.
   **Writes to Zuper stay as they are** for now (status pushes, bookings, quote decisions,
   new requests): the application writes to Zuper, Zuper fires its webhook, and Zupersync
@@ -82,38 +86,31 @@ Snapshots taken for this plan (structure only is kept in the repo; data stays on
 
 These tables are **not copied**.
 
-### `client.*` — the customer portal's own data
+### `portal.*` — everything either portal creates
 
-| New table | From `gbg` | Notes |
-|---|---|---|
-| `client.users` | `client_users` | `customer_id` → **`jms.customers.id`** (see *Re-pointing*); keep `password_updated_at` bigint (session version) |
-| `client.enrollment_pins` | `portal_enrollment_pins` | `customer_uid` kept; `tuper:<id>` values become the jms id |
-| `client.password_reset_tokens` | `portal_password_reset_tokens` | still used by three routes |
-| `client.password_setup_tokens` | `portal_password_setup_tokens` | legacy flow; copied, candidate for removal |
-| `client.legacy_reports` | `legacy_reports` | empty; table created, no data |
+Both portals keep using one set of tables, as they do today; only the schema changes. Table
+and enum names are kept, so the shared Drizzle package changes by `pgSchema("portal")`.
 
-### `staff.*` — the review pipeline and everything the staff portal creates
+| Tables (unchanged names) | Changes |
+|---|---|
+| `client_users` | `customer_id` → a **`jms.customers.id`** (see *Re-pointing*) |
+| `portal_enrollment_pins` | `customer_uid` kept; **add `jms_customer_id`** |
+| `portal_password_reset_tokens`, `portal_password_setup_tokens` | — (setup tokens are the legacy flow; copied, candidate for removal) |
+| `legacy_reports` | empty; table only |
+| `staff_users`, `staff_password_reset_tokens` | — |
+| `jobs` | `customer_id` / `asset_id` → jms ids; **add `jms_job_id`** from `zuper_job_uid` |
+| `engine_snapshots`, `review_items`, `rectifications`, `report_versions` | — |
+| `issuances` | `customer_id` → jms id |
+| `customer_decisions`, `quotations` | — |
+| `job_status_steps`, `job_status_step_revisions`, `job_step_attachments` | — |
+| `applicability_determinations`, `governed_rows`, `governed_drt_rules`, `governed_seed_state` | — |
+| `audit_log`, `notifications` | — |
+| `__drizzle_migrations` | copy of `drizzle.__drizzle_migrations`, so the migrator knows what has run |
 
-Both portals use these tables; the staff portal creates the rows, so the staff schema owns
-them and the client portal gets narrow grants.
-
-| New table | From `gbg` | Client portal access |
-|---|---|---|
-| `staff.users`, `staff.password_reset_tokens` | `staff_users`, `staff_password_reset_tokens` | none |
-| `staff.jobs` | `jobs` | read. `customer_id`/`asset_id` → jms ids; **add `jms_job_id`** from `zuper_job_uid` |
-| `staff.engine_snapshots`, `staff.review_items`, `staff.rectifications` | same names | read |
-| `staff.report_versions` | `report_versions` | read |
-| `staff.issuances` | `issuances` | read. `customer_id` → jms id |
-| `staff.customer_decisions` | `customer_decisions` | read + insert |
-| `staff.quotations` | `quotations` | read + update status |
-| `staff.job_status_steps`, `staff.job_status_step_revisions`, `staff.job_step_attachments` | same names | read |
-| `staff.applicability_determinations`, `staff.governed_rows`, `staff.governed_drt_rules`, `staff.governed_seed_state` | same names | read |
-| `staff.audit_log`, `staff.notifications` | same names | insert |
-
-The 16 enum types move to `staff.*` (`client.*` uses none). Names are kept so the Drizzle
-schema changes only by `pgSchema("staff")`. Primary keys, tokens and object keys keep
-their values: Zuper already holds attachment and quotation URLs built from them, S3 keys
-embed the uuids, and session cookies carry the user ids.
+The 16 enum types and the eight `gbg_*` protection functions move to `portal` too; the
+functions get `search_path = portal` because they refer to tables unqualified. Primary keys,
+tokens and object keys keep their values: Zuper already holds attachment and quotation URLs
+built from them, S3 keys embed the uuids, and session cookies carry the user ids.
 
 ### `amc.*` — reminders, bookings and AMC's own accounts
 
@@ -170,17 +167,17 @@ so most reads change a table name rather than a query:
 
 ## Access
 
-**One login role per application**, used over a direct Postgres connection (Drizzle / `pg`):
+**One login role per database user of today**, used over a direct Postgres connection
+(Drizzle / `pg`). The two portals share one connection string today and keep sharing one role:
 
-| Role | Own schema | `jms` | Other |
-|---|---|---|---|
-| `client_portal_app` | all DML on `client.*` | `SELECT` on the tables and views the portal reads | `staff.*`: read; insert `customer_decisions`, `audit_log`, `notifications`; update `quotations(status, decided_at)` |
-| `staff_portal_app` | all DML on `staff.*` | `SELECT` | — |
-| `amc_app` | all DML on `amc.*` | `SELECT` | — |
+| Role | Own schema | `jms` |
+|---|---|---|
+| `portal_app` | all DML on `portal.*` | `SELECT` on the tables and views the portals read |
+| `amc_app` | all DML on `amc.*` | `SELECT` |
 
 None of them may write `jms.*`. Row-level security is on; each role gets a policy for its own
 schema. The existing `tgbg_portal` PostgREST role (the client portal's "Tuper" data source)
-keeps working and is retired when the portal moves to `client_portal_app`.
+keeps working and is retired when the portal moves to `portal_app`.
 
 **Getting there on the network.** The Supabase database has no published port and sits on
 Docker network `x123f7phha4w5nas4dtq2k50`; the three applications are on `coolify`. Attach
@@ -192,15 +189,15 @@ schemas are **not** added to `PGRST_DB_SCHEMAS` unless an application needs them
 
 ## Doing it
 
-### Phase 1 — create and copy (this session)
+### Phase 1 — create and copy — **done 2026-09-17**
 
 1. Migration files in `TGBG-Zupersync/migrations/`: schemas `client`, `staff`, `amc`; the
    enum types; every table with its constraints, partial indexes and the eight `gbg_*`
    protection triggers (rewritten schema-qualified); the read views; the three roles and
    their grants and policies.
-2. A copy script (`npm run merge:copy -- --app client|staff|amc [--apply]`, dry run by
-   default) that:
-   - reads `gbg` over `docker exec` and the AMC **snapshot** (never the live file);
+2. A copy script (`scripts/merge-copy.sh portal|amc [--apply]`, dry run by default) that:
+   - runs entirely on `tgbgaws` — rows go from `gbg` (as JSON) and from the AMC **snapshot**
+     (never the live file, as CSV) into a staging schema in Supabase, and never leave the server;
    - converts and re-points as described above, and reports every unresolved reference;
    - loads with triggers held off (`session_replication_role = replica`), fills circular
      links (`jobs.current_snapshot_id`, `jobs.current_report_version_id`,
@@ -209,6 +206,50 @@ schemas are **not** added to `PGRST_DB_SCHEMAS` unless an application needs them
      now and once more at cutover;
    - verifies: row counts per table, no orphaned references, protection triggers present.
 3. Nothing in `gbg`, the AMC file or the running applications changes.
+
+What was done:
+
+| Step | Result |
+|---|---|
+| `migrations/0004_portal_schema.sql` (generated by `scripts/merge/gen-portal-schema.py`) | 25 tables, 16 enums, 8 protection triggers, RLS on all |
+| `migrations/0005_amc_schema.sql` | 23 tables + `amc.audit_all`, RLS on all, `amc.secret()` |
+| `migrations/0006_app_roles_and_read_views.sql` | roles `portal_app`, `amc_app`; grants; `app_read` policies on jms; views `jms.v_uid`, `v_job_summary`, `v_customer`, `v_asset`, `v_user` |
+| `migrations/0007_portal_zuper_uids.sql` | `zuper_customer_uid` / `zuper_asset_uid` beside the jms references |
+| `scripts/merge/merge-copy.sh portal --apply` | 2,552 rows, every table equal to `gbg`; 0 orphaned references; all 23 review jobs resolved to jms jobs |
+| `scripts/merge/merge-copy.sh amc --apply` | 10,452 rows from snapshot `~/merge-snapshots/amc-reminders-20260917T134152Z.db`; every table equal except the keys moved out (below); 0 orphans; every timestamp converted |
+| Secrets | 7 AMC secrets in Vault (`amc/zuper_api_token`, `amc/booking_secret_key`, `amc/location/{2..6}/whatsapp_api_key`); the global WhatsApp key was empty |
+| Logins | `scripts/merge/set-app-role-password.py` — `SUPABASE_DATABASE_URL` added to the Client Portal and AMC Engine Coolify apps (runtime only; not yet used). Both logins verified over the Supabase network |
+
+References the copy could not resolve to `jms` (rows kept, `jms` id empty, Zuper uid kept):
+
+- portal: two **end-to-end test customers** (uids starting `e2e-`) behind 2 portal accounts,
+  2 issued reports, 2 review jobs and 1 sign-in code — test data in production that can be
+  deleted; one asset Zuper has since deleted (review job `asset_id`).
+- amc: jobs `jms` does not have (deleted in Zuper) — 2 of 1,713 reminders, 10 of 1,037
+  scheduled reminders, 29 of 1,248 WhatsApp messages, 20 of 567 booking entries.
+
+## Connecting
+
+| From | How |
+|---|---|
+| An application on `tgbgaws` | Attach it to Docker network `x123f7phha4w5nas4dtq2k50` (Coolify → application → Network → *Connect to predefined network*), then use `SUPABASE_DATABASE_URL` from its environment. **Not attached yet** — do it at cutover. |
+| A development machine | `scripts/merge/tunnel.sh` (localhost:55433), then the same URL with host `localhost` and port `55433`. The password is only in the Coolify environment (Client Portal: `d474sjhh2no9xu6h93gwotbr`, AMC: `sti1wkudfqfsvk2s98sqn9df`); the Staff Portal uses the Client Portal's value. |
+
+Useful reads:
+
+```sql
+-- this week's AMC jobs for one category
+SELECT job_uid, work_order_number, status_name, scheduled_start, assigned_tech_names, workshop_location
+  FROM jms.v_job_summary
+ WHERE category_name = 'AMC - Workshop' AND scheduled_start >= date_trunc('week', now())
+   AND scheduled_start < date_trunc('week', now()) + interval '7 days' AND NOT is_deleted;
+
+-- a Zuper uid to its jms id and back
+SELECT jms_id FROM jms.v_uid WHERE entity = 'customers' AND zuper_uid = $1;
+```
+
+Filters on `job_uid`, `id`, `work_order_number` and `scheduled_start` use indexes (tens of
+milliseconds for a week of jobs).
 
 ### Phase 2 — change each application (per-project sessions)
 
@@ -222,8 +263,10 @@ cutover. See the briefs below.
 3. Deploy the application pointed at Supabase; check sign-in, lists, one write each.
 4. Keep the old database untouched for two weeks as the fallback.
 
-Suggested order: **Client Portal** (already reads `jms` in its Tuper mode) → **AMC Engine**
-reads → **Staff Portal** → **AMC Engine** own tables (the async rewrite).
+Order (owner decision): **Client Portal** → **AMC Engine** reads → **Staff Portal** →
+**AMC Engine** own tables (the async rewrite). For each: attach the application to the Supabase
+network, re-run `scripts/merge/merge-copy.sh <portal|amc> --apply` while its writes are paused,
+then deploy the version that reads Supabase.
 
 ### Phase 4 — retire
 
@@ -234,10 +277,14 @@ reads → **Staff Portal** → **AMC Engine** own tables (the async rewrite).
 
 ## Briefs for the application sessions
 
+Start each session by reading this file. The data is already in Supabase; the job is to point
+the application at it. Keep each change behind a switch until cutover, and never write to
+`jms.*` — Zupersync is its only writer.
+
 ### Client Portal (`C:\Projects\tgbg-portal\apps\client-portal`)
 
-- Connection: `DATABASE_URL` → Supabase as `client_portal_app`. In `@tgbg/db`, move the
-  client tables to `pgSchema("client")` and the shared pipeline tables to `pgSchema("staff")`.
+- Connection: `DATABASE_URL` → Supabase as `portal_app`. In `@tgbg/db`, every table and
+  enum moves to `pgSchema("portal")` (shared with the staff portal).
 - Records: make the `tuper` data source the only one — it already reads `jms` — and read it
   through the direct connection instead of PostgREST. Delete the Zuper-mirror reads
   (`customer-mirror.ts`, `records/zuper.ts` reads) and the webhook receiver after cutover.
@@ -250,8 +297,9 @@ reads → **Staff Portal** → **AMC Engine** own tables (the async rewrite).
 
 - The container **runs migrations on every boot** (`scripts/start.mjs` → `migrate.mjs`).
   Change that before pointing it at Supabase, or it will create its tables in `public`.
-  The migration manifest must target `staff.*`, and `governed_seed_state` must be copied so
-  the governed seed does not run again.
+  The migration manifest must target `portal.*` (and the Drizzle journal
+  `portal.__drizzle_migrations`), and `governed_seed_state` is copied so the governed seed
+  does not run again.
 - Ingest: replace `fetchJobsByCategory` / `fetchJobDetail` / `fetchPortalEnabledCustomers`
   with reads from `jms` (`jms.v_job_summary`, `jms.jobs` + checklist history). The immutable
   `engine_snapshots.raw_payload` should be built from `jms` data from now on; existing
@@ -284,7 +332,7 @@ reads → **Staff Portal** → **AMC Engine** own tables (the async rewrite).
 | A reference to a Zuper record is not in `jms` | Reported by the copy; Zupersync imports the record first |
 | The staff container re-creates tables in `public` | Migration target changed before the first Supabase boot |
 | Mixed date formats in AMC | Converted column by column with explicit rules; rows that do not parse are reported, not guessed |
-| Two accounts named `admin@golfbuggyguy.com` (client and staff) | They stay separate, in separate schemas |
+| Two accounts named `admin@golfbuggyguy.com` (client and staff) | They stay separate rows in separate tables, as today |
 
 ## Security notes found while surveying
 
@@ -298,9 +346,10 @@ reads → **Staff Portal** → **AMC Engine** own tables (the async rewrite).
 - `database.js` in AMC creates four default users with a shared password when `users` is
   empty — disable before Step B.
 
-## Decisions for the owner
+## Owner decisions (2026-09-17)
 
-1. Shared portal tables in `staff.*` (as above) or a single `portal.*` schema for both portals.
-2. Direct Postgres over the Supabase Docker network (as above) or PostgREST over HTTPS.
-3. Cutover order (as above) and a maintenance window for each application.
-4. Removing the portal's 68 Zuper webhooks after the portal cutover.
+1. **One `portal.*` schema** for both portals (not a client/staff split).
+2. **Direct Postgres** over the Supabase Docker network, one login role per application.
+3. **Cutover order:** Client Portal → AMC Engine reads → Staff Portal → AMC Engine own tables.
+4. **Each application's Zuper webhooks are removed after its cutover** (once it has run
+   cleanly for a day). DataHouse's webhooks are never touched.
