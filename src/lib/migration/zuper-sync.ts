@@ -1762,9 +1762,13 @@ async function writeZuperActivity(ctx: Ctx, entityType: string, entityId: string
     const verb = action === "JOB_STATUS" || (["REQUEST", "ESTIMATE", "INVOICE"].includes(action) && /\bstatus\b/i.test(message)) ? "zuper_status"
       : action.includes("NOTE") ? "zuper_note" : action === "TIMELOG" ? "zuper_timelog" : "zuper_activity";
     const remarks = T(a.metadata?.remarks);
+    // Zuper's own Activity tab reads none of the sentence above: it renders metadata.fields_updated — each field's
+    // label with its old and new value, and for a status move the status's name and colour. Tuper's tab renders the
+    // same, so the list is kept as Zuper sends it. The rest of metadata (the client that made the call) is dropped.
+    const fields = Array.isArray(a.metadata?.fields_updated) && a.metadata.fields_updated.length ? a.metadata.fields_updated : null;
     return {
       tenant_id: ctx.tenantId, entity_type: entityType, entity_id: entityId, actor_id: mapGet(users, a.users?.user_uid), verb,
-      meta: { message, zuper_type: T(a.activity_type), zuper_action: T(action), ...(remarks ? { remarks } : {}), zuper_uid: T(a.user_activity_uid) },
+      meta: { message, zuper_type: T(a.activity_type), zuper_action: T(action), ...(remarks ? { remarks } : {}), ...(fields ? { metadata: { fields_updated: fields } } : {}), zuper_uid: T(a.user_activity_uid) },
       ...(a.created_at ? { created_at: String(a.created_at) } : {}),
     };
   });
