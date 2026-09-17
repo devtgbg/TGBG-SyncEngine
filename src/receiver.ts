@@ -21,7 +21,7 @@
 import { Router, type Request, type Response } from "express";
 import { timingSafeEqual } from "node:crypto";
 import { config, errorText, secretConfigured } from "./config.js";
-import { db } from "./supabase.js";
+import { one } from "./store.js";
 import { resolveRoute } from "./routes.js";
 
 export const receiver = Router();
@@ -103,22 +103,19 @@ export async function captureUnparseable(req: Request, err: Error & { type?: str
   const v = verify(req);
   const raw = (req as Request & { rawBody?: Buffer }).rawBody;
   try {
-    const { data, error } = await db().schema("jms").from("zuper_webhook_events").insert({
-      tenant_id: config.tenantId,
-      received_at: new Date().toISOString(),
-      verified: v.verified,
-      verify_reason: v.reason,
-      // Nothing can be identified from a body that would not parse.
-      module: null, event: null, zuper_uid: null, work_order_number: null,
-      headers: req.headers,
-      // body is JSONB, so the raw text is wrapped to stay valid JSON while
-      // preserving exactly what arrived.
-      body: { _unparsed: raw ? raw.toString("utf8").slice(0, 100_000) : null, _parse_error: err.type ?? err.name },
-      processed_at: new Date().toISOString(),
-      process_error: `unparseable body: ${err.message}`.slice(0, 400),
-    }).select("id").single();
-    if (error) throw error;
-    return (data as { id: string }).id;
+    const row = await one<{ id: string }>(
+      `INSERT INTO sync.webhook_events
+         (tenant_id, source, verified, verify_reason, headers, body, processed_at, process_error)
+       VALUES ($1, 'zuper', $2, $3, $4, $5, now(), $6)
+       RETURNING id`,
+      [
+        config.tenantId, v.verified, v.reason, JSON.stringify(req.headers),
+        // body is JSONB, so the raw text is wrapped to stay valid JSON while preserving exactly what arrived.
+        JSON.stringify({ _unparsed: raw ? raw.toString("utf8").slice(0, 100_000) : null, _parse_error: err.type ?? err.name }),
+        `unparseable body: ${err.message}`.slice(0, 400),
+      ],
+    );
+    return row?.id ?? null;
   } catch (e) {
     console.warn("[zupersync] could not persist unparseable delivery:", errorText(e));
     return null;
@@ -127,23 +124,20 @@ export async function captureUnparseable(req: Request, err: Error & { type?: str
 
 /** Persist the delivery. Never throws — a logging failure must not cost us the ACK. */
 async function capture(
-  req: Request, v: Verdict, ids: ReturnType<typeof identify>,
+  req: Request, v: Verdict, ids: ReturnType<typeof identify>, source: "zuper" | "tuper" = "zuper",
 ): Promise<string | null> {
   try {
-    const { data, error } = await db().schema("jms").from("zuper_webhook_events").insert({
-      tenant_id: config.tenantId,
-      received_at: new Date().toISOString(),
-      verified: v.verified,
-      verify_reason: v.reason,
-      module: ids.module,
-      event: ids.event,
-      zuper_uid: ids.uid,
-      work_order_number: ids.workOrder,
-      headers: req.headers,
-      body: req.body ?? {},
-    }).select("id").single();
-    if (error) throw error;
-    return (data as { id: string }).id;
+    const row = await one<{ id: string }>(
+      `INSERT INTO sync.webhook_events
+         (tenant_id, source, verified, verify_reason, module, event, zuper_uid, work_order_number, headers, body)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       RETURNING id`,
+      [
+        config.tenantId, source, v.verified, v.reason, ids.module, ids.event, ids.uid, ids.workOrder,
+        JSON.stringify(req.headers), JSON.stringify(req.body ?? {}),
+      ],
+    );
+    return row?.id ?? null;
   } catch (err) {
     // Includes "table does not exist" before the migration is applied — the
     // service still works, it just can't replay.

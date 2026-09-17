@@ -7,7 +7,7 @@
  * reason (an importer change, a gap), and each run is recorded in jms.zuper_sync_runs.
  */
 
-import { db } from "../supabase.js";
+import { tuper as db } from "../tuper-client.js";
 import { config } from "../config.js";
 import { runSync } from "../lib/migration/zuper-sync.js";
 

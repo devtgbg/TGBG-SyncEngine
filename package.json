@@ -22,16 +22,19 @@
     "check": "npm run check-routes && npm run check-wire-routes && npm run check-real-payload && npm run check-checklist-import",
     "check-real-payload": "tsx src/cli/check-real-payload.ts",
     "sweep": "tsx src/cli/sweep.ts",
-    "outbox": "tsx src/cli/outbox.ts"
+    "outbox": "tsx src/cli/outbox.ts",
+    "check-push": "tsx src/cli/check-push.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
     "dotenv": "^16.4.5",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "pg": "^8.23.0"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^20.14.0",
+    "@types/pg": "^8.23.1",
     "esbuild": "^0.28.2",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3"

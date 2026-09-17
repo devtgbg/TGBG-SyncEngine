@@ -70,9 +70,22 @@ export const config = {
   nodeEnv: optional("NODE_ENV", "development"),
   isProduction: optional("NODE_ENV", "development") === "production",
 
-  supabase: {
-    url: required("SUPABASE_URL"),
-    serviceRoleKey: required("SUPABASE_SERVICE_ROLE_KEY"),
+  /**
+   * Tuper's API — where records are read and written from now on. The key carries the `sync` scope; without it the
+   * sync endpoints refuse every call. There is no database connection here on purpose: this service reaches both
+   * systems the same way, over their APIs (docs/API-ONLY.md).
+   */
+  tuper: {
+    url: (optional("TUPER_API_URL", "https://api.tuper.golfbuggyguy.com")).replace(/\/+$/, ""),
+    apiKey: required("TUPER_API_KEY"),
+  },
+
+  /**
+   * This service's own database: the deliveries it has received, the queue of changes waiting to go to Zuper, its
+   * configuration and its run history. Its data, in its own place — and it keeps working when Tuper does not.
+   */
+  store: {
+    url: required("DATABASE_URL"),
   },
 
   tenantId: optional("DEFAULT_TENANT_ID", "00000000-0000-0000-0000-000000000001"),
@@ -90,6 +103,14 @@ export const config = {
   webhook: {
     header: optional("ZUPER_WEBHOOK_HEADER", "x-zupersync-key").toLowerCase(),
     secret: process.env.ZUPER_WEBHOOK_SECRET?.trim() || "",
+  },
+
+  /**
+   * Tuper's webhooks — changes made in Tuper, on their way to Zuper. Tuper signs each delivery with the webhook's
+   * own secret (x-tuper-signature: sha256=…), so unlike Zuper there is a real signature to check.
+   */
+  tuperWebhook: {
+    secret: process.env.TUPER_WEBHOOK_SECRET?.trim() || "",
   },
 
   /**
@@ -147,6 +168,30 @@ export const config = {
     deletes: optional("PUSH_DELETES", "false") === "true",
     // The company's zone (Tuper: Settings › Company). Zuper applies it to schedules.
     timeZone: optional("PUSH_TIMEZONE", "Asia/Dubai"),
+    /**
+     * When Zuper holds neither the value someone set in Tuper nor the value they
+     * started from, the field was changed on both sides. `zuper-wins` (the default)
+     * leaves Zuper alone and says so on the outbox row: Zuper is the system of
+     * record, and a technician's status set from the mobile app a moment ago must
+     * not be replaced by an older one from a desk. `tuper-wins` pushes regardless.
+     */
+    onConflict: optional("PUSH_ON_CONFLICT", "zuper-wins") === "tuper-wins" ? "tuper-wins" as const : "zuper-wins" as const,
+    /**
+     * Which entities `live` applies to. Everything else is planned and never sent,
+     * whatever PUSH_MODE says — so a kind of record goes live only after its
+     * requests have been checked against the real account, one kind at a time.
+     * Jobs are the default: their request shapes ran in production in the AMC
+     * engine and the portals for months. Customers: update is DataHouse's
+     * production call; add "customers" once a first push has been watched.
+     */
+    entities: optional("PUSH_ENTITIES", "jobs").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+    /**
+     * A change older than this is not sent; it is marked skipped, with its age.
+     * While pushing is off or dry-run, edits pile up here and the inbound sync puts
+     * Zuper's values back over them. Turning `live` on must not then replay a
+     * week of edits nobody remembers making over whatever Zuper holds now.
+     */
+    maxAgeMinutes: Math.max(5, Number(optional("PUSH_MAX_AGE_MINUTES", "120"))),
   },
 
   sweep: {

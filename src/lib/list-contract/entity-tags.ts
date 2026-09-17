@@ -6,7 +6,7 @@
 // exactly what Settings → Master Tags writes, so tags typed on a record and tags defined in
 // settings are the SAME rows rather than two parallel vocabularies. `taggables.entity_type` is the
 // jms.custom_field_entity enum, whose values are those same upper-case keys.
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { TuperClient as SupabaseClient } from "../../tuper-client.js";
 import { FilterValidationError } from "./operators";
 
 /** Entity types that can carry tags — MODULE_KEYS in config-admin.ts (Master Tags), less GALLERY, whose tags go on photos. */
@@ -44,9 +44,9 @@ export async function getEntityTags(
     .eq("tenant_id", tenantId).eq("entity_type", entityType).eq("entity_id", entityId);
   if (error) throw error;
   return (data ?? [])
-    .map((r) => (r as any).tags?.name as string | undefined)
-    .filter((n): n is string => Boolean(n))
-    .sort((a, b) => a.localeCompare(b));
+    .map((r: any) => (r as any).tags?.name as string | undefined)
+    .filter((n: unknown): n is string => Boolean(n))
+    .sort((a: any, b: any) => a.localeCompare(b));
 }
 
 /**
@@ -73,7 +73,7 @@ export async function getEntityTagsBulk(
       (out[id] ??= []).push(name);
     }
   }
-  for (const k of Object.keys(out)) out[k].sort((a, b) => a.localeCompare(b));
+  for (const k of Object.keys(out)) out[k].sort((a: any, b: any) => a.localeCompare(b));
   return out;
 }
 
@@ -107,15 +107,15 @@ export async function setEntityTags(
       for (const t of created ?? []) idByLower.set(String((t as any).name).toLowerCase(), (t as any).id);
     }
   }
-  const wantedIds = new Set(wanted.map((n) => idByLower.get(n.toLowerCase())).filter(Boolean) as string[]);
+  const wantedIds = new Set(wanted.map((n: any) => idByLower.get(n.toLowerCase())).filter(Boolean) as string[]);
 
   // 2. Reconcile the links.
   const { data: links, error: lErr } = await client.schema("jms").from("taggables")
     .select("id, tag_id").eq("tenant_id", tenantId).eq("entity_type", entityType).eq("entity_id", entityId);
   if (lErr) throw lErr;
-  const currentIds = new Set((links ?? []).map((l) => (l as any).tag_id as string));
+  const currentIds = new Set((links ?? []).map((l: any) => (l as any).tag_id as string));
 
-  const toRemove = (links ?? []).filter((l) => !wantedIds.has((l as any).tag_id as string)).map((l) => (l as any).id as string);
+  const toRemove = (links ?? []).filter((l: any) => !wantedIds.has((l as any).tag_id as string)).map((l: any) => (l as any).id as string);
   if (toRemove.length > 0) {
     const { error } = await client.schema("jms").from("taggables").delete().in("id", toRemove);
     if (error) throw error;

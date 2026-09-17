@@ -24,7 +24,7 @@
  */
 
 import { config, errorText } from "./config.js";
-import { db } from "./supabase.js";
+import { tuper as db } from "./tuper-client.js";
 import { customerFields, getSyncConfig, zuperFilterPages, zuperGet, type SyncConfig } from "./lib/migration/zuper-sync.js";
 import { syncOne, syncRecord } from "./processor.js";
 import { syncCollection } from "./collections.js";

@@ -23,7 +23,7 @@
  */
 
 import { config, errorText } from "./config.js";
-import { db } from "./supabase.js";
+import { tuper as db } from "./tuper-client.js";
 import { getSyncConfig, zuperFilterPages, zuperGet } from "./lib/migration/zuper-sync.js";
 import { syncOne } from "./processor.js";
 import type { Collection } from "./routes.js";

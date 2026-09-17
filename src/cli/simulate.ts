@@ -20,7 +20,8 @@
  */
 
 import { config, secretConfigured } from "../config.js";
-import { db } from "../supabase.js";
+import { one } from "../store.js";
+import { tuper as db } from "../tuper-client.js";
 import { resolveRoute } from "../routes.js";
 
 const argv = process.argv.slice(2);
@@ -95,10 +96,11 @@ async function main() {
 
   for (let i = 0; i < 12; i++) {
     await new Promise((r) => setTimeout(r, 1000));
-    const { data } = await db().schema("jms").from("zuper_webhook_events")
-      .select("verified, verify_reason, module, event, zuper_uid, sync_entity, processed_at, process_error")
-      .eq("id", stored).maybeSingle();
-    const row = data as Record<string, unknown> | null;
+    const row = await one<Record<string, unknown>>(
+      `SELECT verified, verify_reason, module, event, zuper_uid, sync_entity, processed_at, process_error
+         FROM sync.webhook_events WHERE id = $1`,
+      [stored],
+    );
     if (!row) continue;
     if (row.processed_at || row.process_error || (badSecret && row.verified === false)) {
       console.log("\nstored delivery:");

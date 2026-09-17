@@ -59,7 +59,7 @@
  */
 
 import { config, errorText } from "./config.js";
-import { db } from "./supabase.js";
+import { tuper as db } from "./tuper-client.js";
 import { getSyncConfig, zuperGet } from "./lib/migration/zuper-sync.js";
 import { syncRecord } from "./processor.js";
 import { JOB_ENRICH } from "./routes.js";

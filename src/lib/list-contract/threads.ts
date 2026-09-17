@@ -2,7 +2,7 @@
 // One engine behind every module's Comments/Notes + Activity tabs (requests, jobs, …). Rows are
 // keyed by (entity_type, entity_id); tenant isolation is enforced in code. Activity is append-only;
 // comments are soft-deletable by their author (or an admin). Supersedes request-specific threads.
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { TuperClient as SupabaseClient } from "../../tuper-client.js";
 import { FilterValidationError } from "./operators";
 
 // 'job_chat' is the Job Internal Chat channel — a distinct entity_type so job chat messages never

@@ -1,13 +1,14 @@
 // ── Zuper → Tuper sync engine ── pulls real Golf Buggy Guy data from the Zuper API (x-api-key) and
 // upserts it straight into jms.* (no mirror). Idempotent via jms.zuper_sync_map (zuper_uid ↔ jms id),
-// so re-runs update in place and cross-entity FKs resolve. Driven by jms.zuper_sync_config (key /
-// base / enabled / interval). Every run is logged to jms.zuper_sync_runs. Server-only.
+// so re-runs update in place and cross-entity FKs resolve. Records are written through Tuper's API (src/tuper-client.ts),
+// never a database connection. This service's own settings (key / base / enabled / interval) and its run log live in
+// its own database, sync.config and sync.runs (src/store.ts). Server-only.
 //
 // History import (owner decisions 2026-09-11): customers are imported fresh with their Zuper ids and
 // the legacy mirror customers retired (retireLegacyCustomers); only active users get accounts, with no
 // password and no invite; every job comes across. Run order so links resolve:
 //   organizations → customers → users → assets → contracts → requests → jobs → estimates → invoices
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { TuperClient as SupabaseClient } from "../../tuper-client.js";
 import { saveChecklistFields, checklistFieldConfig, type ChecklistFieldInput } from "../list-contract/checklists";
 import { setEntityTags } from "../list-contract/entity-tags";
 // Zupersync: the three pure helpers this engine used from tenant-dates.ts and
@@ -16,14 +17,21 @@ import { setEntityTags } from "../list-contract/entity-tags";
 // which a sync service runs.
 import { addDays as addDaysYmd, cleanFileName, kindOf } from "../helpers";
 import { sanitizeRichText, richTextToPlain } from "../rich-text";
+import { one as storeOne, sql as storeSql } from "../../store.js";
 
 export interface SyncConfig { api_key: string | null; api_base: string; company: string | null; enabled: boolean; interval_hours: number; last_run_at: string | null; next_run_at: string | null; is_syncing: boolean }
 
 // ── Config ──
-export async function getSyncConfig(client: SupabaseClient, tenantId: string): Promise<SyncConfig> {
-  let { data } = await client.schema("jms").from("zuper_sync_config").select("*").eq("tenant_id", tenantId).maybeSingle();
-  if (!data) { const ins = await client.schema("jms").from("zuper_sync_config").insert({ tenant_id: tenantId }).select("*").single(); if (ins.error) throw ins.error; data = ins.data; }
-  return data as any;
+export async function getSyncConfig(_client: SupabaseClient, tenantId: string): Promise<SyncConfig> {
+  // This service's own settings, in its own database (src/store.ts). The row is made on first use.
+  const row = await storeOne<SyncConfig>(
+    `INSERT INTO sync.config (tenant_id) VALUES ($1)
+     ON CONFLICT (tenant_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id
+     RETURNING api_key, api_base, company, enabled, interval_hours, last_run_at, next_run_at, is_syncing`,
+    [tenantId],
+  );
+  if (!row) throw new Error("could not read the sync configuration");
+  return row;
 }
 export async function saveSyncConfig(client: SupabaseClient, tenantId: string, patch: Partial<SyncConfig>): Promise<void> {
   await getSyncConfig(client, tenantId);
@@ -34,8 +42,9 @@ export async function saveSyncConfig(client: SupabaseClient, tenantId: string, p
   if (patch.enabled !== undefined) fields.enabled = patch.enabled;
   if (patch.interval_hours !== undefined) fields.interval_hours = patch.interval_hours;
   if (Object.keys(fields).length === 0) return;
-  const { error } = await client.schema("jms").from("zuper_sync_config").update(fields).eq("tenant_id", tenantId);
-  if (error) throw error;
+  const columns = Object.keys(fields);
+  const sets = columns.map((c, i) => `${c} = $${i + 2}`).join(", ");
+  await storeSql(`UPDATE sync.config SET ${sets} WHERE tenant_id = $1`, [tenantId, ...columns.map((c) => fields[c])]);
 }
 
 // ── Zuper API client ──
@@ -1195,9 +1204,10 @@ ENTITIES.jobs_oldest = {
   ...ENTITIES.jobs, name: "jobs_oldest", mapEntity: "jobs",
   async *pages(ctx) {
     const imported = await ctxMap(ctx, "jobs");
-    const { data: firstRun } = await ctx.client.schema("jms").from("zuper_sync_runs").select("started_at")
-      .eq("tenant_id", ctx.tenantId).eq("entity", "jobs_oldest").order("started_at", { ascending: true }).limit(1).maybeSingle();
-    const cutoff = (firstRun as { started_at: string } | null)?.started_at ?? new Date().toISOString();
+    const firstRun = await storeOne<{ started_at: string }>(
+      `SELECT started_at FROM sync.runs WHERE tenant_id = $1 AND entity = 'jobs_oldest'
+        ORDER BY started_at ASC LIMIT 1`, [ctx.tenantId]);
+    const cutoff = firstRun?.started_at ?? new Date().toISOString();
     const newestFirst = new Set<string>();
     for (let from = 0; ; from += 1000) {
       const { data, error } = await ctx.client.schema("jms").from("zuper_sync_map").select("zuper_uid")
@@ -1844,7 +1854,8 @@ ENTITIES.estimate_activity = {
 
 export async function syncEntity(ctx: Ctx, name: string): Promise<{ fetched: number; upserted: number; failed: number }> {
   const e = ENTITIES[name]; if (!e) throw new Error(`unknown entity ${name}`);
-  const run = await ctx.client.schema("jms").from("zuper_sync_runs").insert({ tenant_id: ctx.tenantId, entity: name }).select("id").single();
+  const run = { data: await storeOne<{ id: string }>(
+    "INSERT INTO sync.runs (tenant_id, entity) VALUES ($1, $2) RETURNING id", [ctx.tenantId, name]), error: null };
   const runId = (run.data as any)?.id;
   const log = process.env.ZUPER_SYNC_LOG ? (msg: string) => console.log(`  ${name}: ${msg}`) : () => {};
   let fetched = 0, upserted = 0, failed = 0, detail: string | null = null;
@@ -1918,10 +1929,18 @@ export async function syncEntity(ctx: Ctx, name: string): Promise<{ fetched: num
       await inChunks(rows, n, one);
     }
     if (e.afterAll) await e.afterAll(ctx, rows);
-    await ctx.client.schema("jms").from("zuper_sync_runs").update({ finished_at: new Date().toISOString(), fetched, upserted, failed, status: failed && !upserted ? "FAILED" : "OK", detail }).eq("id", runId);
+    await storeSql(
+      `UPDATE sync.runs SET finished_at = now(), fetched = $2, upserted = $3, failed = $4, status = $5, detail = $6
+        WHERE id = $1`,
+      [runId, fetched, upserted, failed, failed && !upserted ? "FAILED" : "OK", JSON.stringify(detail)],
+    );
   } catch (err) {
     detail = err instanceof Error ? err.message.slice(0, 200) : "sync error";
-    await ctx.client.schema("jms").from("zuper_sync_runs").update({ finished_at: new Date().toISOString(), fetched, upserted, failed, status: "FAILED", detail }).eq("id", runId);
+    await storeSql(
+      `UPDATE sync.runs SET finished_at = now(), fetched = $2, upserted = $3, failed = $4, status = $5, detail = $6
+        WHERE id = $1`,
+      [runId, fetched, upserted, failed, "FAILED", JSON.stringify(detail)],
+    );
     throw err;
   }
   return { fetched, upserted, failed };
@@ -1931,14 +1950,17 @@ export async function syncEntity(ctx: Ctx, name: string): Promise<{ fetched: num
 export async function runSync(client: SupabaseClient, tenantId: string, order: string[] = ["job_categories", "job_statuses", "products"]): Promise<Record<string, any>> {
   const cfg = await getSyncConfig(client, tenantId);
   if (!cfg.api_key) throw new Error("no Zuper API key configured");
-  await client.schema("jms").from("zuper_sync_config").update({ is_syncing: true }).eq("tenant_id", tenantId);
+  await storeSql("UPDATE sync.config SET is_syncing = true WHERE tenant_id = $1", [tenantId]);
   const ctx: Ctx = { client, tenantId, cfg, maps: {}, extra: {} };
   const results: Record<string, any> = {};
   try {
     for (const name of order) results[name] = await syncEntity(ctx, name);
   } finally {
     const next = new Date(Date.now() + cfg.interval_hours * 3600_000).toISOString();
-    await client.schema("jms").from("zuper_sync_config").update({ is_syncing: false, last_run_at: new Date().toISOString(), next_run_at: next }).eq("tenant_id", tenantId);
+    await storeSql(
+      "UPDATE sync.config SET is_syncing = false, last_run_at = now(), next_run_at = $2 WHERE tenant_id = $1",
+      [tenantId, next],
+    );
   }
   return results;
 }
@@ -1975,6 +1997,10 @@ export async function retireLegacyCustomers(client: SupabaseClient, tenantId: st
 }
 
 export async function recentRuns(client: SupabaseClient, tenantId: string, limit = 20) {
-  const { data } = await client.schema("jms").from("zuper_sync_runs").select("entity, started_at, finished_at, fetched, upserted, failed, status, detail").eq("tenant_id", tenantId).order("started_at", { ascending: false }).limit(limit);
+  const data = await storeSql(
+    `SELECT entity, started_at, finished_at, fetched, upserted, failed, status, detail
+       FROM sync.runs WHERE tenant_id = $1 ORDER BY started_at DESC LIMIT $2`,
+    [tenantId, limit],
+  );
   return data ?? [];
 }

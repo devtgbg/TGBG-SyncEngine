@@ -2,7 +2,7 @@
 // number — its module's Sequence Start Number, or one past the highest already used — and numbering continues from
 // there. While Zuper still runs, a record imported from Zuper can arrive with a number a record made in Tuper already
 // took. Zuper owns its numbers, so the Tuper-made record moves to the next number, and its activity says so.
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { TuperClient as SupabaseClient } from "../../tuper-client.js";
 
 export type NumberedKind = "job" | "contract" | "product" | "request";
 const SPEC: Record<NumberedKind, { table: string; column: string; next: string; renumber: string; syncEntity: string; activity: "job" | "contract" | "request" | null }> = {

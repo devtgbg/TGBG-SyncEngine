@@ -13,10 +13,12 @@
 
 import express from "express";
 import { config, secretConfigured } from "./config.js";
-import { dbReachable } from "./supabase.js";
+import { tuperReachable } from "./tuper-client.js";
+import { migrate, storeReachable } from "./store.js";
+import { tuperReceiver } from "./receiver-tuper.js";
 import { receiver } from "./receiver.js";
 import { startReplay } from "./reconcile.js";
-import { startPusher } from "./pusher.js";
+import { pushState, startPusher } from "./pusher.js";
 import { startSweep } from "./sweep.js";
 
 const app = express();
@@ -61,17 +63,35 @@ app.use(async (err: Error & { type?: string; status?: number }, req: express.Req
 });
 
 app.get("/health", async (_req, res) => {
-  const database = await dbReachable();
-  res.status(database.ok ? 200 : 503).json({
-    ok: database.ok,
+  // Two things this service depends on now: Tuper's API for the records, and its own database for its log and queue.
+  const [tuper, own] = await Promise.all([tuperReachable(), storeReachable()]);
+  const ok = tuper.ok && own.ok;
+  res.status(ok ? 200 : 503).json({
+    ok,
     service: "zupersync",
-    database,
+    tuper,
+    store: own,
     webhookSecretConfigured: secretConfigured(),
+    // Whether changes made in Tuper reach Zuper, and for which kinds of record. Names only,
+    // no secrets: this is the one fact about a deployment nobody should have to guess.
+    push: pushState(),
     at: new Date().toISOString(),
   });
 });
 
 app.use("/webhooks/zuper", receiver);
+// Changes made in Tuper arrive the same way Zuper's do, and are queued for Zuper (src/receiver-tuper.ts).
+app.use("/webhooks/tuper", tuperReceiver);
+
+// The store is brought up to date before anything is served: nothing works without its log, queue and config.
+const booted = migrate()
+  .then(({ applied }) => { if (applied.length) console.log(`[zupersync] store ready (${applied.length} applied)`); })
+  .catch((err) => {
+    console.error("[zupersync] the store could not be prepared:", err instanceof Error ? err.message : err);
+    process.exit(1);
+  });
+
+await booted;
 
 app.listen(config.port, () => {
   console.log(`[zupersync] listening on :${config.port} (${config.nodeEnv})`);

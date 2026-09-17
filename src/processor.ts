@@ -32,8 +32,9 @@
  * untouched because it is memoised on ctx.maps.
  */
 
-import type { SupabaseClient } from "@supabase/supabase-js";
-import { db } from "./supabase.js";
+import type { TuperClient as SupabaseClient } from "./tuper-client.js";
+import { tuper as db } from "./tuper-client.js";
+import { one, sql } from "./store.js";
 import { config, errorText } from "./config.js";
 import { ENTITIES, getSyncConfig, zuperGet, type SyncConfig } from "./lib/migration/zuper-sync.js";
 import { detailPathFor, isSelfFetching, resolveRoute, type NoteHost, type Route } from "./routes.js";
@@ -292,6 +293,17 @@ export async function whenIdle(key: string): Promise<void> {
 export const JOB_CREATE_LOCK = "push:job-create";
 
 /**
+ * Set by the pusher when pushing is live: called with a record's entity and
+ * Zuper uid just before the inbound sync rewrites its row, so edits made in Tuper
+ * and not yet pushed go to Zuper FIRST and come back as part of the record read
+ * below. A hook, not an import, because pusher.ts already imports this module.
+ */
+let beforeInbound: ((entity: string, uid: string) => Promise<void>) | null = null;
+export function setBeforeInbound(fn: ((entity: string, uid: string) => Promise<void>) | null): void {
+  beforeInbound = fn;
+}
+
+/**
  * Write a record, then run its later passes if it has any (job_details and job_activity, for jobs).
  * The result names the first entity, whose create/update is what happened.
  */
@@ -299,6 +311,8 @@ export async function syncRecord(
   entity: string, uid: string, opts: { enrich?: string[]; detail?: ((uid: string) => string) | null; selfFetching?: boolean } = {},
 ): Promise<SyncOneResult> {
   return oneAtATime(uid, async () => {
+    // Never let a push problem stop the inbound sync: Zuper stays the system of record.
+    if (beforeInbound) await beforeInbound(entity, uid).catch((err) => console.warn(`[zupersync] push before inbound sync failed for ${entity} ${uid}: ${errorText(err)}`));
     const selfFetching = opts.selfFetching ?? isSelfFetching(entity);
     const detail = opts.detail ?? detailPathFor(entity);
     // Read the record once: the first pass writes from it, and the second pass
@@ -485,17 +499,19 @@ export async function processEvent(delivery: Delivery): Promise<SyncOneResult | 
   // which nothing else was doing.
   let attempt = 0;
   if (delivery.id) {
-    const { data } = await db().schema("jms").from("zuper_webhook_events")
-      .select("attempts").eq("id", delivery.id).maybeSingle();
-    attempt = (((data as { attempts?: number } | null)?.attempts) ?? 0) + 1;
+    const row = await one<{ attempts: number }>("SELECT attempts FROM sync.webhook_events WHERE id = $1", [delivery.id]);
+    attempt = (row?.attempts ?? 0) + 1;
   }
 
   const finish = async (patch: Record<string, unknown>) => {
     if (!delivery.id) return;
     try {
-      await db().schema("jms").from("zuper_webhook_events")
-        .update({ ...patch, attempts: attempt, updated_at: new Date().toISOString() })
-        .eq("id", delivery.id);
+      await sql(
+        `UPDATE sync.webhook_events
+            SET processed_at = COALESCE($2, processed_at), process_error = $3, sync_entity = $4, attempts = $5
+          WHERE id = $1`,
+        [delivery.id, patch.processed_at ?? null, patch.process_error ?? null, patch.sync_entity ?? null, attempt],
+      );
     } catch (err) {
       console.warn("[zupersync] could not record processing outcome:", errorText(err));
     }
@@ -578,31 +594,28 @@ export async function processEvent(delivery: Delivery): Promise<SyncOneResult | 
  * consuming budget.
  */
 export async function processPending(limit = 50): Promise<{ attempted: number; ok: number; failed: number }> {
-  const { data, error } = await db().schema("jms").from("zuper_webhook_events")
-    .select("id, module, event, zuper_uid, work_order_number, body")
-    .eq("tenant_id", config.tenantId)
-    // Only ever replay deliveries that PASSED verification.
-    //
-    // Without this the two halves combine into a hole: the receiver correctly
-    // refuses a delivery whose secret header did not match, storing it with
-    // verified = false and processed_at = null — and those are exactly the rows
-    // this query would otherwise select, so the replay loop would process a
-    // forged request minutes after the door was shut on it.
-    .eq("verified", true)
-    .is("processed_at", null)
-    .lt("attempts", config.reconcile.replayMaxAttempts)
-    .order("received_at", { ascending: true })
-    .limit(limit);
-  if (error) throw error;
-
+  // Only ever replay deliveries that PASSED verification.
+  //
+  // Without this the two halves combine into a hole: the receiver correctly refuses a delivery whose secret header
+  // did not match, storing it with verified = false and processed_at = null — and those are exactly the rows this
+  // query would otherwise select, so the replay loop would process a forged request minutes after the door was shut
+  // on it.
+  const rows = await sql<{ id: string; module: string | null; event: string | null; zuper_uid: string | null; work_order_number: string | null; body: any }>(
+    `SELECT id, module, event, zuper_uid, work_order_number, body
+       FROM sync.webhook_events
+      WHERE tenant_id = $1 AND source = 'zuper' AND verified = true AND processed_at IS NULL AND attempts < $2
+      ORDER BY received_at ASC
+      LIMIT $3`,
+    [config.tenantId, config.reconcile.replayMaxAttempts, limit],
+  );
   let ok = 0, failed = 0;
-  for (const row of (data ?? []) as any[]) {
+  for (const row of rows) {
     try {
       await processEvent({ id: row.id, module: row.module, event: row.event, uid: row.zuper_uid, workOrder: row.work_order_number, body: row.body });
       ok++;
     } catch { failed++; }
   }
-  return { attempted: (data ?? []).length, ok, failed };
+  return { attempted: rows.length, ok, failed };
 }
 
 /** Find a uid in a body whose shape Zuper does not document. */

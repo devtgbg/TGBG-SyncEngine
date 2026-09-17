@@ -1,10 +1,12 @@
 /**
  * Pushing application-made job changes to Zuper — the other half of two-way sync.
  *
- *   Tuper ──write──▶ jms.jobs ──trigger──▶ jms.zuper_outbox ──pusher──▶ Zuper
+ *   Tuper ──write──▶ Tuper webhook ──receiver──▶ sync.outbox ──pusher──▶ Zuper
  *
- * The trigger (migrations/0002) queues every change that did not come from
- * Zupersync. This module turns queued changes into Zuper API calls.
+ * A change made in Tuper arrives here as one of Tuper's webhooks and is queued in this service's own database. This
+ * module turns queued changes into Zuper API calls. (Until Tuper had webhooks this came from a database trigger; the
+ * queue row looks the same either way.) A change this service itself wrote into Tuper fires no webhook, which is what
+ * keeps the two systems from echoing each other.
  *
  * MODES (PUSH_MODE):
  *   off      nothing is read or written.
@@ -41,11 +43,14 @@
  * production against this account (see the header of each builder).
  */
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { TuperClient as SupabaseClient } from "./tuper-client.js";
 import { config, errorText } from "./config.js";
-import { db } from "./supabase.js";
+import { tuper as db } from "./tuper-client.js";
+import { sql } from "./store.js";
 import { getSyncConfig, zuperGet, type SyncConfig } from "./lib/migration/zuper-sync.js";
-import { JOB_CREATE_LOCK, oneAtATime } from "./processor.js";
+import { JOB_CREATE_LOCK, oneAtATime, setBeforeInbound } from "./processor.js";
+// The two modules import each other; both only define functions, so neither needs the other while loading.
+import { planCustomer, verifyCustomer } from "./pusher-customers.js";
 
 export type PushMode = "off" | "dry-run" | "live";
 
@@ -56,10 +61,51 @@ interface OutboxRow {
   zuper_uid: string | null;
   operation: "create" | "update";
   changed: Record<string, unknown>;
+  previous: Record<string, unknown>;
   status: string;
   attempts: number;
   queued_at: string;
 }
+
+/**
+ * What someone did to one column, across all of a record's pending rows: the
+ * value it held BEFORE their first edit, and the value they LAST set.
+ *
+ * The row alone cannot say this. Every inbound webhook for the record rewrites
+ * the whole row from Zuper, so an edit made in Tuper can be reverted in jms.*
+ * before it is pushed. A planner that compared only the row with Zuper then saw
+ * "Zuper already has this value" and dropped the edit without a trace. With
+ * both ends of the edit the planner can tell the three cases apart:
+ *
+ *   Zuper holds the new value      nothing to do
+ *   Zuper holds the old value      nobody touched it there: push the edit
+ *   Zuper holds something else     changed on both sides: a conflict
+ *
+ * A marker row ({_assignees: true}, a follow-up) carries no values and is
+ * planned from the tables as they stand, as before.
+ */
+export type Edits = Record<string, { previous: unknown; value: unknown }>;
+
+export function editsOf(rows: { operation: string; changed: Record<string, unknown>; previous?: Record<string, unknown>; queued_at: string }[]): Edits {
+  const edits: Edits = {};
+  for (const r of [...rows].sort((a, b) => a.queued_at.localeCompare(b.queued_at))) {
+    if (r.operation === "create") continue;
+    for (const [k, v] of Object.entries(r.changed ?? {})) {
+      if (k in edits) edits[k].value = v;                                  // the last edit wins
+      else edits[k] = { previous: (r.previous ?? {})[k], value: v };        // the first one remembers where it started
+    }
+  }
+  return edits;
+}
+
+/**
+ * True for a real value someone set; false for a marker such as {_assignees: true}
+ * or a follow-up row. A marker is told by having NO "before" — the trigger records
+ * one for every real column, null included — and not by its value: `true` is also
+ * what has_sla, do_not_service and is_deleted are set to.
+ */
+export const isValue = (e: { previous: unknown; value: unknown } | undefined): e is { previous: unknown; value: unknown } =>
+  !!e && e.previous !== undefined;
 
 /** One Zuper call the pusher would make. */
 export interface PlannedRequest {
@@ -71,6 +117,11 @@ export interface PlannedRequest {
 }
 
 export interface Plan {
+  /** Sync entity: jobs, customers, … Absent on plans stored before other entities were pushed. */
+  entity?: string;
+  /** What a person would call the record: a work order number, a customer's name. */
+  label?: string | null;
+  /** The record's jms id. Named for the first entity pushed; it is any record's id now. */
   jobId: string;
   workOrder: string | null;
   zuperUid: string | null;
@@ -131,11 +182,11 @@ async function uidsFor(client: SupabaseClient, entity: string, jmsId: string | n
   if (error) throw error;
   return ((data ?? []) as { zuper_uid: string; synced_at: string }[]).map((r) => ({ uid: r.zuper_uid, synced_at: r.synced_at }));
 }
-const uidFor = async (client: SupabaseClient, entity: string, jmsId: string | null | undefined) =>
+export const uidFor = async (client: SupabaseClient, entity: string, jmsId: string | null | undefined) =>
   (await uidsFor(client, entity, jmsId))[0]?.uid ?? null;
 
 /** jms.addresses-style JSON → Zuper's address object (the reverse of zAddress). */
-function zuperAddress(a: any): Record<string, unknown> | null {
+export function zuperAddress(a: any): Record<string, unknown> | null {
   if (!a || typeof a !== "object") return null;
   const out: Record<string, unknown> = {
     street: a.street ?? "", city: a.city ?? "", state: a.state ?? "", country: a.country ?? "",
@@ -192,38 +243,82 @@ function sameValue(column: string, ours: unknown, theirs: unknown): boolean {
 }
 
 const ADDRESS_KEYS = ["street", "city", "state", "country", "zip_code", "landmark"];
-function sameAddress(ours: Record<string, unknown> | null, theirs: any): boolean {
+export function sameAddress(ours: Record<string, unknown> | null, theirs: any): boolean {
   const norm = (a: any) => ADDRESS_KEYS.map((k) => String(a?.[k] ?? "").trim().toLowerCase()).join("|");
   return norm(ours) === norm(theirs);
 }
 
 // ── planning ─────────────────────────────────────────────────────────────────
 
+const PRIORITIES = new Set(["LOW", "MEDIUM", "HIGH", "URGENT"]);
+const trimmed = (v: unknown): string | null => { const t = v == null ? "" : String(v).trim(); return t || null; };
+
+/**
+ * Zuper's value for a column, put the way the inbound sync stores it
+ * (lib/migration/zuper-sync.ts, `jobs.transform`). A conflict check compares it
+ * with what jms.* held BEFORE an edit, and that was written by the inbound sync —
+ * so "  Title " in Zuper and "Title" here are the same value, not a conflict.
+ * `undefined` means the inbound value cannot be reproduced, so no conflict is claimed.
+ */
+function zuperAsStored(column: string, zj: any): unknown {
+  switch (column) {
+    case "title": return trimmed(zj.job_title) ?? "Job";
+    case "prefix": return trimmed(zj.prefix);
+    case "priority": { const p = String(zj.job_priority ?? "").toUpperCase(); return PRIORITIES.has(p) ? p : "LOW"; }
+    case "job_type": return zj.job_type === "REVISIT" ? "REVISIT" : "NEW";
+    // With no due date in Zuper the inbound sync derives one, which cannot be reproduced here.
+    case "due_date": return zj.due_date ? zj.due_date : undefined;
+    case "job_tags": return Array.isArray(zj.job_tags) ? zj.job_tags : [];
+    default: return undefined;
+  }
+}
+
+const sameInstant = (a: unknown, b: unknown) =>
+  (!a || !b) ? !a && !b : new Date(String(a)).getTime() === new Date(String(b)).getTime();
+
+const CONFLICT = (now: unknown) =>
+  `changed in Zuper too, which now has ${JSON.stringify(now ?? null).slice(0, 80)}: left as Zuper has it (PUSH_ON_CONFLICT=zuper-wins)`;
+
 /**
  * Work out the Zuper requests for one job's pending changes.
  *
  * Reads only. `columns` is the union of what changed across the job's queued
- * rows; `forceCreate` is set when the job has never been in Zuper.
+ * rows; `forceCreate` is set when the job has never been in Zuper; `edits` says
+ * what each column was changed from and to (see Edits).
  */
 export async function planJob(
-  client: SupabaseClient, cfg: SyncConfig, jobId: string, columns: string[], forceCreate: boolean,
+  client: SupabaseClient, cfg: SyncConfig, jobId: string, columns: string[], forceCreate: boolean, edits: Edits = {},
 ): Promise<Plan> {
   const { data: job, error } = await client.schema("jms").from("jobs").select("*")
     .eq("tenant_id", config.tenantId).eq("id", jobId).maybeSingle();
   if (error) throw error;
   const zuperUid = await uidFor(client, "jobs", jobId);
   const plan: Plan = {
+    entity: "jobs", label: (job as any)?.work_order_number ? `WO ${(job as any).work_order_number}` : null,
     jobId, workOrder: (job as any)?.work_order_number ?? null, zuperUid,
     operation: zuperUid ? "update" : "create", columns, requests: [], notPushed: [],
   };
   if (!job) { plan.blocked = "the job no longer exists in Tuper"; return plan; }
-  const j = job as Record<string, any>;
+  // Plan from what people SET, not from what the row holds this second: an inbound
+  // sync may have put Zuper's value back over an edit that has not been pushed yet.
+  const j = { ...(job as Record<string, any>) };
+  for (const [c, e] of Object.entries(edits)) if (isValue(e) && c in j) j[c] = e.value;
 
   if (!zuperUid) return planCreate(client, j, plan, forceCreate);
 
   const zj = await zuperJob(cfg, zuperUid);
   if (!zj) { plan.blocked = "Zuper no longer has this job (404)"; return plan; }
   const cols = new Set(columns);
+
+  /**
+   * Changed on both sides? Only asked once Zuper is known NOT to hold the new
+   * value. `zuperStillHas(previous)` says whether Zuper holds what the edit
+   * started from; if it holds neither, someone changed it there as well.
+   */
+  const conflict = (c: string, zuperStillHas: (previous: unknown) => boolean): boolean => {
+    const e = edits[c];
+    return config.push.onConflict === "zuper-wins" && isValue(e) && !zuperStillHas(e.previous);
+  };
 
   // Deletion first: nothing else matters for a job that is going away.
   if (cols.has("is_deleted")) {
@@ -245,14 +340,20 @@ export async function planJob(
     const zf = JOB_FIELDS[c];
     if (!zf) continue;
     const ours = j[c] ?? (c === "job_tags" ? [] : null);
-    if (sameValue(c, ours, zj[zf])) plan.notPushed.push({ column: c, reason: "Zuper already has this value" });
-    else fields[zf] = ours;
+    if (sameValue(c, ours, zj[zf])) { plan.notPushed.push({ column: c, reason: "Zuper already has this value" }); continue; }
+    const stored = zuperAsStored(c, zj);
+    if (stored !== undefined && conflict(c, (previous) => sameValue(c, previous ?? (c === "job_tags" ? [] : null), stored))) {
+      plan.notPushed.push({ column: c, reason: CONFLICT(zj[zf]) });
+      continue;
+    }
+    fields[zf] = ours;
   }
   if ([...cols].some((c) => DESCRIPTION.has(c))) fields.job_description = j.description_html ?? j.description ?? "";
   for (const [c, zf] of [["service_address", "customer_address"], ["billing_address", "customer_billing_address"]] as const) {
     if (!cols.has(c)) continue;
     const ours = zuperAddress(j[c]);
     if (sameAddress(ours, zj[zf])) plan.notPushed.push({ column: c, reason: "Zuper already has this address" });
+    else if (conflict(c, (previous) => sameAddress(zuperAddress(previous), zj[zf]))) plan.notPushed.push({ column: c, reason: CONFLICT(zj[zf]?.street ?? zj[zf]) });
     else fields[zf] = ours;
   }
   if (cols.has("customer_id")) {
@@ -280,7 +381,12 @@ export async function planJob(
       const same = zj.scheduled_start_time && zj.scheduled_end_time
         && new Date(zj.scheduled_start_time).getTime() === new Date(j.scheduled_start_time).getTime()
         && new Date(zj.scheduled_end_time).getTime() === new Date(j.scheduled_end_time).getTime();
+      // Rescheduled in Zuper as well (a dispatcher there, or the AMC booking flow)?
+      const movedInZuper =
+        conflict("scheduled_start_time", (previous) => sameInstant(previous, zj.scheduled_start_time)) ||
+        conflict("scheduled_end_time", (previous) => sameInstant(previous, zj.scheduled_end_time));
       if (same) plan.notPushed.push({ column: "schedule", reason: "Zuper already has this schedule" });
+      else if (movedInZuper) plan.notPushed.push({ column: "schedule", reason: CONFLICT(zj.scheduled_start_time) });
       else plan.requests.push({
         method: "PUT", path: "/api/jobs/schedule", why: "rescheduled",
         body: {
@@ -306,6 +412,10 @@ export async function planJob(
     } else if (zj.current_job_status?.status_uid && candidates.some((c) => c.uid === zj.current_job_status.status_uid)) {
       // Every status call adds a history entry — never send one Zuper already shows.
       plan.notPushed.push({ column: "current_status_id", reason: "Zuper already shows this status" });
+    } else if (await statusMovedInZuper(client, edits.current_status_id, zj)) {
+      // The likeliest conflict there is: a technician moved the job on from the mobile
+      // app while someone set a status at a desk. The technician's is the later fact.
+      plan.notPushed.push({ column: "current_status_id", reason: CONFLICT(zj.current_job_status?.status_name) });
     } else {
       const { data: hist } = await client.schema("jms").from("job_status_history")
         .select("remarks, remarks_free_text, created_at").eq("tenant_id", config.tenantId)
@@ -336,6 +446,20 @@ export async function planJob(
     if (NOT_ZUPER[c]) plan.notPushed.push({ column: c, reason: NOT_ZUPER[c] });
   }
   return plan;
+}
+
+/**
+ * Did Zuper's status move while a status set in Tuper was waiting to be pushed?
+ * True when Zuper shows a status that is not the one the edit started from. Several
+ * Zuper statuses can share one Tuper status (one per category), hence the list.
+ */
+async function statusMovedInZuper(client: SupabaseClient, edit: Edits[string] | undefined, zj: any): Promise<boolean> {
+  if (config.push.onConflict !== "zuper-wins" || !isValue(edit) || typeof edit.previous !== "string") return false;
+  const current = zj.current_job_status?.status_uid;
+  if (!current) return false;
+  const before = await uidsFor(client, "job_statuses", edit.previous);
+  // A previous status Zuper has no counterpart for proves nothing either way.
+  return before.length > 0 && !before.some((c) => c.uid === current);
 }
 
 async function jobTeamIds(client: SupabaseClient, jobId: string): Promise<string[]> {
@@ -461,35 +585,61 @@ async function verify(cfg: SyncConfig, plan: Plan, uid: string): Promise<string 
   return null;
 }
 
-async function execute(client: SupabaseClient, cfg: SyncConfig, plan: Plan): Promise<{ ok: boolean; responses: unknown[]; error?: string }> {
+/** The requests that make a new record in Zuper, and where each answers with its uid. */
+const CREATES: Record<string, { entity: string; uidOf: (body: any) => string | null }> = {
+  "/api/jobs": { entity: "jobs", uidOf: (b) => b?.job_uid ?? b?.data?.job_uid ?? null },
+  "/api/customers_new": { entity: "customers", uidOf: (b) => b?.customer_uid ?? b?.data?.customer_uid ?? b?.data?.customer?.customer_uid ?? null },
+};
+
+interface Outcome {
+  ok: boolean;
+  responses: unknown[];
+  error?: string;
+  /** Do not try again by itself: whether the record was created is not known. */
+  needsAPerson?: boolean;
+}
+
+async function execute(client: SupabaseClient, cfg: SyncConfig, plan: Plan): Promise<Outcome> {
   const responses: unknown[] = [];
   let uid = plan.zuperUid;
+  const entity = plan.entity ?? "jobs";
   for (const r of plan.requests) {
-    if (r.method === "POST" && r.path === "/api/jobs") {
+    const create = r.method === "POST" ? CREATES[r.path] : undefined;
+    if (create) {
       // Create and map atomically as far as this process is concerned.
-      const out = await oneAtATime(JOB_CREATE_LOCK, async () => {
-        const res = await send(cfg, r);
-        const newUid = res.body?.job_uid ?? res.body?.data?.job_uid ?? null;
-        if (res.ok && newUid) {
-          const { error } = await client.schema("jms").from("zuper_sync_map").upsert(
-            { tenant_id: config.tenantId, entity: "jobs", zuper_uid: newUid, jms_id: plan.jobId, synced_at: new Date(0).toISOString() },
-            { onConflict: "tenant_id,entity,zuper_uid" },
-          );
-          if (error) throw error;
-        }
-        return { res, newUid };
-      });
-      responses.push({ status: out.res.status, type: out.res.body?.type, job_uid: out.newUid, message: out.res.body?.message });
-      if (!out.res.ok || !out.newUid) return { ok: false, responses, error: `create failed: HTTP ${out.res.status} ${out.res.body?.message ?? ""}`.trim() };
+      let out: { res: Awaited<ReturnType<typeof send>>; newUid: string | null };
+      try {
+        out = await oneAtATime(create.entity === "jobs" ? JOB_CREATE_LOCK : `push:create:${create.entity}`, async () => {
+          const res = await send(cfg, r);
+          const newUid = create.uidOf(res.body);
+          if (res.ok && newUid) {
+            const { error } = await client.schema("jms").from("zuper_sync_map").upsert(
+              { tenant_id: config.tenantId, entity: create.entity, zuper_uid: newUid, jms_id: plan.jobId, synced_at: new Date(0).toISOString() },
+              { onConflict: "tenant_id,entity,zuper_uid" },
+            );
+            if (error) throw error;
+          }
+          return { res, newUid };
+        });
+      } catch (err) {
+        // A timeout or a dropped connection: Zuper may or may not have made the
+        // record. A second POST would make a second one, so this stops here.
+        return { ok: false, responses, needsAPerson: true, error: `create: no answer (${errorText(err).slice(0, 160)}). It may exist in Zuper already: check before replaying` };
+      }
+      responses.push({ status: out.res.status, type: out.res.body?.type, uid: out.newUid, message: out.res.body?.message });
+      if (!out.res.ok) return { ok: false, responses, error: `create failed: HTTP ${out.res.status} ${out.res.body?.message ?? ""}`.trim() };
+      if (!out.newUid) return { ok: false, responses, needsAPerson: true, error: "created, but Zuper's answer carried no uid, so the record is not linked: link it by hand before replaying" };
       uid = out.newUid;
-      // A new Zuper job starts in its category's first status, and assignments
-      // may have been rejected on create. Queue a follow-up that compares both
-      // with Tuper once Zuper has settled.
-      await client.schema("jms").from("zuper_outbox").insert({
-        tenant_id: config.tenantId, entity: "jobs", jms_id: plan.jobId, zuper_uid: uid, operation: "update",
-        changed: { current_status_id: true, _assignees: true }, origin: "zupersync-followup",
-        next_try_at: new Date(Date.now() + 60_000).toISOString(),
-      });
+      if (create.entity === "jobs") {
+        // A new Zuper job starts in its category's first status, and assignments
+        // may have been rejected on create. Queue a follow-up that compares both
+        // with Tuper once Zuper has settled.
+        await sql(
+          `INSERT INTO sync.outbox (tenant_id, entity, jms_id, zuper_uid, operation, changed, origin, next_try_at)
+           VALUES ($1, 'jobs', $2, $3, 'update', $4, 'zupersync-followup', now() + interval '60 seconds')`,
+          [config.tenantId, plan.jobId, uid, JSON.stringify({ current_status_id: true, _assignees: true })],
+        );
+      }
       continue;
     }
     const res = await send(cfg, r);
@@ -497,7 +647,7 @@ async function execute(client: SupabaseClient, cfg: SyncConfig, plan: Plan): Pro
     if (!res.ok) return { ok: false, responses, error: `${r.method} ${r.path}: HTTP ${res.status} ${res.body?.message ?? ""}`.trim() };
   }
   if (uid && plan.operation === "update") {
-    const problem = await verify(cfg, plan, uid);
+    const problem = entity === "customers" ? await verifyCustomer(cfg, plan, uid) : await verify(cfg, plan, uid);
     if (problem) return { ok: false, responses, error: `sent, but ${problem}` };
   }
   return { ok: true, responses };
@@ -509,8 +659,38 @@ export interface PushResult { jobs: number; planned: number; sent: number; skipp
 
 const backoffMinutes = (attempts: number) => Math.min(240, 2 ** attempts);
 
-/** Take due outbox rows, group them by job, plan (and in live mode, send). */
-export async function pushPending(mode: PushMode = config.push.mode, limit = config.push.batch): Promise<PushResult> {
+type Planner = (client: SupabaseClient, cfg: SyncConfig, id: string, columns: string[], forceCreate: boolean, edits: Edits) => Promise<Plan>;
+
+/** Which kinds of record can be pushed. A change to anything else is queued, shown, and marked not built. */
+const PLANNERS: Record<string, Planner> = { jobs: planJob, customers: planCustomer };
+
+/**
+ * `live` reaches only the entities named in PUSH_ENTITIES. Every other one is
+ * planned and never sent, so a kind of record goes live on its own, after its
+ * requests have been watched against the real account.
+ */
+export const modeFor = (mode: PushMode, entity: string): PushMode =>
+  mode === "live" && !config.push.entities.includes(entity) ? "dry-run" : mode;
+
+/** For /health and the start-up log: what is sent, what is only planned, and how a conflict is settled. */
+export function pushState(): { mode: PushMode; sentToZuper: string[]; plannedOnly: string[]; onConflict: string; deletes: boolean } {
+  const mode = config.push.mode;
+  const known = Object.keys(PLANNERS);
+  const sentToZuper = mode === "off" ? [] : known.filter((e) => modeFor(mode, e) === "live");
+  return { mode, sentToZuper, plannedOnly: mode === "off" ? [] : known.filter((e) => !sentToZuper.includes(e)), onConflict: config.push.onConflict, deletes: config.push.deletes };
+}
+
+/** How long a claimed row is this runner's. Longer than any push; short enough that a crash frees it soon. */
+const LEASE_MS = 120_000;
+
+/**
+ * Take due outbox rows, group them by record, plan (and for a live entity, send).
+ * `only` narrows the run to one record: the inbound sync uses it to push a
+ * record's pending edits before it overwrites the row with Zuper's values.
+ */
+export async function pushPending(
+  mode: PushMode = config.push.mode, limit = config.push.batch, only?: { entity: string; jmsId: string },
+): Promise<PushResult> {
   const result: PushResult = { jobs: 0, planned: 0, sent: 0, skipped: 0, failed: 0, waiting: 0 };
   if (mode === "off") return result;
   const client = db();
@@ -519,71 +699,145 @@ export async function pushPending(mode: PushMode = config.push.mode, limit = con
 
   // Dry run plans only fresh rows; live also takes rows a dry run already planned.
   const statuses = mode === "live" ? ["queued", "planned", "failed"] : ["queued"];
-  const { data, error } = await client.schema("jms").from("zuper_outbox")
-    .select("id, entity, jms_id, zuper_uid, operation, changed, status, attempts, queued_at")
-    .eq("tenant_id", config.tenantId).eq("entity", "jobs").in("status", statuses)
-    .lte("next_try_at", new Date().toISOString()).lt("attempts", config.push.maxAttempts)
-    .order("queued_at", { ascending: true }).limit(limit * 10);
-  if (error) throw error;
+  const data = await sql<OutboxRow>(
+    `SELECT id, entity, jms_id, zuper_uid, operation, changed, previous, status, attempts, queued_at
+       FROM sync.outbox
+      WHERE tenant_id = $1 AND status = ANY($2) AND next_try_at <= now() AND attempts < $3
+        AND ($4::text IS NULL OR (entity = $4 AND jms_id = $5::uuid))
+      ORDER BY queued_at ASC
+      LIMIT $6`,
+    [config.tenantId, statuses, config.push.maxAttempts, only?.entity ?? null, only?.jmsId ?? null, limit * 10],
+  );
 
   const groups = new Map<string, OutboxRow[]>();
   for (const row of (data ?? []) as OutboxRow[]) {
-    const g = groups.get(row.jms_id) ?? [];
+    const key = `${row.entity}:${row.jms_id}`;
+    const g = groups.get(key) ?? [];
     g.push(row);
-    groups.set(row.jms_id, g);
+    groups.set(key, g);
   }
 
   const now = Date.now();
-  for (const [jobId, rows] of [...groups].slice(0, limit)) {
-    const ids = rows.map((r) => r.id);
+  for (const [key, all] of [...groups].slice(0, limit)) {
+    const entity = all[0].entity, recordId = all[0].jms_id;
+    const effective = modeFor(mode, entity);
+    // An entity that is not live is planned once; its planned rows are not planned again every tick.
+    let rows = effective === "live" ? all : all.filter((r) => r.status === "queued");
+    if (!rows.length) continue;
+
+    const markRows = async (ids: string[], patch: Record<string, unknown>) => {
+      if (!ids.length) return;
+      const columns = Object.keys(patch);
+      const sets = columns.map((c, i) => `${c} = $${i + 2}`).join(", ");
+      await sql(
+        `UPDATE sync.outbox SET ${sets} WHERE id = ANY($1)`,
+        [ids, ...columns.map((c) => {
+          const v = patch[c];
+          return v !== null && typeof v === "object" ? JSON.stringify(v) : v;
+        })],
+      );
+    };
+
+    const planner = PLANNERS[entity];
+    if (!planner) {
+      // Queued by a trigger, so it is on the dashboard — but said plainly, not dropped.
+      const blocked = `pushing ${entity} to Zuper is not built yet: this change stays in Tuper, and Zuper's value returns on its next sync`;
+      await markRows(rows.map((r) => r.id), { status: "skipped", last_error: blocked,
+        planned: { entity, label: null, jobId: recordId, workOrder: null, zuperUid: rows[0].zuper_uid, operation: rows[0].operation, columns: [], requests: [], notPushed: [], blocked } satisfies Plan });
+      result.skipped++;
+      continue;
+    }
+
     const isCreate = rows.some((r) => r.operation === "create");
-    // A new job arrives in several requests (row, then assignees, teams, line
-    // items). Give them time to land before planning the create.
+    // A new record arrives in several requests (the row, then its assignees,
+    // teams, addresses, line items). Give them time to land before planning it.
     const newest = Math.max(...rows.map((r) => new Date(r.queued_at).getTime()));
     if (isCreate && now - newest < config.push.createDelaySeconds * 1000) { result.waiting++; continue; }
 
+    // Too old to send — see PUSH_MAX_AGE_MINUTES. Only a live send is refused; a plan harms nobody.
+    if (effective === "live") {
+      const stale = rows.filter((r) => now - new Date(r.queued_at).getTime() > config.push.maxAgeMinutes * 60_000 && r.status !== "failed");
+      if (stale.length) {
+        const hours = Math.round((now - new Date(stale[0].queued_at).getTime()) / 3_600_000);
+        await markRows(stale.map((r) => r.id), { status: "skipped",
+          last_error: `not sent: queued about ${hours}h ago, before pushing ${entity} was live (PUSH_MAX_AGE_MINUTES=${config.push.maxAgeMinutes}). Make the change again if it is still wanted` });
+        result.skipped++;
+        rows = rows.filter((r) => !stale.includes(r));
+        if (!rows.length) continue;
+      }
+    }
+
+    // Claim the rows in the database. Two runners can be alive at once — the tick and
+    // the inbound sync's flush here, or two containers during a deploy — and a
+    // status sent twice is two history entries in Zuper.
+    const claimed = await sql<{ id: string }>(
+      `UPDATE sync.outbox SET next_try_at = $1
+        WHERE id = ANY($2) AND status = ANY($3) AND next_try_at <= $4
+        RETURNING id`,
+      [new Date(now + LEASE_MS).toISOString(), rows.map((r) => r.id), statuses, new Date(now).toISOString()],
+    );
+    const mine = new Set(claimed.map((r) => r.id));
+    rows = rows.filter((r) => mine.has(r.id));
+    if (!rows.length) continue;
+
     result.jobs++;
+    const ids = rows.map((r) => r.id);
+    const mark = (patch: Record<string, unknown>) => markRows(ids, patch);
     const columns = [...new Set(rows.flatMap((r) => (r.operation === "create" ? [] : Object.keys(r.changed ?? {}))))];
-    const mark = async (patch: Record<string, unknown>) => {
-      const { error: upErr } = await client.schema("jms").from("zuper_outbox")
-        .update({ ...patch, updated_at: new Date().toISOString() }).in("id", ids);
-      if (upErr) throw upErr;
-    };
+    const attemptsNow = Math.max(...rows.map((r) => r.attempts)) + 1;
+    const failed = (patch: Record<string, unknown>, stop = false) => mark({
+      ...patch, status: "failed", attempts: stop ? config.push.maxAttempts : attemptsNow,
+      next_try_at: new Date(Date.now() + backoffMinutes(attemptsNow) * 60_000).toISOString(),
+    });
 
     try {
-      const plan = await oneAtATime(`push:${jobId}`, () => planJob(client, cfg, jobId, columns, isCreate));
+      const plan = await oneAtATime(`push:${key}`, () => planner(client, cfg, recordId, columns, isCreate, editsOf(rows)));
       if (plan.blocked || !plan.requests.length) {
         await mark({ status: "skipped", planned: plan, last_error: plan.blocked ?? null });
         result.skipped++;
         continue;
       }
-      if (mode === "dry-run") {
+      if (effective === "dry-run") {
         await mark({ status: "planned", planned: plan });
         result.planned++;
         continue;
       }
-      const out = await oneAtATime(`push:${jobId}`, () => execute(client, cfg, plan));
+      const out = await oneAtATime(`push:${key}`, () => execute(client, cfg, plan));
       if (out.ok) {
         await mark({ status: "sent", planned: plan, response: out.responses, sent_at: new Date().toISOString(), last_error: null });
         result.sent++;
       } else {
-        const attempts = Math.max(...rows.map((r) => r.attempts)) + 1;
-        await mark({
-          status: "failed", planned: plan, response: out.responses, last_error: out.error ?? "failed", attempts,
-          next_try_at: new Date(Date.now() + backoffMinutes(attempts) * 60_000).toISOString(),
-        });
+        await failed({ planned: plan, response: out.responses, last_error: out.error ?? "failed" }, out.needsAPerson);
         result.failed++;
       }
     } catch (err) {
-      const attempts = Math.max(...rows.map((r) => r.attempts)) + 1;
-      await mark({
-        status: "failed", last_error: errorText(err).slice(0, 400), attempts,
-        next_try_at: new Date(Date.now() + backoffMinutes(attempts) * 60_000).toISOString(),
-      }).catch(() => undefined);
+      await failed({ last_error: errorText(err).slice(0, 400) }).catch(() => undefined);
       result.failed++;
     }
   }
   return result;
+}
+
+/**
+ * Push one record's pending edits NOW, because the inbound sync is about to
+ * rewrite its row from Zuper (processor.syncRecord calls this first).
+ *
+ * Without it a job's people are the casualty: assigning someone in Tuper leaves
+ * only a marker in the outbox, the inbound sync rebuilds the assignment rows from
+ * Zuper, and by the next tick there is nothing left to say who was wanted. Field
+ * edits survive that (see Edits), but Tuper would show the old value until the
+ * push and its echo had both happened.
+ */
+export async function pushRecordNow(entity: string, zuperUid: string): Promise<void> {
+  if (modeFor(config.push.mode, entity) !== "live" || !PLANNERS[entity]) return;
+  const client = db();
+  const { data, error } = await client.schema("jms").from("zuper_sync_map").select("jms_id")
+    .eq("tenant_id", config.tenantId).eq("entity", entity).eq("zuper_uid", zuperUid).limit(1);
+  if (error) throw error;
+  const jmsId = (data as { jms_id: string }[] | null)?.[0]?.jms_id;
+  if (!jmsId) return;
+  const r = await pushPending("live", 1, { entity, jmsId });
+  if (r.jobs) console.log(`[zupersync] push before inbound sync (${entity} ${zuperUid}): ${r.sent} sent, ${r.skipped} skipped, ${r.failed} failed`);
 }
 
 let timer: NodeJS.Timeout | null = null;
@@ -601,12 +855,12 @@ export function startPusher(): void {
     running = true;
     try {
       const r = await pushPending(mode);
-      if (r.jobs) console.log(`[zupersync] push (${mode}): ${r.jobs} job(s) — ${r.planned} planned, ${r.sent} sent, ${r.skipped} skipped, ${r.failed} failed${r.waiting ? `, ${r.waiting} waiting` : ""}`);
+      if (r.jobs) console.log(`[zupersync] push (${mode}): ${r.jobs} record(s) — ${r.planned} planned, ${r.sent} sent, ${r.skipped} skipped, ${r.failed} failed${r.waiting ? `, ${r.waiting} waiting` : ""}`);
     } catch (err) {
       const msg = errorText(err);
       // Before migrations/0002 is applied the table does not exist; say so once.
-      if (/zuper_outbox|PGRST205|42P01/.test(msg)) {
-        if (!missingTableWarned) console.warn("[zupersync] push: jms.zuper_outbox is missing — apply migrations/0002");
+      if (/sync\.outbox|zuper_outbox|42P01/.test(msg)) {
+        if (!missingTableWarned) console.warn("[zupersync] push: sync.outbox is missing — the store migrations have not run");
         missingTableWarned = true;
       } else {
         console.warn("[zupersync] push failed:", msg);
@@ -616,7 +870,16 @@ export function startPusher(): void {
     }
   }, config.push.everySeconds * 1000);
   timer.unref?.();
-  console.log(`[zupersync] push to Zuper: ${mode.toUpperCase()} every ${config.push.everySeconds}s${mode === "dry-run" ? " — requests are planned and stored, nothing is sent" : ""}`);
+  const live = Object.keys(PLANNERS).filter((e) => modeFor(mode, e) === "live");
+  const planOnly = Object.keys(PLANNERS).filter((e) => !live.includes(e));
+  if (live.length) {
+    // An inbound sync rewrites the row from Zuper: push the record's pending edits first.
+    setBeforeInbound((entity, uid) => pushRecordNow(entity, uid));
+  }
+  console.log(`[zupersync] push to Zuper every ${config.push.everySeconds}s — ` +
+    (live.length ? `LIVE for ${live.join(", ")}` : "nothing is sent") +
+    (planOnly.length ? `; planned only (never sent): ${planOnly.join(", ")}` : "") +
+    `; on a conflict ${config.push.onConflict}`);
 }
 
 export function stopPusher(): void {

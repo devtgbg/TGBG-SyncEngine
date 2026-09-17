@@ -3,7 +3,7 @@
 // Inspection Forms reuse. A checklist bound to a (category, status) via job_statuses.form_id gates that transition.
 // Questions are saved in place (jms.save_checklist_fields, 00102): each keeps its id and field_key, so the answers given
 // to it stay with it, and a removed question someone answered is kept, marked removed (00101).
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { TuperClient as SupabaseClient } from "../../tuper-client.js";
 import { FilterValidationError } from "./operators";
 import { StaleWriteError } from "./write";
 import { VALIDATION_KEYS } from "./checklist-validation";
