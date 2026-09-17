@@ -6,9 +6,13 @@
  * apply it, and if not, why not.
  */
 
-import { deliveriesPage, totals, type Delivery } from "@/lib/db";
+import { deliveriesPage, deliveryById, totals, zuperUserNames, type Delivery, type DeliveryDetail } from "@/lib/db";
+import { userUidsIn } from "@/lib/describe";
+import { outcome } from "@/lib/outcome";
+import { Detail } from "./detail";
 import { Ago } from "./live";
-import { Pager, Pinned, readPaging } from "./pager";
+import { DEFAULT_SIZE, Pager, Pinned, readPaging } from "./pager";
+import { Row } from "./row";
 
 export const dynamic = "force-dynamic";
 
@@ -20,18 +24,7 @@ const FILTERS = [
   { key: "refused", label: "Refused" },
 ] as const;
 
-function outcome(d: Delivery): { label: string; tone: "ok" | "warn" | "bad" | "muted" } {
-  if (!d.verified) return { label: d.verify_reason ?? "refused", tone: "bad" };
-  if (d.process_error) {
-    // A deliberate skip is recorded as an error string but is not a failure.
-    if (d.process_error.startsWith("skipped:")) return { label: "not synced", tone: "muted" };
-    return { label: d.process_error, tone: "bad" };
-  }
-  if (d.processed_at) return { label: d.sync_entity ?? "applied", tone: "ok" };
-  return { label: "waiting", tone: "warn" };
-}
-
-const ago = (iso: string) => {
+const ago =(iso: string) => {
   const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
   if (s < 60) return `${Math.floor(s)}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
@@ -42,7 +35,7 @@ const ago = (iso: string) => {
 /** Arrived in the last few seconds — highlighted once, so a row appearing live catches the eye. */
 const isFresh = (iso: string) => Date.now() - new Date(iso).getTime() < 15_000;
 
-export default async function Page({ searchParams }: { searchParams: Promise<{ filter?: string; page?: string; size?: string; upto?: string }> }) {
+export default async function Page({ searchParams }: { searchParams: Promise<{ filter?: string; page?: string; size?: string; upto?: string; open?: string }> }) {
   const sp = await searchParams;
   const filter = sp.filter ?? "";
   const paging = readPaging(sp);
@@ -50,16 +43,33 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ f
   let rows: Delivery[] = [];
   let matching = 0;
   let counts = { total: 0, refused: 0, processed: 0, skipped: 0, failed: 0, waiting: 0 };
+  let opened: DeliveryDetail | null = null;
+  let names: Record<string, string> = {};
   let error: string | null = null;
   try {
-    const [list, all] = await Promise.all([
+    const [list, all, one] = await Promise.all([
       deliveriesPage({ limit: paging.size, offset: paging.offset, upto: paging.upto, filter }),
       totals(),
+      sp.open ? deliveryById(sp.open) : Promise.resolve(null),
     ]);
-    rows = list.rows; matching = list.total; counts = all;
+    rows = list.rows; matching = list.total; counts = all; opened = one;
+    // An assignment webhook names people by uid only; a name that cannot be found is no reason to fail the page.
+    if (opened) names = await zuperUserNames(userUidsIn(opened.body)).catch(() => ({}));
   } catch (err) {
     error = err instanceof Error ? err.message : String(err);
   }
+
+  /** This view's own URL: same filter, page size, page and pin, with or without a delivery opened. */
+  const here = (open?: string) => {
+    const q = new URLSearchParams();
+    if (filter) q.set("filter", filter);
+    if (paging.size !== DEFAULT_SIZE) q.set("size", String(paging.size));
+    if (paging.page > 1) q.set("page", String(paging.page));
+    if (paging.upto) q.set("upto", paging.upto);
+    if (open) q.set("open", open);
+    const qs = q.toString();
+    return qs ? `/?${qs}` : "/";
+  };
 
   // Older pages are pinned to the newest row on show here; an older page keeps the pin it came with.
   const pager = (
@@ -100,7 +110,14 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ f
             <p className="empty">{paging.page > 1 ? "No rows on this page." : `No deliveries${filter ? " matching that filter" : " yet"}.`}</p>
           ) : (
             <div className="scroll">
-              <table>
+              <table className="log">
+                {/* Fixed shares, so the table is always exactly as wide as its box: a long
+                    value is cut with an ellipsis (full text on hover), never a scrollbar. */}
+                <colgroup>
+                  <col style={{ width: "6.5%" }} /><col style={{ width: "6%" }} /><col style={{ width: "14%" }} />
+                  <col style={{ width: "6.5%" }} /><col style={{ width: "17%" }} /><col style={{ width: "13%" }} />
+                  <col style={{ width: "21%" }} /><col style={{ width: "11.5%" }} /><col style={{ width: "4.5%" }} />
+                </colgroup>
                 <thead>
                   <tr><th>When</th><th>Module</th><th>Event</th><th>Record</th><th>By</th><th>Role</th><th>Staff ID</th><th>Outcome</th><th className="num">Tries</th></tr>
                 </thead>
@@ -108,17 +125,18 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ f
                   {rows.map((d) => {
                     const o = outcome(d);
                     return (
-                      <tr key={d.id} className={isFresh(d.received_at) ? "fresh" : undefined}>
+                      <Row key={d.id} href={here(d.id)}
+                        className={[isFresh(d.received_at) ? "fresh" : "", opened?.id === d.id ? "opened" : ""].filter(Boolean).join(" ") || undefined}>
                         <td className="dim" title={d.received_at}><Ago iso={d.received_at} initial={ago(d.received_at)} /></td>
-                        <td>{d.module ?? "—"}</td>
-                        <td className="mono">{d.event ?? "—"}</td>
-                        <td className="mono dim">{d.work_order_number ?? d.zuper_uid?.slice(0, 8) ?? "—"}</td>
+                        <td title={d.module ?? undefined}>{d.module ?? "—"}</td>
+                        <td className="mono" title={d.event ?? undefined}>{d.event ?? "—"}</td>
+                        <td className="mono dim" title={d.work_order_number ?? d.zuper_uid ?? undefined}>{d.work_order_number ?? d.zuper_uid?.slice(0, 8) ?? "—"}</td>
                         <td><Pair top={personName(d)} under={d.by_email} /></td>
                         <td><Pair top={d.by_role} under={d.by_designation} /></td>
                         <td><Pair top={d.by_emp_code} under={d.by_uid} mono /></td>
-                        <td><span className={`pill ${o.tone}`}>{o.label}</span></td>
+                        <td><span className={`pill ${o.tone}`} title={o.label}>{o.label}</span></td>
                         <td className="num dim">{d.attempts}</td>
-                      </tr>
+                      </Row>
                     );
                   })}
                 </tbody>
@@ -129,6 +147,8 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ f
           {rows.length > 15 ? pager : null}
         </>
       )}
+
+      {opened ? <Detail d={opened} names={names} closeHref={here()} /> : null}
     </main>
   );
 }
@@ -146,8 +166,8 @@ function Pair({ top, under, mono }: { top: string | null; under: string | null; 
   if (!a && !b) return <span className="dim">—</span>;
   return (
     <span className="pair">
-      <span>{a ?? "—"}</span>
-      {b ? <span className={mono ? "note mono" : "note"}>{b}</span> : null}
+      <span title={a ?? undefined}>{a ?? "—"}</span>
+      {b ? <span className={mono ? "note mono" : "note"} title={b}>{b}</span> : null}
     </span>
   );
 }

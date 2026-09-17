@@ -51,7 +51,8 @@ export interface Delivery {
  * Every genuine Zuper delivery carries `triggered_by`: the person whose action
  * fired it. The sync never reads it (the record is re-fetched), so the stored
  * body is the only place it lives. Only these seven values are lifted out, in the
- * database — the body itself, with its customer details, is never selected.
+ * database — the list never selects the body itself, with its customer details.
+ * The one delivery someone opens is the exception: see deliveryById.
  *
  * A change made through Zuper's API shows the account that owns the API key,
  * so an integration's writes appear under that account's name.
@@ -61,6 +62,81 @@ const COLUMNS =
   "by_first:body->triggered_by->>first_name, by_last:body->triggered_by->>last_name, " +
   "by_email:body->triggered_by->>email, by_role:body->triggered_by->role->>role_name, " +
   "by_designation:body->triggered_by->>designation, by_emp_code:body->triggered_by->>emp_code, by_uid:body->triggered_by->>user_uid";
+
+/** One delivery in full: the only query here that reads a body. */
+export interface DeliveryDetail extends Delivery {
+  /** Already masked — see maskHeaders. The stored secret never leaves this file. */
+  headers: Record<string, string>;
+  /** Names of the headers whose values were masked. */
+  hiddenHeaders: string[];
+  body: unknown;
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * The receiver stores every request header, and one of them IS the shared secret
+ * that authenticates a delivery. It is masked HERE, before the row is returned,
+ * and not in the component that prints it: React serialises a server component's
+ * props into the page for the browser, so a secret that reaches a component is in
+ * the HTML source even when nothing displays it. (Found by a test that searched
+ * the rendered page for the secret.)
+ *
+ * Masked: any header whose name looks like a credential, and whichever header
+ * ZUPER_WEBHOOK_HEADER names.
+ */
+const CREDENTIAL = /key|secret|token|authorization|cookie|password/i;
+function maskHeaders(raw: unknown): { headers: Record<string, string>; hiddenHeaders: string[] } {
+  const configured = (process.env.ZUPER_WEBHOOK_HEADER ?? "x-zupersync-key").toLowerCase();
+  const headers: Record<string, string> = {};
+  const hiddenHeaders: string[] = [];
+  const source = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  for (const name of Object.keys(source).sort()) {
+    if (CREDENTIAL.test(name) || name.toLowerCase() === configured) {
+      headers[name] = "(hidden)";
+      hiddenHeaders.push(name);
+    } else {
+      headers[name] = String(source[name]);
+    }
+  }
+  return { headers, hiddenHeaders };
+}
+
+/** Null for an id that is not a uuid or is not this tenant's — never an error page. */
+export async function deliveryById(id: string): Promise<DeliveryDetail | null> {
+  if (!UUID.test(id)) return null;
+  const { data, error } = await db().schema("jms").from("zuper_webhook_events")
+    .select(`${COLUMNS}, headers, body`).eq("tenant_id", tenantId()).eq("id", id).maybeSingle();
+  if (error) throw error;
+  if (!data) return null;
+  const row = data as unknown as Omit<DeliveryDetail, "headers" | "hiddenHeaders"> & { headers: unknown };
+  return { ...row, ...maskHeaders(row.headers) };
+}
+
+/**
+ * Zuper user uid → name, from the users the sync has imported. An assignment
+ * webhook carries uids only, and "unassigned a3945208-…" tells nobody anything.
+ * A uid the sync has never seen is simply absent from the result.
+ */
+export async function zuperUserNames(uids: string[]): Promise<Record<string, string>> {
+  const wanted = [...new Set(uids.filter((u) => UUID.test(u)))].slice(0, 50);
+  if (!wanted.length) return {};
+  const map = await db().schema("jms").from("zuper_sync_map").select("zuper_uid, jms_id")
+    .eq("tenant_id", tenantId()).eq("entity", "users").in("zuper_uid", wanted);
+  if (map.error) throw map.error;
+  const byJms = new Map(((map.data ?? []) as { zuper_uid: string; jms_id: string }[]).map((m) => [m.jms_id, m.zuper_uid]));
+  if (!byJms.size) return {};
+  const users = await db().schema("jms").from("users").select("id, first_name, last_name")
+    .eq("tenant_id", tenantId()).in("id", [...byJms.keys()]);
+  if (users.error) throw users.error;
+  const out: Record<string, string> = {};
+  for (const u of (users.data ?? []) as { id: string; first_name: string | null; last_name: string | null }[]) {
+    const name = [u.first_name, u.last_name].map((s) => s?.trim()).filter(Boolean).join(" ");
+    const uid = byJms.get(u.id);
+    if (name && uid) out[uid] = name;
+  }
+  return out;
+}
 
 /** One page of rows, and how many rows there are in all under the same filter. */
 export interface Paged<T> { rows: T[]; total: number }

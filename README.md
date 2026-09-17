@@ -135,7 +135,25 @@ real traffic.
   synced (a deliberate skip) or failed, and why. It also shows who made the change
   in Zuper: name, email, role, designation, employee code and Zuper user uid, read
   from the delivery's `triggered_by`. A change made through Zuper's API shows the
-  account that owns the API key.
+  account that owns the API key. The table never scrolls sideways: the columns
+  are fixed shares, and a value that does not fit is cut with an ellipsis, with
+  the whole of it in the tooltip.
+
+  Clicking a row opens that delivery (`?open=<id>`, so it can be linked to): what
+  Zupersync did with it and the full error, who caused it, **what changed** in
+  words, and the **exact webhook** as stored. "What changed" is only as good as
+  what Zuper sends: a reschedule carries the old and new times, an `*.update`
+  names the changed fields with their new values only, a status change carries
+  the new status only. It describes the webhook, not the write — the record is
+  still re-read from Zuper. Shapes were read off real deliveries
+  (`dashboard/src/lib/describe.ts`); an event with no view of its own lists the
+  simple fields of its body.
+
+  The receiver stores every request header, and `x-zupersync-key` is the shared
+  secret itself. It is masked in `lib/db.ts`, before the row is returned, not in
+  the component that prints it: React serialises a server component's props into
+  the page, so a secret that reaches a component is in the HTML source even when
+  nothing displays it.
 - **To Zuper** (`/pushes`) — every change made in Tuper, the Zuper requests
   planned for it, what is not pushed and why, and whether it was sent. While
   `PUSH_MODE=dry-run`, this page is the review before going live.

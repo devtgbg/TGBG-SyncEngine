@@ -176,7 +176,7 @@ tr.fresh td { animation: fresh 4s ease-out; }
 
 /* Two values to a cell, one over the other: seven facts about a person in three
    columns rather than seven. */
-.pair { display: inline-flex; flex-direction: column; line-height: 1.35; }
+.pair { display: flex; flex-direction: column; line-height: 1.35; min-width: 0; }
 .pair .note.mono { font-size: 11px; }
 
 /* ── Pages of rows ────────────────────────────────────────────────────────── */
@@ -208,3 +208,80 @@ tr.fresh td { animation: fresh 4s ease-out; }
 @media (max-width: 560px) {
   .pager .pages { margin-left: 0; width: 100%; }
 }
+
+/* ── The delivery log never scrolls sideways ──────────────────────────────── */
+
+/* Fixed layout: the column shares in <colgroup> decide the widths, not the
+   content, so one long error cannot stretch the table past its box. Whatever
+   does not fit is cut with an ellipsis; the full value is in the title. */
+table.log { table-layout: fixed; }
+table.log th, table.log td { overflow: hidden; text-overflow: ellipsis; }
+table.log .pair > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+table.log .pill { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+
+/* Below this the shares would crush every column, so a phone scrolls instead. */
+@media (max-width: 1100px) { table.log { min-width: 1060px; } }
+
+/* ── Opening a delivery ───────────────────────────────────────────────────── */
+
+table.log tbody tr { cursor: pointer; }
+table.log tbody tr:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+table.log tbody tr.opened { background: var(--muted-bg); box-shadow: inset 3px 0 0 var(--accent); }
+
+.backdrop { position: fixed; inset: 0; z-index: 19; background: rgba(0, 0, 0, 0.4); }
+
+/* A panel over the right of the page: the log stays where it was underneath, so
+   closing the panel returns to the same row. */
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 20;
+  width: min(780px, 100vw); overflow-y: auto; overscroll-behavior: contain;
+  background: var(--bg); border-left: 1px solid var(--line);
+  padding: 22px 24px calc(40px + env(safe-area-inset-bottom, 0px));
+  display: flex; flex-direction: column; gap: 22px;
+  box-shadow: -12px 0 32px rgba(0, 0, 0, 0.18);
+  animation: drawer-in 0.16s ease-out;
+}
+@keyframes drawer-in { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+.drawer-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.drawer-head h2 { margin: 2px 0 4px; font-size: 19px; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.drawer-head p { margin: 0; font-size: 13px; }
+.drawer h3 {
+  margin: 0 0 10px; font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--dim);
+}
+.drawer section { display: flex; flex-direction: column; }
+.drawer .note { margin: 8px 0 0; }
+
+.drawer .close, .copy {
+  flex: none; padding: 5px 12px; border-radius: 6px; font: inherit; font-size: 13px; cursor: pointer;
+  color: var(--ink); background: var(--surface); border: 1px solid var(--line); text-decoration: none;
+}
+.drawer .close:hover, .copy:hover { border-color: var(--accent); color: var(--accent); }
+
+.facts {
+  margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 7px 18px;
+  padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); font-size: 13px;
+}
+.facts dt { color: var(--dim); }
+.facts dd { margin: 0; min-width: 0; }
+.wrapany { overflow-wrap: anywhere; }
+
+/* Inside the panel there is room, so nothing is cut: long values wrap. */
+.changes-table { table-layout: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); border-collapse: separate; border-spacing: 0; }
+.changes-table th, .changes-table td { white-space: pre-wrap; overflow-wrap: anywhere; vertical-align: top; }
+.changes-table td:first-child { color: var(--dim); width: 30%; }
+.changes-table td.was { color: var(--dim); text-decoration: line-through; }
+.changes-table tbody tr:hover { background: transparent; }
+
+.raw-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.raw-head h3 { margin: 0; }
+.raw {
+  margin: 0; padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface);
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2;
+}
+.raw-headers { margin-top: 12px; }
+.raw-headers summary { cursor: pointer; font-size: 13px; color: var(--dim); margin-bottom: 8px; }
+
+@media (prefers-reduced-motion: reduce) { .drawer { animation: none; } }
