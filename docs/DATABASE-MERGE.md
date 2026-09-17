@@ -82,7 +82,7 @@ Snapshots taken for this plan (structure only is kept in the repo; data stays on
 | `amc.zuper_jobs`, `amc.zuper_job_assignees` | `jms.jobs`, `jms.job_assignments` |
 | `amc.zuper_webhook_events` (empty) | Zupersync |
 | AMC `settings` caches `zuper_users`, `zuper_categories` | `jms.users`, `jms.job_categories` |
-| Supabase `jms_mirror.*` (mirror from an earlier design; **still read** — see Phase 4) | `jms.*` — only after the Business OS apps switch |
+| Supabase `jms_mirror.*` (mirror from an earlier design) | `jms.*` — **dropped 2026-09-17**, see Phase 4 |
 
 These tables are **not copied**.
 
@@ -280,12 +280,27 @@ then deploy the version that reads Supabase.
 
 - Remove the portal's 68 Zuper webhooks (`customer.golfbuggyguy.com/api/webhooks/zuper`) and
   AMC's webhook once nothing ingests through them. **DataHouse's webhooks are not touched.**
-- `jms_mirror.*` is **not** unused. 11 of the 12 deployed Business OS apps run with
-  `JMS_MODE=mirror` (or unset, on `tgbg-api`), so `@tgbg/api-client`'s `JMSAdapter` reads jobs,
-  customers and technicians from it; only `tgbg-jms` is `native`. Its data is stale — no writes
-  since at least mid-July 2026 — so those apps show old jobs today. Dropping it needs those apps
-  switched to `JMS_MODE=native` (and checked) first; the support/ops agents and the OS app's
-  `api/sync/zuper` and `api/admin/link-*` routes read or write it directly too.
+- **`jms_mirror.*` — done 2026-09-17.** It was still read: 11 of the 12 Business OS apps ran
+  `JMS_MODE=mirror` (and in the browser the adapter always fell back to it), so they showed
+  jobs as of its last write on 2026-03-12. Business OS commit `be97401` (on `main`, all 12
+  apps redeployed) moved every reader to `jms`: `JMSAdapter` is read-only and reads the
+  `jms.bos_jobs` / `jms.bos_customers` / `jms.bos_technicians` views (migration 0008,
+  `security_invoker`); the realtime hook listens on `jms.jobs` (migration 0009 publishes it);
+  the OS `api/sync/zuper` and `api/webhooks/zuper` routes and `zuper-sync.ts` are gone; the
+  agents read the views and write jobs only to the Zuper API. Then migration 0010 dropped the
+  schema. Backup: `tgbgaws:~/merge-snapshots/jms_mirror-20260917T154032Z.dump` (mode 600,
+  `pg_restore`-able; 33,361 jobs, 4,407 customers, 39 technicians, 4 sync_log rows).
+- **PostgREST's schema list now lives in the database.** PostgREST refuses to load its schema
+  cache when a listed schema does not exist, and then answers 503 to every request (tested
+  on a throwaway v14.6 container). So before the drop, the list was set on the role:
+  `ALTER ROLE authenticator SET pgrst.db_schemas = 'public,storage,graphql_public,core,jms,chat,support,ai,crm,hrms,ops,pms,mail,drive,inventory'`
+  and reloaded with `NOTIFY pgrst, 'reload config'`. **This setting overrides the container's
+  `PGRST_DB_SCHEMAS`** — to expose another schema (e.g. `portal`), change it here, then
+  `NOTIFY pgrst, 'reload config'`. The Supabase service's own `PGRST_DB_SCHEMAS` had been
+  hand-edited into `/data/coolify/services/x123f7phha4w5nas4dtq2k50/.env` and
+  `docker-compose.yml` while Coolify still stored the default `public,storage,graphql_public`
+  (a restart from Coolify would have dropped `core`, `jms` and the rest from the API); both
+  files and Coolify's stored value now carry the same list as the database.
 - Archive and stop `gbg-postgres`; close its public port 5432 now (see *Security*).
 
 ## Briefs for the application sessions
