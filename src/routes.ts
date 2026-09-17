@@ -65,6 +65,7 @@ export type FetchMode =
 const ENTITY_FETCH: Record<string, { mode: FetchMode; path?: (uid: string) => string; reason?: string }> = {
   job_details: { mode: "self" },                                            // transform GETs /api/jobs/{uid} itself
   job_activity: { mode: "self" },                                           // GETs the job's activity feed (+ /timelog)
+  estimate_activity: { mode: "self" },                                      // GETs the quote's activity feed
   jobs: { mode: "detail", path: (u) => `/api/jobs/${u}` },               // never a list row — see sweep.ts
   customers: { mode: "detail", path: (u) => `/api/customers/${u}` },        // plural
   organizations: { mode: "detail", path: (u) => `/api/organization/${u}` }, // singular
@@ -364,6 +365,8 @@ const MODULES: Record<string, ModuleSpec> = {
   ESTIMATES: {
     label: "Quotes",
     entity: "estimates",
+    // The quote, then its activity feed (Tuper's Quote Activity panel).
+    enrich: ["estimate_activity"],
     uidFields: ["estimate_uid"],
     events: {
       "estimate.new": ["New Quote"],

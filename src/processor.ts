@@ -420,7 +420,7 @@ function stubUidFields(entityName: string, uid: string): Record<string, string> 
   const byEntity: Record<string, string> = {
     jobs: "job_uid", job_details: "job_uid", job_activity: "job_uid",
     customers: "customer_uid", organizations: "organization_uid", users: "user_uid",
-    assets: "asset_uid", estimates: "estimate_uid", invoices: "invoice_uid",
+    assets: "asset_uid", estimates: "estimate_uid", estimate_activity: "estimate_uid", invoices: "invoice_uid",
     contracts: "service_contract_uid", products: "product_uid", requests: "request_uid",
   };
   const k = byEntity[entityName];

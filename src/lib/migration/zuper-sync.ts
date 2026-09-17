@@ -587,15 +587,22 @@ async function writeJobHistory(ctx: Ctx, jobId: string, r: any, isNew: boolean):
 /** A document's Zuper line items → jms.line_items (products linked through the products map). */
 async function writeLineItems(ctx: Ctx, parentType: "QUOTE" | "INVOICE", parentId: string, items: any[] | undefined, isNew: boolean): Promise<void> {
   const products = await ctxMap(ctx, "products");
+  const locations = await ctxMap(ctx, "stock_locations");
   const tbl = () => ctx.client.schema("jms").from("line_items");
   if (!isNew) { const { error } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("parent_type", parentType).eq("parent_id", parentId); if (error) throw error; }
   const rows = (items ?? []).map((l: any, i: number) => {
     const qty = num0(l.quantity), price = num0(l.unit_price);
     const discount = String(l.discount_type).toUpperCase() === "PERCENTAGE" ? r2((qty * price * num0(l.discount)) / 100) : num0(l.discount);
+    const type = String(l.line_item_type ?? "ITEM").toUpperCase();
     return {
       tenant_id: ctx.tenantId, parent_type: parentType, parent_id: parentId, product_id: mapGet(products, l.product_uid),
       description: T(l.name) ?? "Item", quantity: qty, unit_price: price, discount_amount: discount, tax_amount: 0,
       total: num0(l.total) || r2(qty * price - discount), display_order: i + 1,
+      // The line's own copy of the item, as Zuper's quote and invoice tables show it (00083).
+      item_type: type === "SECTION" || type === "HEADER" ? "HEADER" : type === "BUNDLE" ? "BUNDLE" : type.startsWith("CUSTOM") ? "CUSTOM" : "ITEM",
+      item_code: T(l.product_id), product_type: T(l.product_type), brand: T(l.brand), specification: T(l.specification),
+      uom: T(l.uom), details: T(l.plain_text_description) ?? T(l.description),
+      unit_cost: l.purchase_price == null ? null : num0(l.purchase_price), location_id: mapGet(locations, l.location_uid),
     };
   });
   if (rows.length) { const { error } = await tbl().insert(rows); if (error) throw error; }
@@ -625,6 +632,50 @@ async function writeCustomFieldValues(ctx: Ctx, entityType: string, entityId: st
     const { error } = await ctx.client.schema("jms").from("custom_field_values").upsert(rows, { onConflict: "definition_id,entity_id" });
     if (error) throw error;
   }
+}
+/** A quote's or invoice's own billing and service contact and address → jms.addresses (parent QUOTE / INVOICE). */
+async function writeDocumentAddresses(ctx: Ctx, parentType: "QUOTE" | "INVOICE", parentId: string, r: any): Promise<void> {
+  const rows = ([["BILLING", r.customer_billing_address], ["SERVICE", r.customer_service_address]] as const)
+    .filter(([, a]) => a && typeof a === "object")
+    .map(([kind, a]: readonly [string, any]) => ({
+      tenant_id: ctx.tenantId, parent_type: parentType, parent_id: parentId, address_kind: kind,
+      street: T(a.street), landmark: T(a.landmark), city: T(a.city), state: T(a.state), country: T(a.country), zip_code: T(a.zip_code),
+      contact_first_name: T(a.first_name), contact_last_name: T(a.last_name), contact_email: T(a.email), contact_phone: T(a.phone_number),
+    }));
+  if (!rows.length) return;
+  const { error } = await ctx.client.schema("jms").from("addresses").upsert(rows, { onConflict: "parent_type,parent_id,address_kind" });
+  if (error) throw error;
+}
+/** A quote's Zuper status_history → jms.quote_status_history (00107), replacing the imported rows and keeping any
+ *  Tuper made after the import. Nothing is touched when Zuper returned no history. */
+async function writeQuoteStatusHistory(ctx: Ctx, quoteId: string, history: any[] | undefined): Promise<void> {
+  if (!Array.isArray(history) || !history.length) return;
+  const users = await ctxMap(ctx, "users");
+  const tbl = () => ctx.client.schema("jms").from("quote_status_history");
+  const { error: delErr } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("quote_id", quoteId).eq("source", "zuper");
+  if (delErr) throw delErr;
+  const rows = history
+    .map((h: any) => ({ h, status: QUOTE_STATUSES[String(h?.status_name ?? "").toUpperCase()] }))
+    .filter(({ h, status }) => status && h?.created_at)
+    .map(({ h, status }) => ({
+      tenant_id: ctx.tenantId, quote_id: quoteId, status, remarks: T(h.remarks),
+      changed_by: String(h.done_by_type ?? "EMPLOYEE").toUpperCase() === "EMPLOYEE" ? mapGet(users, h.done_by?.user_uid) : null,
+      changed_at: String(h.created_at), source: "zuper",
+    }));
+  if (rows.length) { const { error } = await tbl().insert(rows); if (error) throw error; }
+}
+/** Tuper's copy of a Zuper document template (00082 imported them, keyed by source_uid). */
+async function documentTemplateId(ctx: Ctx, templateUid: unknown): Promise<string | null> {
+  const uid = T(templateUid);
+  if (!uid) return null;
+  const cache: Map<string, string | null> = (ctx.extra.templateIds ??= new Map());
+  if (!cache.has(uid)) {
+    const { data, error } = await ctx.client.schema("jms").from("document_templates")
+      .select("id").eq("tenant_id", ctx.tenantId).eq("source_uid", uid).eq("is_deleted", false).maybeSingle();
+    if (error) throw error;
+    cache.set(uid, (data as { id: string } | null)?.id ?? null);
+  }
+  return cache.get(uid) ?? null;
 }
 /** Zuper's customer list has no organization, but jobs name it — fill it in on a customer that has none. */
 async function linkCustomerOrganization(ctx: Ctx, customer: any): Promise<void> {
@@ -1086,11 +1137,25 @@ export const ENTITIES: Record<string, Entity> = {
         description: T(r.plain_text_description),
         sub_total: sub, total_discount: discount, total_tax: Math.max(0, r2(total - sub + discount)), total,
         tax_exempt: r.tax_exempt === true, is_converted: r.is_converted === true, accepted_date: ts(r.accepted_date),
+        converted_date: ts(r.converted_date),
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
+        // Zuper's Quote Details: prefix + number ("JGE33"), title, reference, sold by, tags, template, rich description.
+        prefix: T(r.prefix), title: T(r.proposal_title), reference_no: T(r.reference_no),
+        sold_by: mapGet(await ctxMap(ctx, "users"), (r.sold_by_user ?? r.sold_by)?.user_uid),
+        tags: Array.isArray(r.tags) ? r.tags.map((t: any) => T(typeof t === "string" ? t : t?.tag_name ?? t?.name)).filter(Boolean) : [],
+        template_id: await documentTemplateId(ctx, r.template?.template_uid),
+        description_html: T(r.estimate_description),
+        deposit_amount: r.deposit?.total == null ? null : num0(r.deposit.total), deposit_status: T(r.deposit?.status),
         is_deleted: r.is_deleted === true, ...createdAt(r),
       };
     },
-    afterWrite: (ctx, id, r, isNew) => writeLineItems(ctx, "QUOTE", id, r.line_items, isNew),
+    async afterWrite(ctx, id, r, isNew) {
+      await writeLineItems(ctx, "QUOTE", id, r.line_items, isNew);
+      await writeDocumentAddresses(ctx, "QUOTE", id, r);
+      await writeQuoteStatusHistory(ctx, id, r.status_history);
+      await ensureCustomFieldDefinitions(ctx, "QUOTE", (r.custom_fields ?? []).map((f: any) => String(f?.label ?? "")));
+      await writeCustomFieldValues(ctx, "QUOTE", id, r.custom_fields);
+    },
   },
   invoices: {
     name: "invoices", schema: "jms", table: "invoices", deps: ["customers", "organizations", "jobs", "users", "products", "estimates"],
@@ -1113,7 +1178,12 @@ export const ENTITIES: Record<string, Entity> = {
         is_deleted: r.is_deleted === true, ...createdAt(r),
       };
     },
-    afterWrite: (ctx, id, r, isNew) => writeLineItems(ctx, "INVOICE", id, r.line_items, isNew),
+    async afterWrite(ctx, id, r, isNew) {
+      await writeLineItems(ctx, "INVOICE", id, r.line_items, isNew);
+      await writeDocumentAddresses(ctx, "INVOICE", id, r);
+      await ensureCustomFieldDefinitions(ctx, "INVOICE", (r.custom_fields ?? []).map((f: any) => String(f?.label ?? "")));
+      await writeCustomFieldValues(ctx, "INVOICE", id, r.custom_fields);
+    },
   },
 };
 
@@ -1664,7 +1734,7 @@ async function writeZuperActivity(ctx: Ctx, entityType: string, entityId: string
   const list = rows.filter((a) => T(a.activity_message)).map((a) => {
     const action = String(a.activity_action ?? "").toUpperCase();
     const message = T(a.activity_message) as string;
-    const verb = action === "JOB_STATUS" || (action === "REQUEST" && /\bstatus\b/i.test(message)) ? "zuper_status"
+    const verb = action === "JOB_STATUS" || (["REQUEST", "ESTIMATE", "INVOICE"].includes(action) && /\bstatus\b/i.test(message)) ? "zuper_status"
       : action.includes("NOTE") ? "zuper_note" : action === "TIMELOG" ? "zuper_timelog" : "zuper_activity";
     const remarks = T(a.metadata?.remarks);
     return {
@@ -1759,6 +1829,17 @@ ENTITIES.request_activity = {
   uid: (r) => r.request_uid,
   async transform(r, ctx) { r._activity = await zuperActivity(ctx, "REQUEST", r.request_uid); return {}; },
   async afterWrite(ctx, id, r) { await writeZuperActivity(ctx, "request", id, r._activity ?? []); },
+};
+// Every imported quote's activity (Zuper's Quote Activity panel: created, printed, totals, status, custom fields).
+ENTITIES.estimate_activity = {
+  name: "estimate_activity", schema: "jms", table: "quotes", mapEntity: "estimates", enrichOnly: true, deps: ["users"], concurrency: 4,
+  async *pages(ctx) {
+    const uids = [...(await ctxMap(ctx, "estimates")).keys()];
+    if (uids.length) yield uids.map((estimate_uid) => ({ estimate_uid }));
+  },
+  uid: (r) => r.estimate_uid,
+  async transform(r, ctx) { r._activity = await zuperActivity(ctx, "ESTIMATE", r.estimate_uid); return {}; },
+  async afterWrite(ctx, id, r) { await writeZuperActivity(ctx, "quote", id, r._activity ?? []); },
 };
 
 export async function syncEntity(ctx: Ctx, name: string): Promise<{ fetched: number; upserted: number; failed: number }> {
