@@ -62,6 +62,25 @@ main {
   gap: 24px;
 }
 
+nav.site {
+  max-width: 1040px; margin: 0 auto; padding: 14px 20px 0;
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 18px;
+}
+nav.site strong { font-size: 13px; letter-spacing: 0.02em; margin-right: 6px; }
+nav.site a { color: var(--dim); text-decoration: none; font-size: 13px; }
+nav.site a:hover { color: var(--ink); }
+
+.changes { display: flex; flex-direction: column; gap: 2px; white-space: normal; min-width: 220px; }
+.changes .from { color: var(--dim); text-decoration: line-through; }
+.requests { display: flex; flex-direction: column; gap: 4px; white-space: normal; min-width: 260px; }
+.requests details summary { cursor: pointer; }
+.requests pre {
+  margin: 6px 0 0; padding: 8px 10px; border-radius: 6px; background: var(--muted-bg);
+  max-width: 440px; overflow-x: auto; font-size: 11px; line-height: 1.45;
+}
+.note { color: var(--dim); font-size: 12px; }
+td.wrap { white-space: normal; }
+
 .head h1 { margin: 0 0 6px; font-size: 22px; letter-spacing: -0.01em; }
 .head p { margin: 0; color: var(--dim); max-width: 62ch; }
 .head code { background: var(--muted-bg); padding: 1px 5px; border-radius: 4px; font-size: 0.92em; }

@@ -13,6 +13,7 @@ export const dynamic = "force-dynamic";
 const FILTERS = [
   { key: "", label: "All" },
   { key: "failed", label: "Failed" },
+  { key: "skipped", label: "Not synced" },
   { key: "unprocessed", label: "Waiting" },
   { key: "refused", label: "Refused" },
 ] as const;
@@ -40,7 +41,7 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ f
   const { filter = "" } = await searchParams;
 
   let rows: Delivery[] = [];
-  let counts = { total: 0, refused: 0, processed: 0, failed: 0, waiting: 0 };
+  let counts = { total: 0, refused: 0, processed: 0, skipped: 0, failed: 0, waiting: 0 };
   let error: string | null = null;
   try {
     [rows, counts] = await Promise.all([recentDeliveries(100, filter), totals()]);
@@ -62,6 +63,7 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ f
           <section className="tiles">
             <Tile n={counts.total} label="received" />
             <Tile n={counts.processed} label="applied" tone="ok" />
+            <Tile n={counts.skipped} label="not synced" />
             <Tile n={counts.waiting} label="waiting" tone={counts.waiting ? "warn" : undefined} />
             <Tile n={counts.failed} label="failed" tone={counts.failed ? "bad" : undefined} />
             <Tile n={counts.refused} label="refused" tone={counts.refused ? "bad" : undefined} />

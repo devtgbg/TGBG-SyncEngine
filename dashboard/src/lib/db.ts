@@ -4,10 +4,9 @@
  * Service-role, so it bypasses RLS — which is why every query here pins
  * tenant_id explicitly rather than relying on a policy to do it.
  *
- * SECURITY: nothing in this app authenticates anyone. The rows it shows include
- * the stored webhook bodies, which carry customer names, addresses and job
- * details. That is fine for a tool running on localhost and NOT fine on a public
- * URL — put auth in front of it before deploying it anywhere reachable.
+ * SECURITY: the rows shown include stored webhook bodies and planned Zuper
+ * requests, which carry customer names, addresses and job details. Every page
+ * is behind the sign-in in src/middleware.ts.
  */
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
@@ -49,7 +48,9 @@ export async function recentDeliveries(limit = 100, filter?: string): Promise<De
     .order("received_at", { ascending: false }).limit(limit);
 
   // Each filter answers a question someone actually asks of a sync log.
-  if (filter === "failed") q = q.not("process_error", "is", null);
+  // A deliberate skip is stored as "skipped: …" in process_error, but is not a failure.
+  if (filter === "failed") q = q.not("process_error", "is", null).not("process_error", "like", "skipped:%");
+  else if (filter === "skipped") q = q.like("process_error", "skipped:%");
   else if (filter === "unprocessed") q = q.is("processed_at", null).is("process_error", null);
   else if (filter === "refused") q = q.eq("verified", false);
 
@@ -58,18 +59,19 @@ export async function recentDeliveries(limit = 100, filter?: string): Promise<De
   return (data ?? []) as unknown as Delivery[];
 }
 
-export interface Totals { total: number; refused: number; processed: number; failed: number; waiting: number }
+export interface Totals { total: number; refused: number; processed: number; skipped: number; failed: number; waiting: number }
 
 /** Counts via head requests — the log can grow large and none of the rows are needed. */
 export async function totals(): Promise<Totals> {
   const base = () => db().schema("jms").from("zuper_webhook_events")
     .select("id", { count: "exact", head: true }).eq("tenant_id", tenantId());
 
-  const [all, refused, processed, failed] = await Promise.all([
+  const [all, refused, processed, skipped, failed] = await Promise.all([
     base(),
     base().eq("verified", false),
     base().not("processed_at", "is", null).is("process_error", null),
-    base().not("process_error", "is", null),
+    base().like("process_error", "skipped:%"),
+    base().not("process_error", "is", null).not("process_error", "like", "skipped:%"),
   ]);
 
   const n = (r: { count: number | null }) => r.count ?? 0;
@@ -78,7 +80,51 @@ export async function totals(): Promise<Totals> {
     total,
     refused: n(refused),
     processed: n(processed),
+    skipped: n(skipped),
     failed: n(failed),
-    waiting: Math.max(0, total - n(processed) - n(failed) - n(refused)),
+    waiting: Math.max(0, total - n(processed) - n(skipped) - n(failed) - n(refused)),
   };
+}
+
+// ── Pushes to Zuper (jms.zuper_outbox) ───────────────────────────────────────
+
+export interface PlannedRequest { method: string; path: string; body?: unknown; why: string }
+export interface Plan {
+  workOrder: string | null;
+  operation: "create" | "update";
+  requests: PlannedRequest[];
+  notPushed: { column: string; reason: string }[];
+  blocked?: string;
+}
+export interface Push {
+  id: string;
+  queued_at: string;
+  sent_at: string | null;
+  operation: "create" | "update";
+  status: "queued" | "planned" | "sent" | "failed" | "skipped" | "superseded";
+  origin: string;
+  changed: Record<string, unknown>;
+  previous: Record<string, unknown>;
+  planned: Plan | null;
+  response: unknown;
+  last_error: string | null;
+  attempts: number;
+}
+
+export async function recentPushes(limit = 100, status?: string): Promise<Push[]> {
+  let q = db().schema("jms").from("zuper_outbox")
+    .select("id, queued_at, sent_at, operation, status, origin, changed, previous, planned, response, last_error, attempts")
+    .eq("tenant_id", tenantId()).order("queued_at", { ascending: false }).limit(limit);
+  if (status) q = q.eq("status", status);
+  const { data, error } = await q;
+  if (error) throw error;
+  return (data ?? []) as unknown as Push[];
+}
+
+export async function pushTotals(): Promise<Record<string, number>> {
+  const statuses = ["queued", "planned", "sent", "failed", "skipped"];
+  const counts = await Promise.all(statuses.map((s) =>
+    db().schema("jms").from("zuper_outbox").select("id", { count: "exact", head: true })
+      .eq("tenant_id", tenantId()).eq("status", s)));
+  return Object.fromEntries(statuses.map((s, i) => [s, counts[i].count ?? 0]));
 }
