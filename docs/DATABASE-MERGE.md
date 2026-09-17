@@ -241,7 +241,11 @@ References the copy could not resolve to `jms` (rows kept, `jms` id empty, Zuper
 | From | How |
 |---|---|
 | An application on `tgbgaws` | Attach it to Docker network `x123f7phha4w5nas4dtq2k50` (Coolify → application → Network → *Connect to predefined network*), then use `SUPABASE_DATABASE_URL` from its environment. **Not attached yet** — do it at cutover. |
-| A development machine | `scripts/merge/tunnel.sh` (localhost:55433), then the same URL with host `localhost` and port `55433`. The password is only in the Coolify environment (Client Portal: `d474sjhh2no9xu6h93gwotbr`, AMC: `sti1wkudfqfsvk2s98sqn9df`); the Staff Portal uses the Client Portal's value. |
+| A development machine | `scripts/merge/tunnel.sh` (localhost:55433). The tunnel URL (host `localhost`, port `55433`) is already in the git-ignored local env files as `SUPABASE_DATABASE_URL` (2026-09-17): `tgbg-portal/.env`, `apps/client-portal/.env.local`, `apps/staff-portal/.env.local`, `TGBG-AmcEngine/.env` and `.env.local`. Logins checked through the tunnel. |
+
+`SUPABASE_DATABASE_URL` (runtime only) is set on the Coolify apps Client Portal
+(`d474sjhh2no9xu6h93gwotbr`), Staff Portal (`vvoodx0d7ib60o0qk7iuexub`, same `portal_app` value, added
+2026-09-17 on the owner's request) and AMC Engine (`sti1wkudfqfsvk2s98sqn9df`).
 
 Useful reads:
 
