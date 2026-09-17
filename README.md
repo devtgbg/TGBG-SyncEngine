@@ -138,13 +138,28 @@ rights); the Docker build is unaffected.
 Two deployables, two Coolify applications from this one repository. A push to
 `main` auto-deploys.
 
-| App | Dockerfile | Base directory | Port | Domain |
-|---|---|---|---|---|
-| Sync service | `Dockerfile` | *(repo root)* | 3020 | `zupersync.golfbuggyguy.com` |
-| Delivery log | `dashboard/Dockerfile` | `dashboard` | 3021 | *(internal — see the warning above)* |
+| App | Coolify app | Dockerfile | Base directory | Port | Domain | Health check |
+|---|---|---|---|---|---|---|
+| Sync service | `odzzb87rii8pelpwd5io885f` | `Dockerfile` | *(repo root)* | 3020 | `zupersync.golfbuggyguy.com` | `/health` |
+| Log dashboard | `xlqg5egagiof3f9mb6iabuoq` | `/Dockerfile` | `/dashboard` | 3021 | `synclog.golfbuggyguy.com` | `/healthz`, host `127.0.0.1` |
 
-Health check path: `/health`. It returns 503 when the database is unreachable, so
-it reports the thing that matters rather than merely that the process is alive.
+The service's `/health` returns 503 when the database is unreachable, so it
+reports the thing that matters rather than merely that the process is alive.
+
+The dashboard's settings are runtime-only (none is a build variable):
+`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `DEFAULT_TENANT_ID`,
+`DASHBOARD_USER` and `DASHBOARD_PASSWORD` — the password is generated and can be
+read in the app's Environment Variables in Coolify.
+
+Two things made its first deploys fail, both invisible locally:
+
+- **Coolify sets `HOSTNAME`** on the container, and Next's standalone server
+  listens on `$HOSTNAME` — it resolves the container name, fails with
+  `getaddrinfo ENOTFOUND` and exits. The image's command sets
+  `HOSTNAME=0.0.0.0` itself.
+- **Coolify's health check calls `localhost`**, which on Alpine resolves to `::1`
+  first, while the server listens on IPv4 — "connection refused" on every
+  attempt. The app's health check host is set to `127.0.0.1`.
 
 ### Environment
 
