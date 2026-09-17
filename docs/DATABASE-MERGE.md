@@ -82,7 +82,7 @@ Snapshots taken for this plan (structure only is kept in the repo; data stays on
 | `amc.zuper_jobs`, `amc.zuper_job_assignees` | `jms.jobs`, `jms.job_assignments` |
 | `amc.zuper_webhook_events` (empty) | Zupersync |
 | AMC `settings` caches `zuper_users`, `zuper_categories` | `jms.users`, `jms.job_categories` |
-| Supabase `jms_mirror.*` (stale mirror from an earlier design) | `jms.*` — drop once nothing reads it |
+| Supabase `jms_mirror.*` (mirror from an earlier design; **still read** — see Phase 4) | `jms.*` — only after the Business OS apps switch |
 
 These tables are **not copied**.
 
@@ -222,9 +222,17 @@ What was done:
 
 References the copy could not resolve to `jms` (rows kept, `jms` id empty, Zuper uid kept):
 
-- portal: two **end-to-end test customers** (uids starting `e2e-`) behind 2 portal accounts,
-  2 issued reports, 2 review jobs and 1 sign-in code — test data in production that can be
-  deleted; one asset Zuper has since deleted (review job `asset_id`).
+- portal: one asset Zuper has since deleted (a review job's `asset_id`) and one sign-in code.
+  The two **end-to-end test customers** (uids `e2e-…`) found by the first copy were **deleted
+  from `gbg` on 2026-09-17** with everything that belonged to them (219 rows: 2 customers,
+  2 portal accounts, 2 review jobs, 4 snapshots, 12 review items, 2 report versions,
+  2 issuances, 2 decisions, 1 quotation, 10 steps, 7 revisions, 1 attachment, 169 audit
+  rows, 3 queued emails), and the portal copy was reloaded. Backup:
+  `tgbgaws:~/merge-snapshots/gbg-e2e-deleted-20260917T134911Z.jsonl` (mode 600). Left for
+  the owner: `e2e-portal@example.com` (portal account, no customer) and the staff admin
+  `e2e-admin@golfbuggyguy.com` (reviewer on 23 review items of real jobs). The test runs
+  had pushed 7 status/checklist updates to the real Zuper jobs WO 52917 and 52882 on
+  2026-08-31; those remain in Zuper.
 - amc: jobs `jms` does not have (deleted in Zuper) — 2 of 1,713 reminders, 10 of 1,037
   scheduled reminders, 29 of 1,248 WhatsApp messages, 20 of 567 booking entries.
 
@@ -272,7 +280,12 @@ then deploy the version that reads Supabase.
 
 - Remove the portal's 68 Zuper webhooks (`customer.golfbuggyguy.com/api/webhooks/zuper`) and
   AMC's webhook once nothing ingests through them. **DataHouse's webhooks are not touched.**
-- Drop `jms_mirror.*` after confirming no reader.
+- `jms_mirror.*` is **not** unused. 11 of the 12 deployed Business OS apps run with
+  `JMS_MODE=mirror` (or unset, on `tgbg-api`), so `@tgbg/api-client`'s `JMSAdapter` reads jobs,
+  customers and technicians from it; only `tgbg-jms` is `native`. Its data is stale — no writes
+  since at least mid-July 2026 — so those apps show old jobs today. Dropping it needs those apps
+  switched to `JMS_MODE=native` (and checked) first; the support/ops agents and the OS app's
+  `api/sync/zuper` and `api/admin/link-*` routes read or write it directly too.
 - Archive and stop `gbg-postgres`; close its public port 5432 now (see *Security*).
 
 ## Briefs for the application sessions
@@ -337,7 +350,9 @@ the application at it. Keep each change behind a switch until cutover, and never
 ## Security notes found while surveying
 
 - `gbg-postgres` is published on port 5432 (`paneldb.golfbuggyguy.com`) with a superuser
-  login. Close the public port; the portals reach it over the SSH tunnel or the Docker network.
+  login. The owner is closing it. Production is unaffected — both portal apps connect to the
+  container name `g13ju6epg6wnum4nabolt8se` — but local development that uses the public host
+  must switch to the repo's `db:tunnel`.
 - AMC's `settings` / `location_settings` hold the Zuper API token, WhatsApp key and booking
   secret. They are **not** copied into `amc.settings`; the application reads them from
   environment variables after the move.
