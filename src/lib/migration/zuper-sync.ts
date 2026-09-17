@@ -751,6 +751,9 @@ export const ENTITIES: Record<string, Entity> = {
         name: String(r.status_name ?? "").trim() || "Status",
         status_type: JOB_STATUS_TYPES.has(String(r.status_type)) ? r.status_type : "OTHER",
         color: S(r.status_color),
+        // What the status is for, in the words Zuper's own workflow shows ("Appointment date/time needs to be
+        // confirmed with the customer"). It was dropped, so Tuper's statuses read as bare names.
+        description: S(r.status_description),
         display_order: r._order,
         require_customer_signature: r.require_customer_signature === true,
         require_customer_feedback: r.require_customer_feedback === true,
@@ -761,7 +764,8 @@ export const ENTITIES: Record<string, Entity> = {
         enabled_for_field_executive: r.enabled_for_field_executive !== false,
         enabled_for_manager: r.enabled_for_manager !== false,
         allow_remarks: allowRemarks,
-        remarks_type: allowRemarks ? (remarks.length ? "BOTH" : "FREE_TEXT") : null,
+        // Zuper's own choice where it made one — it has PREDEFINED too, which guessing from the values misses.
+        remarks_type: S(r.remarks_type) ?? (allowRemarks ? (remarks.length ? "BOTH" : "FREE_TEXT") : null),
         remarks_values: remarks,
         prefill_checklist: r.prefill_checklist === true,
         checklist_view_type: r.checklist_view_type === "MULTI_PAGE" ? "MULTI_PAGE" : "SINGLE_PAGE",
