@@ -31,12 +31,14 @@ COPY --from=build /app/.next/standalone ./
 COPY --from=build /app/.next/static ./.next/static
 
 ENV PORT=3021
-# Without this the standalone server binds localhost and nothing outside the
-# container can reach it.
-ENV HOSTNAME=0.0.0.0
 EXPOSE 3021
 
 USER node
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD wget -qO- http://127.0.0.1:3021/healthz >/dev/null || exit 1
-CMD ["node", "server.js"]
+# The standalone server listens on $HOSTNAME. Coolify sets HOSTNAME to the
+# container's name at run time, which overrides an ENV here, and the server then
+# exits with getaddrinfo ENOTFOUND before listening (reproduced on the server
+# 2026-09-17: the deploy failed its health check with "connection refused").
+# Setting it in the command itself wins over anything the platform injects.
+CMD ["sh", "-c", "HOSTNAME=0.0.0.0 exec node server.js"]
