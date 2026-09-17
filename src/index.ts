@@ -17,6 +17,7 @@ import { dbReachable } from "./supabase.js";
 import { receiver } from "./receiver.js";
 import { startReplay } from "./reconcile.js";
 import { startPusher } from "./pusher.js";
+import { startSweep } from "./sweep.js";
 
 const app = express();
 
@@ -84,6 +85,9 @@ app.listen(config.port, () => {
   // Retry what was received but never finished. Without this a delivery that
   // failed once is simply lost, and the tables quietly drift from Zuper.
   startReplay();
+  // Re-read jobs Zuper changed recently whose webhook never arrived (Zuper gives
+  // up after its retries). Each run is capped, and ticks never overlap.
+  startSweep();
   // Changes made in Tuper, towards Zuper. Dry run unless PUSH_MODE=live.
   startPusher();
 });

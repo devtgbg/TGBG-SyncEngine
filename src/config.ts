@@ -16,6 +16,22 @@ function required(name: string): string {
   return v.trim();
 }
 
+/**
+ * An error as readable text. supabase-js throws plain objects ({ message, code,
+ * details }), which String() renders as "[object Object]" — and that is what the
+ * delivery log recorded until this existed.
+ */
+export function errorText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object") {
+    const e = err as { message?: unknown; code?: unknown; details?: unknown; hint?: unknown };
+    const parts = [e.message, e.code && `(${e.code})`, e.details, e.hint].filter((x) => typeof x === "string" && x);
+    if (parts.length) return parts.join(" ");
+    try { return JSON.stringify(err); } catch { /* fall through */ }
+  }
+  return String(err);
+}
+
 /** PUSH_MODE, refusing anything unrecognised rather than guessing towards `live`. */
 function pushMode(v: string): "off" | "dry-run" | "live" {
   const m = v.trim().toLowerCase();

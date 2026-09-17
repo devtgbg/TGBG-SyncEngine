@@ -20,7 +20,7 @@
 
 import { Router, type Request, type Response } from "express";
 import { timingSafeEqual } from "node:crypto";
-import { config, secretConfigured } from "./config.js";
+import { config, errorText, secretConfigured } from "./config.js";
 import { db } from "./supabase.js";
 import { resolveRoute } from "./routes.js";
 
@@ -120,7 +120,7 @@ export async function captureUnparseable(req: Request, err: Error & { type?: str
     if (error) throw error;
     return (data as { id: string }).id;
   } catch (e) {
-    console.warn("[zupersync] could not persist unparseable delivery:", e instanceof Error ? e.message : e);
+    console.warn("[zupersync] could not persist unparseable delivery:", errorText(e));
     return null;
   }
 }
@@ -147,7 +147,7 @@ async function capture(
   } catch (err) {
     // Includes "table does not exist" before the migration is applied — the
     // service still works, it just can't replay.
-    console.warn("[zupersync] could not persist delivery:", err instanceof Error ? err.message : err);
+    console.warn("[zupersync] could not persist delivery:", errorText(err));
     return null;
   }
 }
@@ -186,7 +186,7 @@ receiver.post("/", async (req: Request, res: Response) => {
       const { processEvent } = await import("./processor.js");
       await processEvent({ id: eventId, ...ids, body: req.body });
     } catch (err) {
-      console.warn("[zupersync] post-ack processing failed:", err instanceof Error ? err.message : err);
+      console.warn("[zupersync] post-ack processing failed:", errorText(err));
     }
   });
 });

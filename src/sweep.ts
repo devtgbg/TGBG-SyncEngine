@@ -58,7 +58,7 @@
  * it as a lower bound on API usage, never as total consumption.
  */
 
-import { config } from "./config.js";
+import { config, errorText } from "./config.js";
 import { db } from "./supabase.js";
 import { getSyncConfig, zuperGet } from "./lib/migration/zuper-sync.js";
 import { syncRecord } from "./processor.js";
@@ -171,7 +171,7 @@ export async function sweepJobs(opts: {
       result.resynced++;
     } catch (err) {
       result.failed++;
-      console.warn(`[zupersync] sweep failed for job ${item.uid}: ${err instanceof Error ? err.message : err}`);
+      console.warn(`[zupersync] sweep failed for job ${item.uid}: ${errorText(err)}`);
     }
   }
 
@@ -196,7 +196,7 @@ export function startSweep(): void {
         console.log(`[zupersync] sweep: ${r.inWindow} in window, ${r.drifted} drifted, ${r.unmapped} unmapped, ${r.resynced} resynced, ${r.failed} failed${r.stoppedEarly ? " (capped)" : ""}`);
       }
     } catch (err) {
-      console.warn("[zupersync] sweep failed:", err instanceof Error ? err.message : err);
+      console.warn("[zupersync] sweep failed:", errorText(err));
     } finally {
       running = false;
     }

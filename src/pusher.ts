@@ -42,7 +42,7 @@
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { config } from "./config.js";
+import { config, errorText } from "./config.js";
 import { db } from "./supabase.js";
 import { getSyncConfig, zuperGet, type SyncConfig } from "./lib/migration/zuper-sync.js";
 import { JOB_CREATE_LOCK, oneAtATime } from "./processor.js";
@@ -184,8 +184,8 @@ function sameValue(column: string, ours: unknown, theirs: unknown): boolean {
     return new Date(String(ours)).getTime() === new Date(String(theirs)).getTime();
   }
   if (column === "job_tags") {
-    const a = [...((ours as string[]) ?? [])].sort().join(" ");
-    const b = [...((theirs as string[]) ?? [])].sort().join(" ");
+    const a = [...((ours as string[]) ?? [])].sort().join("\u0000");
+    const b = [...((theirs as string[]) ?? [])].sort().join("\u0000");
     return a === b;
   }
   return String(ours ?? "") === String(theirs ?? "");
@@ -577,7 +577,7 @@ export async function pushPending(mode: PushMode = config.push.mode, limit = con
     } catch (err) {
       const attempts = Math.max(...rows.map((r) => r.attempts)) + 1;
       await mark({
-        status: "failed", last_error: (err instanceof Error ? err.message : String(err)).slice(0, 400), attempts,
+        status: "failed", last_error: errorText(err).slice(0, 400), attempts,
         next_try_at: new Date(Date.now() + backoffMinutes(attempts) * 60_000).toISOString(),
       }).catch(() => undefined);
       result.failed++;
@@ -603,7 +603,7 @@ export function startPusher(): void {
       const r = await pushPending(mode);
       if (r.jobs) console.log(`[zupersync] push (${mode}): ${r.jobs} job(s) — ${r.planned} planned, ${r.sent} sent, ${r.skipped} skipped, ${r.failed} failed${r.waiting ? `, ${r.waiting} waiting` : ""}`);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = errorText(err);
       // Before migrations/0002 is applied the table does not exist; say so once.
       if (/zuper_outbox|PGRST205|42P01/.test(msg)) {
         if (!missingTableWarned) console.warn("[zupersync] push: jms.zuper_outbox is missing — apply migrations/0002");

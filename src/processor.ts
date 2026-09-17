@@ -34,7 +34,7 @@
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { db } from "./supabase.js";
-import { config } from "./config.js";
+import { config, errorText } from "./config.js";
 import { ENTITIES, getSyncConfig, zuperGet, type SyncConfig } from "./lib/migration/zuper-sync.js";
 import { detailPathFor, isSelfFetching, resolveRoute, type NoteHost } from "./routes.js";
 
@@ -478,7 +478,7 @@ export async function processEvent(delivery: Delivery): Promise<SyncOneResult | 
         .update({ ...patch, attempts: attempt, updated_at: new Date().toISOString() })
         .eq("id", delivery.id);
     } catch (err) {
-      console.warn("[zupersync] could not record processing outcome:", err instanceof Error ? err.message : err);
+      console.warn("[zupersync] could not record processing outcome:", errorText(err));
     }
   };
 
@@ -516,7 +516,7 @@ export async function processEvent(delivery: Delivery): Promise<SyncOneResult | 
     console.log(`[zupersync] ${route.module}/${delivery.event} → ${result.entity} ${result.action} ${result.id ?? ""}${noteInfo}`.trim());
     return result;
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = errorText(err);
     console.warn(`[zupersync] processing failed for ${delivery.module}/${delivery.event}: ${msg}`);
     await finish({ process_error: msg.slice(0, 400) });
     throw err;

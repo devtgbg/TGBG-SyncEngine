@@ -222,8 +222,13 @@ from a fresh session — the one at the end of the file does not reliably reach 
 
 - `0001_zuper_webhook_events.sql` — the delivery inbox. **Applied.**
 - `0002_zuper_outbox.sql` — the push outbox, and triggers on `jms.jobs`,
-  `jms.job_assignments` and `jms.job_team_assignments`. Apply it only once the
-  deployed service sends `x-sync-origin` (it does from b474d84).
+  `jms.job_assignments` and `jms.job_team_assignments`. **Applied 2026-09-17**,
+  after the deployed service began sending `x-sync-origin` (b474d84). Verified:
+  a write carrying the header queues nothing; one without it queues the changed
+  columns with their previous values.
+- `0003_zuper_sync_map_uid_index.sql` — `(tenant_id, zuper_uid)` on the sync map,
+  for the per-record id lookups (a 513k-row scan before, 0.08 ms after).
+  **Applied 2026-09-17.** Uses `CONCURRENTLY`, so apply it on its own.
 
 ## Pushing back to Zuper
 

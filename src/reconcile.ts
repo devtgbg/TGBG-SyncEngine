@@ -17,7 +17,7 @@
  *     Zuper, say) must stop being retried rather than burn API budget forever.
  */
 
-import { config } from "./config.js";
+import { config, errorText } from "./config.js";
 import { processPending } from "./processor.js";
 
 let timer: NodeJS.Timeout | null = null;
@@ -33,7 +33,7 @@ async function tick(): Promise<void> {
       console.log(`[zupersync] replay: ${r.attempted} attempted, ${r.ok} applied, ${r.failed} still failing`);
     }
   } catch (err) {
-    console.warn("[zupersync] replay failed:", err instanceof Error ? err.message : err);
+    console.warn("[zupersync] replay failed:", errorText(err));
   } finally {
     running = false;
   }
