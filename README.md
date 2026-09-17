@@ -39,7 +39,7 @@ documents no verification scheme for it, so the header is the usable mechanism.
 ### Routing
 
 `src/routes.ts` holds Zuper's whole event catalogue: **12 modules, 203 events** —
-101 synced (12 of them deletions), 102 stored with a reason and skipped.
+118 synced (12 of them deletions), 85 stored with a reason and skipped.
 
 The catalogue is Zuper's own, not transcribed from its UI. `GET
 /api/misc/{MODULE}/events` — the call Zuper's New Webhook form makes when a module
@@ -65,6 +65,17 @@ Things that break routing silently if assumed otherwise:
   "applied". `job_activity` rebuilds the job's Zuper activity feed and its time
   logs (`GET /api/jobs/{uid}/timelog`); nothing refreshed either after the import
   until 2026-09-17. Punches (`job.timelog*`) and job attachments re-read the job.
+- **Punches and time off have no read-by-uid**, so their events re-read the recent
+  part of the list (`src/collections.ts`): punches for the last three days, time
+  off that is new, current or recently decided. Bursts (a bulk check-in) share
+  one pass. Deletions are not mirrored; neither table has a deleted flag. Shift
+  planning is not used in Zuper here and stays out.
+- **The sweep covers every kind of record** (`src/sweep-records.ts`): organizations,
+  assets, products, contracts, requests, quotes and invoices by `updated_at`;
+  customers by value (Zuper's customer list has no `updated_at`); the newest
+  notes; punches and time off. Customers, organizations, assets and products are
+  ~100 list pages, so they run on the first pass after a start and then every
+  `SWEEP_FULL_EVERY_MINUTES` (180). `npm run sweep -- --records [--full] [--apply]`.
 - **Job line items are not synced.** None of 12,000 jobs changed since 2025 has
   one, and replacing Tuper's job line items with Zuper's empty list would lose
   data. Photos reach Tuper through checklist answers and note attachments (53 of

@@ -44,7 +44,16 @@ const zHeaders = (cfg: SyncConfig) => ({ "x-api-key": cfg.api_key ?? "", "conten
  *  fail intermittently at deep offsets (jobs past ~27,000: 500, then 200 on a later try). */
 async function zuperJson(cfg: SyncConfig, path: string, init: RequestInit, what: string): Promise<any> {
   for (let attempt = 1; ; attempt++) {
-    const res = await fetch(cfg.api_base + path, { ...init, headers: zHeaders(cfg) });
+    let res: Response;
+    try {
+      // A reset or timed-out connection is as transient as a 5xx: retried the same way. Callers only use
+      // this for reads and for the idempotent list filters, so a repeat is safe.
+      res = await fetch(cfg.api_base + path, { ...init, headers: zHeaders(cfg), signal: AbortSignal.timeout(60_000) });
+    } catch (err) {
+      if (attempt >= 6) throw new Error(`Zuper ${what} → network error: ${err instanceof Error ? (err.cause as Error | undefined)?.message ?? err.message : String(err)}`);
+      await new Promise((r) => setTimeout(r, Math.min(30_000, 1000 * 2 ** attempt)));
+      continue;
+    }
     if (res.ok) return res.json();
     await res.text().catch(() => "");
     if (attempt >= 6 || (res.status < 500 && res.status !== 429)) throw new Error(`Zuper ${what} → ${res.status}`);
@@ -330,7 +339,7 @@ async function writeAddresses(ctx: Ctx, parentType: string, parentId: string, is
   if (rows.length) { const { error } = await addresses().insert(rows); if (error) throw error; }
 }
 
-function customerFields(r: any): Record<string, unknown> {
+export function customerFields(r: any): Record<string, unknown> {
   const first = T(r.customer_first_name), company = T(r.customer_company_name), email = T(r.customer_email);
   const cn = r.customer_contact_no ?? {}, acc = r.accounts ?? {};
   return {
@@ -1235,7 +1244,7 @@ ENTITIES.timesheets = {
     const checkType = PUNCH_TYPES[String(r.type_of_check)];
     if (!userId || !checkType || !r.checked_time) return null;
     return {
-      user_id: userId, check_type: checkType, checked_time: String(r.checked_time),
+      user_id: userId, check_type: checkType, checked_time: punchTime(r.checked_time),
       latitude: N(r.latitude), longitude: N(r.longitude), auth_photo_url: T(r.auth_pic), remarks: T(r.remarks), ...createdAt(r),
     };
   },

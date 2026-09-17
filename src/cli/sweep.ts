@@ -6,6 +6,8 @@
  *   npm run sweep -- --apply               # actually re-sync the drifted jobs
  *   npm run sweep -- --apply --max 50      # bounded first run
  *   npm run sweep -- --apply --force       # every job in the window, drifted or not
+ *   npm run sweep -- --records             # everything but jobs: which records are behind (dry run)
+ *   npm run sweep -- --records --full --apply   # incl. customers, organizations, assets, products
  *
  * DRY RUN IS THE DEFAULT, as with simulate: there is no local database, so a
  * sweep writes the live jms.* rows four applications read.
@@ -17,7 +19,7 @@
  * one burst while live webhooks are competing for it.
  */
 
-import { sweepJobs } from "../sweep.js";
+import { sweepJobs, sweepOtherRecords } from "../sweep.js";
 import { config } from "../config.js";
 
 const argv = process.argv.slice(2);
@@ -30,6 +32,16 @@ const num = (n: string, d: number) => {
 
 async function main() {
   const dryRun = !has("apply");
+  if (has("records")) {
+    const started = Date.now();
+    const kinds = await sweepOtherRecords({ full: has("full"), dryRun, maxResyncs: num("max", config.sweep.maxResyncs) });
+    for (const k of kinds) {
+      console.log(`${k.kind.padEnd(17)} listed ${String(k.listed).padStart(5)}  missing ${String(k.missing).padStart(3)}  behind ${String(k.behind).padStart(3)}` +
+        (dryRun ? "" : `  synced ${String(k.resynced).padStart(3)}  failed ${k.failed}${k.errors.length ? `  (${k.errors.join(" | ")})` : ""}`));
+    }
+    console.log(`${dryRun ? "DRY RUN — nothing written. " : ""}${Math.round((Date.now() - started) / 1000)}s`);
+    return;
+  }
   const minutesBack = num("minutes", config.sweep.minutesBack);
   const maxResyncs = num("max", config.sweep.maxResyncs);
   const perMinute = num("rate", config.sweep.perMinute);

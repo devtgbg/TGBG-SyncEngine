@@ -128,6 +128,25 @@ for (const [key] of fixture.modules.PROPERTY ?? []) {
 }
 
 // 5. Events Zuper adds later: a known module re-reads the record; the rest are refused.
+// Punches and time off re-read their list; no uid is needed, and nothing else in the module syncs.
+const COLLECTIONS: Record<string, string> = {
+  "timesheet.check_in": "timesheets", "timesheet.check_out": "timesheets", "timesheet.break": "timesheets",
+  "timesheet.resume_work": "timesheets", "timesheet.bulk_check_in": "timesheets", "timesheet.bulk_check_out": "timesheets",
+  "timesheet.bulk_resume_work": "timesheets", "timesheet.bulk_break": "timesheets", "timesheet.update": "timesheets",
+  "timesheet.day_activity": "timesheets",
+  "timesheet.new_timeoff": "timeoff_requests", "timesheet.approve_timeoff": "timeoff_requests",
+  "timesheet.reject_timeoff": "timeoff_requests", "timesheet.update_timeoff": "timeoff_requests",
+  "timesheet.new_timeoff_type": "timeoff_types", "timesheet.edit_timeoff_type": "timeoff_types",
+  "timesheet.delete_timeoff_type": "timeoff_types",
+};
+for (const [key] of fixture.modules.TIMESHEET ?? []) {
+  const r = resolveRoute("", key);
+  const want = COLLECTIONS[key];
+  if (want && (r?.collection !== want || r?.skip || r?.fetch !== "collection")) problems.push(`${key}: expected a re-read of ${want}, got ${r?.collection ?? "none"}${r?.skip ? ` (skipped: ${r.skip})` : ""}`);
+  if (!want && !r?.skip) problems.push(`${key}: expected to be skipped`);
+}
+if (!resolveRoute("", "timesheet.some_new_event")?.skip) problems.push("an uncatalogued timesheet event must be skipped");
+
 // Punches and attachments are job changes now; line items are deliberately not.
 for (const key of ["job.timelog", "job.timelog_update", "job.new_attachment", "job.update_attachment"]) {
   const r = resolveRoute("", key);

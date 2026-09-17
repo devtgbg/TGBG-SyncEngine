@@ -154,6 +154,8 @@ export const config = {
     everyMinutes: Math.max(5, Number(optional("SWEEP_EVERY_MINUTES", "30"))),
     minutesBack: Math.max(5, Number(optional("SWEEP_MINUTES_BACK", "180"))),
     maxResyncs: Math.max(1, Number(optional("SWEEP_MAX_RESYNCS", "200"))),
+    // Organizations, assets, products and customers: ~100 list pages, so less often.
+    fullEveryMinutes: Math.max(30, Number(optional("SWEEP_FULL_EVERY_MINUTES", "180"))),
     perMinute: Math.min(120, Math.max(1, Number(optional("SWEEP_REQUESTS_PER_MINUTE", "45")))),
   },
 } as const;

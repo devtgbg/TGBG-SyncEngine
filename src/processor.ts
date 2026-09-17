@@ -497,6 +497,16 @@ export async function processEvent(delivery: Delivery): Promise<SyncOneResult | 
     // The route's own fields come first. delivery.uid is the receiver's generic
     // guess, which for a note deletion is the HOST's uid (job_uid), not note_uid —
     // and flagging by that would miss, or worse, hit a different record.
+    // A list-only record (punches, time off) needs no uid: its recent list is re-read.
+    if (route.collection) {
+      const { syncCollection } = await import("./collections.js");
+      const r = await syncCollection(route.collection);
+      const note = `${r.written} written of ${r.listed} listed${r.failed ? `, ${r.failed} failed: ${r.errors[0] ?? ""}` : ""}`;
+      await finish({ processed_at: new Date().toISOString(), process_error: r.failed && !r.written ? note.slice(0, 400) : null, sync_entity: route.entity });
+      console.log(`[zupersync] ${route.module}/${delivery.event} → ${route.collection} ${note}`);
+      return { entity: route.entity, uid: "", action: r.written ? "updated" : "skipped", id: null };
+    }
+
     const uid = route.uidFields.map((f) => findUid(delivery.body, f)).find(Boolean) || delivery.uid || null;
     if (!uid) {
       const reason = `none of ${route.uidFields.join(", ")} found in the delivered body`;

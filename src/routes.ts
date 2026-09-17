@@ -51,7 +51,9 @@ export type FetchMode =
   /** Zuper publishes no read-by-uid for this entity — see `reason`. */
   | "unsupported"
   /** Re-read every note on the record the note belongs to (GET /api/notes?filter.<host>=uid). */
-  | "host";
+  | "host"
+  /** Re-read the recent part of a list Zuper only serves whole (collections.ts). */
+  | "collection";
 
 /**
  * Where one record of each entity comes from.
@@ -78,7 +80,10 @@ const ENTITY_FETCH: Record<string, { mode: FetchMode; path?: (uid: string) => st
   // still work for mapped records, because marking a row deleted needs no fetch.
   // Zuper has no GET by note_uid, but lists a record's notes; the host's uid is in every note event.
   notes: { mode: "host" },
-  timesheets: { mode: "unsupported", reason: "Zuper has no GET by timesheet_uid, and /timesheets has no uid filter" },
+  // No read-by-uid; the recent part of each list is re-read instead (collections.ts).
+  timesheets: { mode: "collection" },
+  timeoff_requests: { mode: "collection" },
+  timeoff_types: { mode: "collection" },
 };
 
 /** The by-uid path for an entity, or null when Zuper publishes none. */
@@ -113,7 +118,12 @@ export interface Route {
   inferred: boolean;
   /** For note events: the kind of record the note is on; the uid is that record's. */
   noteHost?: NoteHost;
+  /** For list-only records: which list to re-read. No uid is needed. */
+  collection?: Collection;
 }
+
+/** Lists Zuper only serves whole (see collections.ts). */
+export type Collection = "timesheets" | "timeoff_requests" | "timeoff_types";
 
 /** Records Tuper keeps notes on — the hosts the notes import understands. */
 export type NoteHost = "job" | "customer" | "request" | "asset";
@@ -127,6 +137,7 @@ interface EventRule {
   entity?: string;
   uidFields?: string[];
   noteHost?: NoteHost;
+  collection?: Collection;
 }
 
 interface ModuleSpec {
@@ -139,6 +150,8 @@ interface ModuleSpec {
   events: Record<string, [string, EventRule?]>;
   /** Applies to every event in the module that has no rule of its own. */
   skipAll?: string;
+  /** Applies to events Zuper adds later that the catalogue does not know yet. */
+  skipUncatalogued?: string;
 }
 
 // Shared rules, so the same decision reads the same everywhere.
@@ -150,6 +163,11 @@ const DELETE: EventRule = { deletion: true };
 const NOTE = (host: NoteHost): EventRule => ({ entity: "notes", uidFields: [`${host}_uid`], noteHost: host });
 const NOTE_DELETE = (host: NoteHost): EventRule => ({ ...NOTE(host), deletion: true });
 const NO_NOTES: EventRule = { skip: "Tuper keeps no notes on quotes, invoices or contracts" };
+const PUNCHES: EventRule = { entity: "timesheets", uidFields: [], collection: "timesheets" };
+const TIMEOFF: EventRule = { entity: "timeoff_requests", uidFields: [], collection: "timeoff_requests" };
+const TIMEOFF_TYPES: EventRule = { entity: "timeoff_types", uidFields: [], collection: "timeoff_types" };
+const NOT_KEPT = (what: string): EventRule => ({ skip: `not kept in Tuper: ${what}` });
+const SHIFTS: EventRule = { skip: "shift planning is not used in Zuper here" };
 const ATTACHMENT: EventRule = { skip: "files attached to this kind of record are not synced (job files and note files are)" };
 const NO_STATE: (what: string) => EventRule = (what) => ({ skip: `${what} changes nothing on the record` });
 
@@ -275,48 +293,50 @@ const MODULES: Record<string, ModuleSpec> = {
 
   TIMESHEET: {
     label: "Timesheets",
-    // One Zuper module spanning timesheets, approvals, time off, shifts and GPS.
-    // None has a read-by-uid, so the whole module is recorded but not synced.
+    // One Zuper module spanning punches, approvals, time off, shifts and GPS. None
+    // has a read-by-uid, so punches and time off re-read the recent part of their
+    // list (collections.ts); no uid is needed.
     entity: "timesheets",
-    uidFields: ["timesheet_uid", "user_uid"],
-    skipAll: "timesheets, time off and shifts have no read-by-uid in Zuper",
+    uidFields: [],
+    skipUncatalogued: "an uncatalogued timesheet event has no known list to re-read",
     events: {
-      "timesheet_approval.new": ["New Timesheet Approval"],
-      "timesheet_approval.update": ["Update Timesheet Approval"],
-      "timesheet_approval.delete": ["Delete Timesheet approval"],
-      "timesheet_approval.status_update": ["Timesheet Approval Status Update"],
-      "timesheet.update": ["Timesheet Update"],
-      "timesheet.delete": ["Timesheet Delete"],
-      "timesheet.new_location": ["Timesheet New Location"],
-      "timesheet.edit_location": ["Timesheet Edit Location"],
-      "timesheet.delete_location": ["Timesheet Delete Location"],
-      "timesheet.new_timeoff": ["New Timeoff"],
-      "timesheet.approve_timeoff": ["Approve Timeoff"],
-      "timesheet.reject_timeoff": ["Reject Timeoff"],
-      "timesheet.update_timeoff": ["Update Timeoff"],
-      "timesheet.delete_timeoff": ["Delete Timeoff"],
-      "timesheet.user_shift_create": ["New User Shift"],
-      "timesheet.user_shift_delete": ["Delete User Shift"],
-      "timesheet.new_timeoff_availability": ["New Timeoff Availability"],
-      "timesheet.edit_timeoff_availability": ["Edit Timeoff Availability"],
-      "timesheet.delete_timeoff_availability": ["Delete Timeoff Availability"],
-      "timesheet.new_timeoff_type": ["New Timeoff Type"],
-      "timesheet.edit_timeoff_type": ["Edit Timeoff Type"],
-      "timesheet.delete_timeoff_type": ["Delete Timeoff Type"],
-      "timesheet.employee_location_create": ["New Timesheet Location"],
-      "timesheet.employee_location_delete": ["Delete Timesheet Location"],
-      "timesheet.day_activity": ["Timesheet Day Activity"],
-      "timesheet.check_in": ["Timesheet Check In"],
-      "timesheet.check_out": ["Timesheet Check Out"],
-      "timesheet.break": ["Timesheet Break"],
-      "timesheet.resume_work": ["Timesheet Resume Work"],
-      "timesheet.master_shift_create": ["Timesheet Master Shift Create"],
-      "timesheet.master_shift_update": ["Timesheet Master Shift Updating"],
-      "timesheet.master_shift_delete": ["Timesheet Master Shift Delete"],
-      "timesheet.bulk_check_in": ["Timesheet Bulk Check In"],
-      "timesheet.bulk_check_out": ["Timesheet Bulk Check Out"],
-      "timesheet.bulk_resume_work": ["Timesheet Bulk Resume Work"],
-      "timesheet.bulk_break": ["Timesheet Bulk Break"],
+      "timesheet.check_in": ["Timesheet Check In", PUNCHES],
+      "timesheet.check_out": ["Timesheet Check Out", PUNCHES],
+      "timesheet.break": ["Timesheet Break", PUNCHES],
+      "timesheet.resume_work": ["Timesheet Resume Work", PUNCHES],
+      "timesheet.bulk_check_in": ["Timesheet Bulk Check In", PUNCHES],
+      "timesheet.bulk_check_out": ["Timesheet Bulk Check Out", PUNCHES],
+      "timesheet.bulk_resume_work": ["Timesheet Bulk Resume Work", PUNCHES],
+      "timesheet.bulk_break": ["Timesheet Bulk Break", PUNCHES],
+      "timesheet.update": ["Timesheet Update", PUNCHES],
+      "timesheet.day_activity": ["Timesheet Day Activity", PUNCHES],
+      "timesheet.delete": ["Timesheet Delete", { skip: "a deleted punch stays in Tuper — the table keeps no deleted flag" }],
+      "timesheet.new_timeoff": ["New Timeoff", TIMEOFF],
+      "timesheet.approve_timeoff": ["Approve Timeoff", TIMEOFF],
+      "timesheet.reject_timeoff": ["Reject Timeoff", TIMEOFF],
+      "timesheet.update_timeoff": ["Update Timeoff", TIMEOFF],
+      "timesheet.delete_timeoff": ["Delete Timeoff", { skip: "a deleted time off request stays in Tuper — the table keeps no deleted flag" }],
+      "timesheet.new_timeoff_type": ["New Timeoff Type", TIMEOFF_TYPES],
+      "timesheet.edit_timeoff_type": ["Edit Timeoff Type", TIMEOFF_TYPES],
+      "timesheet.delete_timeoff_type": ["Delete Timeoff Type", TIMEOFF_TYPES],
+      "timesheet_approval.new": ["New Timesheet Approval", NOT_KEPT("timesheet approvals")],
+      "timesheet_approval.update": ["Update Timesheet Approval", NOT_KEPT("timesheet approvals")],
+      "timesheet_approval.delete": ["Delete Timesheet approval", NOT_KEPT("timesheet approvals")],
+      "timesheet_approval.status_update": ["Timesheet Approval Status Update", NOT_KEPT("timesheet approvals")],
+      "timesheet.new_location": ["Timesheet New Location", NOT_KEPT("timesheet locations")],
+      "timesheet.edit_location": ["Timesheet Edit Location", NOT_KEPT("timesheet locations")],
+      "timesheet.delete_location": ["Timesheet Delete Location", NOT_KEPT("timesheet locations")],
+      "timesheet.employee_location_create": ["New Timesheet Location", NOT_KEPT("timesheet locations")],
+      "timesheet.employee_location_delete": ["Delete Timesheet Location", NOT_KEPT("timesheet locations")],
+      "timesheet.new_timeoff_availability": ["New Timeoff Availability", NOT_KEPT("time off availability")],
+      "timesheet.edit_timeoff_availability": ["Edit Timeoff Availability", NOT_KEPT("time off availability")],
+      "timesheet.delete_timeoff_availability": ["Delete Timeoff Availability", NOT_KEPT("time off availability")],
+      // No shift is scheduled in Zuper from Sep to Dec 2026 (checked 2026-09-17).
+      "timesheet.user_shift_create": ["New User Shift", SHIFTS],
+      "timesheet.user_shift_delete": ["Delete User Shift", SHIFTS],
+      "timesheet.master_shift_create": ["Timesheet Master Shift Create", SHIFTS],
+      "timesheet.master_shift_update": ["Timesheet Master Shift Updating", SHIFTS],
+      "timesheet.master_shift_delete": ["Timesheet Master Shift Delete", SHIFTS],
     },
   },
 
@@ -526,6 +546,7 @@ function build(module: string, rule: EventRule | undefined, inferred: boolean): 
   const deletion = rule?.deletion === true;
   const skip = rule?.skip
     ?? spec.skipAll
+    ?? (!rule && inferred ? spec.skipUncatalogued : undefined)
     // A deletion needs no fetch, so an unsupported read does not block it.
     ?? (fetchSpec.mode === "unsupported" && !deletion ? fetchSpec.reason : undefined);
   return {
@@ -535,6 +556,7 @@ function build(module: string, rule: EventRule | undefined, inferred: boolean): 
     // pass must not follow it. Nor does a deletion need one.
     enrich: rule?.entity || deletion ? undefined : spec.enrich,
     noteHost: rule?.noteHost,
+    collection: rule?.collection,
     uidFields: rule?.uidFields ?? spec.uidFields,
     fetch: fetchSpec.mode,
     detail: fetchSpec.mode === "detail" ? fetchSpec.path ?? null : null,

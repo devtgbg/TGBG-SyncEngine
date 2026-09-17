@@ -63,6 +63,7 @@ import { db } from "./supabase.js";
 import { getSyncConfig, zuperGet } from "./lib/migration/zuper-sync.js";
 import { syncRecord } from "./processor.js";
 import { JOB_ENRICH } from "./routes.js";
+import { sweepRecords, type KindResult } from "./sweep-records.js";
 
 export interface SweepResult {
   window: { from: string; to: string };
@@ -179,8 +180,21 @@ export async function sweepJobs(opts: {
   return result;
 }
 
+/** Everything else: see sweep-records.ts. Paced and capped like the job sweep. */
+export async function sweepOtherRecords(opts: { full: boolean; dryRun?: boolean; maxResyncs?: number; perMinute?: number }): Promise<KindResult[]> {
+  let left = opts.maxResyncs ?? config.sweep.maxResyncs;
+  const wait = pacer(opts.perMinute ?? config.sweep.perMinute);
+  return sweepRecords({
+    full: opts.full,
+    dryRun: opts.dryRun ?? false,
+    pace: wait,
+    budget: () => left--,
+  });
+}
+
 let timer: NodeJS.Timeout | null = null;
 let running = false;
+let lastFull = 0;
 
 export function startSweep(): void {
   if (!config.sweep.enabled) {
@@ -195,6 +209,16 @@ export function startSweep(): void {
       const r = await sweepJobs();
       if (r.drifted || r.unmapped || r.failed) {
         console.log(`[zupersync] sweep: ${r.inWindow} in window, ${r.drifted} drifted, ${r.unmapped} unmapped, ${r.resynced} resynced, ${r.failed} failed${r.stoppedEarly ? " (capped)" : ""}`);
+      }
+      // The first pass after a start is a full one, then every fullEveryMinutes.
+      const full = Date.now() - lastFull >= config.sweep.fullEveryMinutes * 60_000;
+      const others = await sweepOtherRecords({ full });
+      if (full) lastFull = Date.now();
+      // Punches and time off are rewritten every pass; only gaps and failures are news.
+      const news = others.filter((k) => k.behind || k.missing || k.failed);
+      if (news.length) {
+        console.log(`[zupersync] sweep${full ? " (full)" : ""}: ` + news.map((k) =>
+          `${k.kind} ${k.missing} missing, ${k.behind} behind, ${k.resynced} synced${k.failed ? `, ${k.failed} failed (${k.errors[0] ?? ""})` : ""}`).join("; "));
       }
     } catch (err) {
       console.warn("[zupersync] sweep failed:", errorText(err));
