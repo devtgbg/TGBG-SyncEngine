@@ -24,7 +24,8 @@ const fixture = JSON.parse(readFileSync(new URL("./fixtures/zuper-events.json", 
 /**
  * Exactly the events that remove something: the record itself, or one of its
  * notes. `estimate.delete` removes the quote; `estimate.delete_attachment` must
- * not, and `job.delete_recurrence` removes a rule, not the job.
+ * not, and `job.delete_recurrence` removes a rule, not the job. Notes on quotes,
+ * invoices and contracts are not kept, so their deletions are skipped.
  */
 const MUST_DELETE: Record<string, string> = {
   "job.delete": "jobs",
@@ -38,10 +39,15 @@ const MUST_DELETE: Record<string, string> = {
   "request.delete": "requests",
   "job.delete_note": "notes",
   "customer.delete_note": "notes",
-  "estimate.delete_note": "notes",
-  "invoice.delete_note": "notes",
-  "service_contract.delete_note": "notes",
   "asset.delete_note": "notes",
+};
+
+/** Note events Tuper keeps, and the record each note is on. */
+const NOTE_EVENTS: Record<string, string> = {
+  "job.new_note": "job", "job.update_note": "job", "job.delete_note": "job",
+  "customer.new_note": "customer", "customer.update_note": "customer", "customer.delete_note": "customer",
+  "asset.new_note": "asset", "asset.update_note": "asset", "asset.delete_note": "asset",
+  "request.new_note": "request",
 };
 
 const problems: string[] = [];
@@ -90,9 +96,17 @@ for (const [m, events] of Object.entries(fixture.modules)) {
     if (wantDelete && r.skip) problems.push(`${key}: a deletion is skipped (${r.skip})`);
     if (wantDelete && r.enrich) problems.push(`${key}: a deletion must not re-read the record it removed`);
     // Every job change must write the row itself: job_details alone never writes the schedule.
-    if (m === "JOB" && !r.skip && !r.deletion && (r.entity !== "jobs" || r.enrich !== "job_details")) {
+    if (m === "JOB" && !r.skip && !r.deletion && !r.noteHost && (r.entity !== "jobs" || r.enrich !== "job_details")) {
       problems.push(`${key}: a job change must run jobs then job_details, got ${r.entity}${r.enrich ? ` then ${r.enrich}` : ""}`);
     }
+
+    // A note event re-reads the notes of the record it names, by that record's uid.
+    const host = NOTE_EVENTS[key];
+    if (host && (r.noteHost !== host || r.entity !== "notes" || r.fetch !== "host" || r.uidFields.join() !== `${host}_uid` || r.skip)) {
+      problems.push(`${key}: expected a note sync on its ${host} (${host}_uid), got ${r.entity}/${r.fetch}/${r.noteHost ?? "-"}${r.skip ? ` skipped: ${r.skip}` : ""}`);
+    }
+    if (!host && r.noteHost) problems.push(`${key}: unexpectedly treated as a note event`);
+    if (/_note$/.test(key) && !host && !r.skip) problems.push(`${key}: a note event on a record Tuper keeps no notes for must be skipped`);
 
     // The same event named by module + display name (the simulator's form) must agree.
     if (!same(resolveRoute(m, name), r)) problems.push(`${m}/"${name}" routes differently from ${key}`);

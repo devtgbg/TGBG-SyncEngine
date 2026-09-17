@@ -36,7 +36,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { db } from "./supabase.js";
 import { config } from "./config.js";
 import { ENTITIES, getSyncConfig, zuperGet, type SyncConfig } from "./lib/migration/zuper-sync.js";
-import { detailPathFor, isSelfFetching, resolveRoute } from "./routes.js";
+import { detailPathFor, isSelfFetching, resolveRoute, type NoteHost } from "./routes.js";
 
 /** Structurally identical to zuper-sync.ts's Ctx, which is not exported. */
 type Ctx = {
@@ -262,6 +262,104 @@ export async function syncRecord(
   });
 }
 
+/** Where each note host's notes are listed, and how the host is mapped. */
+const NOTE_HOSTS: Record<NoteHost, { mapEntity: string }> = {
+  job: { mapEntity: "jobs" },
+  customer: { mapEntity: "customers" },
+  request: { mapEntity: "requests" },
+  asset: { mapEntity: "assets" },
+};
+
+export interface NoteSyncResult extends SyncOneResult {
+  notes: { listed: number; written: number; deleted: number };
+}
+
+/**
+ * Bring one record's notes in line with Zuper.
+ *
+ * Zuper has no read-by-uid for a note, but lists a record's notes, and every note
+ * event names the record. So: list them (pinned ones come back separately, in
+ * `pinned_notes`), write those that are new or changed since we last synced
+ * them, and — for a deletion — flag the note that went away. A delivery that
+ * carries the note's uid is flagged by it; otherwise a note we hold that Zuper no
+ * longer lists is the deleted one (the list omits deleted notes; verified
+ * against a job whose five imported notes matched Zuper's five exactly).
+ */
+export async function syncHostNotes(
+  host: NoteHost, hostUid: string, opts: { deletion?: boolean; noteUid?: string | null } = {},
+): Promise<NoteSyncResult> {
+  return oneAtATime(`notes:${hostUid}`, async () => {
+    const client = db();
+    const tenantId = config.tenantId;
+    const cfg = await getSyncConfig(client, tenantId);
+    if (!cfg.api_key) throw new Error("no Zuper API key configured");
+
+    const { data: hostRow, error: hostErr } = await client.schema("jms").from("zuper_sync_map")
+      .select("jms_id").eq("tenant_id", tenantId).eq("entity", NOTE_HOSTS[host].mapEntity).eq("zuper_uid", hostUid).maybeSingle();
+    if (hostErr) throw hostErr;
+    const hostId = (hostRow as { jms_id?: string } | null)?.jms_id;
+    // Replay retries this, by which time the record's own event has imported it.
+    if (!hostId) throw new Error(`${host} ${hostUid} is not imported yet`);
+
+    // Every page, pinned notes included. A partial list must never drive deletions,
+    // so any failure here throws before anything is flagged.
+    const listed = new Map<string, any>();
+    for (let page = 1; page <= 50; page++) {
+      const j = await zuperGet(cfg, `/api/notes?filter.${host}=${encodeURIComponent(hostUid)}&page=${page}&count=100`);
+      for (const n of [...(j?.data ?? []), ...(page === 1 ? j?.pinned_notes ?? [] : [])]) {
+        if (n?.note_uid) listed.set(String(n.note_uid), n);
+      }
+      const pages = Number(j?.total_pages ?? 1);
+      if (!Number.isFinite(pages) || page >= pages || !(j?.data ?? []).length) break;
+    }
+
+    // What we already hold for this record, and when each was last synced.
+    const uids = [...listed.keys()];
+    const synced = new Map<string, string>();
+    for (let i = 0; i < uids.length; i += 200) {
+      const { data, error } = await client.schema("jms").from("zuper_sync_map").select("zuper_uid, synced_at")
+        .eq("tenant_id", tenantId).eq("entity", "notes").in("zuper_uid", uids.slice(i, i + 200));
+      if (error) throw error;
+      for (const m of (data ?? []) as { zuper_uid: string; synced_at: string }[]) synced.set(m.zuper_uid, m.synced_at);
+    }
+
+    let written = 0;
+    for (const [uid, note] of listed) {
+      const last = synced.get(uid);
+      const changed = !last || (note.updated_at && new Date(note.updated_at).getTime() > new Date(last).getTime());
+      if (!changed && uid !== opts.noteUid) continue;
+      await syncOne("notes", uid, { raw: note, client, tenantId });
+      written++;
+    }
+
+    let deleted = 0;
+    if (opts.deletion) {
+      if (opts.noteUid && !listed.has(opts.noteUid)) {
+        if ((await markDeleted("notes", opts.noteUid)).action === "deleted") deleted++;
+      } else if (!opts.noteUid) {
+        const { data: held, error } = await client.schema("jms").from("entity_comments")
+          .select("id, zuper_uid").eq("tenant_id", tenantId).eq("entity_type", host).eq("entity_id", hostId)
+          .eq("is_deleted", false).not("zuper_uid", "is", null);
+        if (error) throw error;
+        const gone = ((held ?? []) as { id: string; zuper_uid: string }[]).filter((h) => !listed.has(h.zuper_uid));
+        for (const g of gone) {
+          const { error: upErr } = await client.schema("jms").from("entity_comments")
+            .update({ is_deleted: true, deleted_at: new Date().toISOString() })
+            .eq("id", g.id).eq("tenant_id", tenantId).eq("is_deleted", false);
+          if (upErr) throw upErr;
+          deleted++;
+        }
+      }
+    }
+
+    return {
+      entity: "notes", uid: hostUid, id: hostId,
+      action: deleted ? "deleted" : written ? "updated" : "skipped",
+      notes: { listed: listed.size, written, deleted },
+    };
+  });
+}
+
 /** Give a stub record the uid field its entity reads. */
 function stubUidFields(entityName: string, uid: string): Record<string, string> {
   const byEntity: Record<string, string> = {
@@ -351,12 +449,15 @@ export async function processEvent(delivery: Delivery): Promise<SyncOneResult | 
       return { action: "skipped", reason };
     }
 
-    const result: SyncOneResult = route.deletion
-      ? await oneAtATime(uid, () => markDeleted(route.entity, uid))
-      : await syncRecord(route.entity, uid, { enrich: route.enrich, detail: route.detail, selfFetching: route.fetch === "self" });
+    const result: SyncOneResult = route.noteHost
+      ? await syncHostNotes(route.noteHost, uid, { deletion: route.deletion, noteUid: findUid(delivery.body, "note_uid") })
+      : route.deletion
+        ? await oneAtATime(uid, () => markDeleted(route.entity, uid))
+        : await syncRecord(route.entity, uid, { enrich: route.enrich, detail: route.detail, selfFetching: route.fetch === "self" });
+    const noteInfo = "notes" in result ? ` (${JSON.stringify((result as NoteSyncResult).notes)})` : "";
 
     await finish({ processed_at: new Date().toISOString(), process_error: null, sync_entity: result.entity });
-    console.log(`[zupersync] ${route.module}/${delivery.event} → ${result.entity} ${result.action} ${result.id ?? ""}`.trim());
+    console.log(`[zupersync] ${route.module}/${delivery.event} → ${result.entity} ${result.action} ${result.id ?? ""}${noteInfo}`.trim());
     return result;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

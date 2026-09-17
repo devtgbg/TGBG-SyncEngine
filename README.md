@@ -39,7 +39,7 @@ documents no verification scheme for it, so the header is the usable mechanism.
 ### Routing
 
 `src/routes.ts` holds Zuper's whole event catalogue: **12 modules, 203 events** —
-93 synced (15 of them deletions), 110 stored with a reason and skipped.
+97 synced (12 of them deletions), 106 stored with a reason and skipped.
 
 The catalogue is Zuper's own, not transcribed from its UI. `GET
 /api/misc/{MODULE}/events` — the call Zuper's New Webhook form makes when a module
@@ -63,9 +63,17 @@ Things that break routing silently if assumed otherwise:
   the schedule, title, priority or addresses. Running it alone left 69 of 73
   rescheduled jobs on their old times while the log said "applied".
 
-Entities Zuper offers no by-uid read for (notes, timesheets, timelogs) are
-**refused, not stubbed**. Handing a bare uid to a transform written for a full
-record would write a near-empty payload over a live row.
+Entities Zuper offers no by-uid read for (timesheets, timelogs) are **refused,
+not stubbed**. Handing a bare uid to a transform written for a full record would
+write a near-empty payload over a live row.
+
+**Notes** have no by-uid read either, but every note event names the record the
+note is on, and `GET /api/notes?filter.<job|customer|request|asset>=uid` lists
+that record's notes (pinned ones separately, in `pinned_notes`). A note event
+re-reads that list and writes what is new or changed. The list omits deleted
+notes, so a deletion is flagged by `note_uid` when the delivery has one and by
+absence otherwise. Tuper keeps no notes on quotes, invoices or contracts, so
+those note events are skipped.
 
 ## Running it
 

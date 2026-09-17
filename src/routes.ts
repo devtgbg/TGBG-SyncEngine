@@ -45,7 +45,9 @@ export type FetchMode =
   /** The entity's own transform fetches what it needs; a uid stub is enough. */
   | "self"
   /** Zuper publishes no read-by-uid for this entity — see `reason`. */
-  | "unsupported";
+  | "unsupported"
+  /** Re-read every note on the record the note belongs to (GET /api/notes?filter.<host>=uid). */
+  | "host";
 
 /**
  * Where one record of each entity comes from.
@@ -69,7 +71,8 @@ const ENTITY_FETCH: Record<string, { mode: FetchMode; path?: (uid: string) => st
 
   // No read-by-uid exists. Changes are refused rather than guessed at; DELETIONS
   // still work for mapped records, because marking a row deleted needs no fetch.
-  notes: { mode: "unsupported", reason: "note sync is not built — Zuper has no GET by note_uid" },
+  // Zuper has no GET by note_uid, but lists a record's notes; the host's uid is in every note event.
+  notes: { mode: "host" },
   timesheets: { mode: "unsupported", reason: "Zuper has no GET by timesheet_uid, and /timesheets has no uid filter" },
 };
 
@@ -103,7 +106,12 @@ export interface Route {
   skip?: string;
   /** True when the event is not in Zuper's catalogue and the module default was used. */
   inferred: boolean;
+  /** For note events: the kind of record the note is on; the uid is that record's. */
+  noteHost?: NoteHost;
 }
+
+/** Records Tuper keeps notes on — the hosts the notes import understands. */
+export type NoteHost = "job" | "customer" | "request" | "asset";
 
 interface EventRule {
   /** Recorded as not synced, with this reason. */
@@ -113,6 +121,7 @@ interface EventRule {
   /** A different entity than the module's. */
   entity?: string;
   uidFields?: string[];
+  noteHost?: NoteHost;
 }
 
 interface ModuleSpec {
@@ -129,10 +138,13 @@ interface ModuleSpec {
 
 // Shared rules, so the same decision reads the same everywhere.
 const DELETE: EventRule = { deletion: true };
-const NOTE: EventRule = { skip: "note sync is not built — Zuper has no GET by note_uid" };
-// A deleted note needs no fetch: notes are mapped (38,712 at import), so the row
-// can be flagged by its note_uid.
-const NOTE_DELETE: EventRule = { entity: "notes", uidFields: ["note_uid"], deletion: true };
+// A note event names the record it is on. Its notes are re-read from Zuper, which
+// catches new and edited notes; a deleted note is flagged by note_uid when the
+// delivery carries one, otherwise by its absence from that list (Zuper's list
+// omits deleted notes).
+const NOTE = (host: NoteHost): EventRule => ({ entity: "notes", uidFields: [`${host}_uid`], noteHost: host });
+const NOTE_DELETE = (host: NoteHost): EventRule => ({ ...NOTE(host), deletion: true });
+const NO_NOTES: EventRule = { skip: "Tuper keeps no notes on quotes, invoices or contracts" };
 const ATTACHMENT: EventRule = { skip: "attachments are linked at import time, not re-synced" };
 const NO_STATE: (what: string) => EventRule = (what) => ({ skip: `${what} changes nothing on the record` });
 
@@ -158,9 +170,9 @@ const MODULES: Record<string, ModuleSpec> = {
       "job.status_rollback": ["Status Rollback"],
       "job.status_delete": ["Status Delete"],
       "job.feedback": ["Job Feedback"],
-      "job.new_note": ["New Note", NOTE],
-      "job.update_note": ["Update Note", NOTE],
-      "job.delete_note": ["Delete Note", NOTE_DELETE],
+      "job.new_note": ["New Note", NOTE("job")],
+      "job.update_note": ["Update Note", NOTE("job")],
+      "job.delete_note": ["Delete Note", NOTE_DELETE("job")],
       "job.delete": ["Delete Job", DELETE],
       "job.bulk_action": ["Job Bulk Action"],
       // Checklist answers ride on the status history both entities rebuild.
@@ -197,9 +209,9 @@ const MODULES: Record<string, ModuleSpec> = {
       "customer.activate": ["Customer Activate"],
       "customer.accounts_update": ["Customer Accounts Update"],
       "customer.update_technician": ["Favourite Technician Update"],
-      "customer.new_note": ["New Note", NOTE],
-      "customer.update_note": ["Update Note", NOTE],
-      "customer.delete_note": ["Delete Note", NOTE_DELETE],
+      "customer.new_note": ["New Note", NOTE("customer")],
+      "customer.update_note": ["Update Note", NOTE("customer")],
+      "customer.delete_note": ["Delete Note", NOTE_DELETE("customer")],
       "customer.add_card": ["New Customer Card", { skip: "payment cards are not synced" }],
       "customer.delete_card": ["Remove Customer Card", { skip: "payment cards are not synced" }],
       "customer.new_attachment": ["New Customer Attachment", ATTACHMENT],
@@ -328,10 +340,10 @@ const MODULES: Record<string, ModuleSpec> = {
       "estimate.deposit": ["Quote Deposit Payment"],
       "estimate.print": ["Print Quote", NO_STATE("printing")],
       "estimate.send": ["Send Quote"],
-      "estimate.new_note": ["Quote New Note", NOTE],
+      "estimate.new_note": ["Quote New Note", NO_NOTES],
       "estimate.new_attachment": ["Quote New Attachment", ATTACHMENT],
       "estimate.delete_attachment": ["Quote Delete Attachment", ATTACHMENT],
-      "estimate.delete_note": ["Quote Delete Note", NOTE_DELETE],
+      "estimate.delete_note": ["Quote Delete Note", NO_NOTES],
       "estimate.delete": ["Quote Delete", DELETE],
       "estimate.bulk_action": ["Quote Bulk Action"],
       // Undelete: re-reading restores is_deleted from Zuper.
@@ -350,10 +362,10 @@ const MODULES: Record<string, ModuleSpec> = {
       "invoice.payment": ["Invoice Payment"],
       "invoice.print": ["Print Invoice", NO_STATE("printing")],
       "invoice.send": ["Send Invoice"],
-      "invoice.new_note": ["Invoice New Note", NOTE],
+      "invoice.new_note": ["Invoice New Note", NO_NOTES],
       "invoice.new_attachment": ["Invoice Attachment", ATTACHMENT],
       "invoice.delete_attachment": ["Invoice Delete Attachment", ATTACHMENT],
-      "invoice.delete_note": ["Invoice Delete Note", NOTE_DELETE],
+      "invoice.delete_note": ["Invoice Delete Note", NO_NOTES],
       "invoice.delete": ["Invoice Delete", DELETE],
       "invoice.bulk_action": ["Invoice Bulk Action"],
       // Company-level payment settings, not an invoice.
@@ -363,7 +375,7 @@ const MODULES: Record<string, ModuleSpec> = {
       "invoice.payment_term_create": ["Invoice New Payment Term", { skip: "payment terms are company settings, not invoices" }],
       "invoice.payment_term_update": ["Invoice Update Payment Term", { skip: "payment terms are company settings, not invoices" }],
       "invoice.payment_term_delete": ["Invoice Delete Payment Term", { skip: "payment terms are company settings, not invoices" }],
-      "invoice.update_note": ["Invoice Update Note", NOTE],
+      "invoice.update_note": ["Invoice Update Note", NO_NOTES],
     },
   },
 
@@ -378,9 +390,9 @@ const MODULES: Record<string, ModuleSpec> = {
       "service_contract.delete": ["Service Contract Delete", DELETE],
       "service_contract.status_update": ["Service Contract Status Update"],
       "service_contract.renew": ["Service Contract Renewal"],
-      "service_contract.new_note": ["Service Contract New Note", NOTE],
-      "service_contract.delete_note": ["Service Contract Delete Note", NOTE_DELETE],
-      "service_contract.update_note": ["Service Contract Update Note", NOTE],
+      "service_contract.new_note": ["Service Contract New Note", NO_NOTES],
+      "service_contract.delete_note": ["Service Contract Delete Note", NO_NOTES],
+      "service_contract.update_note": ["Service Contract Update Note", NO_NOTES],
       "service_contract.bulk_action": ["Service Contract Bulk Action"],
       "service_contract.activate": ["Service Contract Activate"],
       "service_contract.deactivate": ["Service Contract Deactivate"],
@@ -405,9 +417,9 @@ const MODULES: Record<string, ModuleSpec> = {
       "asset.status_update": ["Asset Status Update"],
       "asset.history": ["Asset History"],
       "asset.recover": ["Asset Recover"],
-      "asset.new_note": ["Asset New Note", NOTE],
-      "asset.update_note": ["Asset Update Note", NOTE],
-      "asset.delete_note": ["Asset Delete Note", NOTE_DELETE],
+      "asset.new_note": ["Asset New Note", NOTE("asset")],
+      "asset.update_note": ["Asset Update Note", NOTE("asset")],
+      "asset.delete_note": ["Asset Delete Note", NOTE_DELETE("asset")],
       "inspection_form.submit": ["Inspection Form Submission", { skip: "filling inspections is not built" }],
       "inspection_form.update": ["Inspection Form Update", { skip: "filling inspections is not built" }],
     },
@@ -448,7 +460,7 @@ const MODULES: Record<string, ModuleSpec> = {
       "request.status_rollback": ["Status Rollback"],
       "request.assign_users": ["Assign Users"],
       "request.unassign_users": ["Unassign Users"],
-      "request.new_note": ["New Note", NOTE],
+      "request.new_note": ["New Note", NOTE("request")],
       "request.delete": ["Delete Request", DELETE],
     },
   },
@@ -510,6 +522,7 @@ function build(module: string, rule: EventRule | undefined, inferred: boolean): 
       // An override points at a different entity (notes), so the module's second
     // pass must not follow it. Nor does a deletion need one.
     enrich: rule?.entity || deletion ? undefined : spec.enrich,
+    noteHost: rule?.noteHost,
     uidFields: rule?.uidFields ?? spec.uidFields,
     fetch: fetchSpec.mode,
     detail: fetchSpec.mode === "detail" ? fetchSpec.path ?? null : null,
