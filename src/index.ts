@@ -16,6 +16,7 @@ import { config, secretConfigured } from "./config.js";
 import { tuperReachable } from "./tuper-client.js";
 import { migrate, storeReachable } from "./store.js";
 import { tuperReceiver } from "./receiver-tuper.js";
+import { admin } from "./admin.js";
 import { receiver } from "./receiver.js";
 import { startReplay } from "./reconcile.js";
 import { pushState, startPusher } from "./pusher.js";
@@ -82,6 +83,8 @@ app.get("/health", async (_req, res) => {
 app.use("/webhooks/zuper", receiver);
 // Changes made in Tuper arrive the same way Zuper's do, and are queued for Zuper (src/receiver-tuper.ts).
 app.use("/webhooks/tuper", tuperReceiver);
+// The service's own controls: re-run an entity, see what it is holding (src/admin.ts). Same secret as the receiver.
+app.use("/admin", admin);
 
 // The store is brought up to date before anything is served: nothing works without its log, queue and config.
 const booted = migrate()

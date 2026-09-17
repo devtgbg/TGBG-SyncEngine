@@ -121,7 +121,7 @@ async function* zuperListPages(cfg: SyncConfig, path: string, pageSize = 100): A
 }
 
 // ── Map + run helpers ──
-type Ctx = { client: SupabaseClient; tenantId: string; cfg: SyncConfig; maps: Record<string, Map<string, string>>; extra: Record<string, any> };
+export type Ctx = { client: SupabaseClient; tenantId: string; cfg: SyncConfig; maps: Record<string, Map<string, string>>; extra: Record<string, any> };
 async function loadMap(client: SupabaseClient, tenantId: string, entity: string): Promise<Map<string, string>> {
   const m = new Map<string, string>();
   for (let from = 0; ; from += 1000) {
@@ -962,8 +962,17 @@ export const ENTITIES: Record<string, Entity> = {
       const field = (label: string) => T((r.custom_fields ?? []).find((f: any) => f.label === label)?.value);
       return {
         name: T(r.asset_name) ?? "Asset", asset_code: T(r.asset_code), serial_number: T(r.asset_serial_number), model: field("Model"), manufacturer: field("Make"),
+        // Zuper's own description, status, quantity and location — Tuper had nowhere for these until 00108.
+        description: T(r.asset_description), plain_text_description: T(r.plain_text_description) ?? stripHtml(r.asset_description),
+        status: T(r.asset_status?.status_name ?? r.asset_status),
+        quantity: num0(r.asset_quantity) || 1,
+        asset_location: r.asset_location && typeof r.asset_location === "object" ? r.asset_location : null,
+        placed_in_service: dubaiDate(r.placed_in_service),
         purchase_date: dubaiDate(r.purchase_date), warranty_expiry: dubaiDate(r.warranty_expiry_date),
         category_id: await assetCategoryId(ctx, r.asset_category), customer_id: await customerId(ctx, r.customer),
+        organization_id: await organizationId(ctx, r.organization),
+        parent_asset_id: mapGet(await ctxMap(ctx, "assets"), r.parent_asset?.asset_uid),
+        created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
         is_active: r.is_active !== false, is_deleted: r.is_deleted === true, ...createdAt(r),
       };
     },
@@ -978,9 +987,15 @@ export const ENTITIES: Record<string, Entity> = {
       return {
         contract_number: [T(r.prefix), T(r.contract_number)].filter(Boolean).join("-") || String(r.contract_uid).slice(0, 8),
         name: T(r.contract_name) ?? "Contract",
+        // Zuper keeps the prefix, reference, term and sub-total apart from the number and the total (00108).
+        prefix: T(r.prefix), reference_no: T(r.ref_no), term_months: num0(r.term_months) || null,
+        sub_total: num0(r.contract_subtotal),
+        description: T(r.contract_description),
         customer_id: await customerId(ctx, r.customer), organization_id: await organizationId(ctx, r.organization),
         start_date: start, end_date: end && end >= start ? end : null,
         approval_status: T(r.approval_status), await_approval_by: mapGet(await ctxMap(ctx, "users"), r.await_approval_by?.user_uid),
+        assigned_to: mapGet(await ctxMap(ctx, "users"), r.assigned_to?.[0]?.user?.user_uid ?? r.assigned_to?.user_uid),
+        created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
         total: num0(r.contract_total),
         is_active: r.is_active !== false && r.is_expired !== true, is_deleted: r.is_deleted === true, ...createdAt(r),
       };
