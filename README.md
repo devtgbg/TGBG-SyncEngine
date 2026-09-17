@@ -111,11 +111,20 @@ real traffic.
 
 ## The dashboard
 
-`dashboard/` is a read-only Next.js view of the delivery log on `:3021`: what
-Zuper sent, whether it was accepted, whether it was applied, and if not, why.
+`dashboard/` is a read-only Next.js app on `:3021` with two pages:
 
-> **It authenticates nobody** and renders stored webhook bodies containing
-> customer data. Put auth in front of it before exposing it publicly.
+- **From Zuper** (`/`) — every delivery: accepted or refused, applied, not
+  synced (a deliberate skip) or failed, and why.
+- **To Zuper** (`/pushes`) — every change made in Tuper, the Zuper requests
+  planned for it, what is not pushed and why, and whether it was sent. While
+  `PUSH_MODE=dry-run`, this page is the review before going live.
+
+Every page is behind HTTP Basic sign-in (`DASHBOARD_USER`,
+`DASHBOARD_PASSWORD`); in production an unset pair answers 503 rather than
+showing customer data. Locally (`next dev`) it is open.
+
+`next build` fails on Windows at the standalone copy step (it needs symlink
+rights); the Docker build is unaffected.
 
 ## Deployment
 
