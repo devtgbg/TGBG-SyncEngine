@@ -30,12 +30,14 @@ FROM node:24-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
-# Production dependencies only (@supabase/supabase-js, express, dotenv).
+# Production dependencies only (express, dotenv, pg).
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY --from=build /app/dist ./dist
-# Carried so the SQL that defines this service's own tables ships with it.
+# Carried so the SQL that defines this service's own tables ships with it: store/ is this service's own
+# database (applied at boot), migrations/ is the older set that shaped Tuper's.
+COPY store ./store
 COPY migrations ./migrations
 
 # Coolify sets PORT; this is the fallback and what EXPOSE documents.

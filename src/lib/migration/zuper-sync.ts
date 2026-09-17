@@ -1932,14 +1932,14 @@ export async function syncEntity(ctx: Ctx, name: string): Promise<{ fetched: num
     await storeSql(
       `UPDATE sync.runs SET finished_at = now(), fetched = $2, upserted = $3, failed = $4, status = $5, detail = $6
         WHERE id = $1`,
-      [runId, fetched, upserted, failed, failed && !upserted ? "FAILED" : "OK", JSON.stringify(detail)],
+      [runId, fetched, upserted, failed, failed && !upserted ? "FAILED" : "OK", detail],
     );
   } catch (err) {
     detail = err instanceof Error ? err.message.slice(0, 200) : "sync error";
     await storeSql(
       `UPDATE sync.runs SET finished_at = now(), fetched = $2, upserted = $3, failed = $4, status = $5, detail = $6
         WHERE id = $1`,
-      [runId, fetched, upserted, failed, "FAILED", JSON.stringify(detail)],
+      [runId, fetched, upserted, failed, "FAILED", detail],
     );
     throw err;
   }

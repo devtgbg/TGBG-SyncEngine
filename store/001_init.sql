@@ -92,7 +92,8 @@ CREATE TABLE IF NOT EXISTS sync.runs (
     upserted    INTEGER NOT NULL DEFAULT 0,
     failed      INTEGER NOT NULL DEFAULT 0,
     status      TEXT,
-    detail      JSONB NOT NULL DEFAULT '{}'::jsonb
+    -- Free text, as it always was: what went wrong, or what was skipped and why.
+    detail      TEXT
 );
 CREATE INDEX IF NOT EXISTS runs_recent_idx ON sync.runs (tenant_id, started_at DESC);
 
