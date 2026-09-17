@@ -6,7 +6,9 @@
  * apply it, and if not, why not.
  */
 
-import { recentDeliveries, totals, type Delivery } from "@/lib/db";
+import { deliveriesPage, totals, type Delivery } from "@/lib/db";
+import { Ago } from "./live";
+import { Pager, Pinned, readPaging } from "./pager";
 
 export const dynamic = "force-dynamic";
 
@@ -37,17 +39,33 @@ const ago = (iso: string) => {
   return `${Math.floor(s / 86400)}d ago`;
 };
 
-export default async function Page({ searchParams }: { searchParams: Promise<{ filter?: string }> }) {
-  const { filter = "" } = await searchParams;
+/** Arrived in the last few seconds — highlighted once, so a row appearing live catches the eye. */
+const isFresh = (iso: string) => Date.now() - new Date(iso).getTime() < 15_000;
+
+export default async function Page({ searchParams }: { searchParams: Promise<{ filter?: string; page?: string; size?: string; upto?: string }> }) {
+  const sp = await searchParams;
+  const filter = sp.filter ?? "";
+  const paging = readPaging(sp);
 
   let rows: Delivery[] = [];
+  let matching = 0;
   let counts = { total: 0, refused: 0, processed: 0, skipped: 0, failed: 0, waiting: 0 };
   let error: string | null = null;
   try {
-    [rows, counts] = await Promise.all([recentDeliveries(100, filter), totals()]);
+    const [list, all] = await Promise.all([
+      deliveriesPage({ limit: paging.size, offset: paging.offset, upto: paging.upto, filter }),
+      totals(),
+    ]);
+    rows = list.rows; matching = list.total; counts = all;
   } catch (err) {
     error = err instanceof Error ? err.message : String(err);
   }
+
+  // Older pages are pinned to the newest row on show here; an older page keeps the pin it came with.
+  const pager = (
+    <Pager base="/" keep={{ filter }} paging={paging} total={matching} shown={rows.length}
+      anchor={paging.upto ?? (paging.page === 1 ? rows[0]?.received_at : undefined)} />
+  );
 
   return (
     <main>
@@ -75,23 +93,29 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ f
             ))}
           </nav>
 
+          <Pinned upto={paging.upto} base="/" keep={{ filter }} size={paging.size} />
+          {pager}
+
           {rows.length === 0 ? (
-            <p className="empty">No deliveries{filter ? " matching that filter" : " yet"}.</p>
+            <p className="empty">{paging.page > 1 ? "No rows on this page." : `No deliveries${filter ? " matching that filter" : " yet"}.`}</p>
           ) : (
             <div className="scroll">
               <table>
                 <thead>
-                  <tr><th>When</th><th>Module</th><th>Event</th><th>Record</th><th>Outcome</th><th className="num">Tries</th></tr>
+                  <tr><th>When</th><th>Module</th><th>Event</th><th>Record</th><th>By</th><th>Role</th><th>Staff ID</th><th>Outcome</th><th className="num">Tries</th></tr>
                 </thead>
                 <tbody>
                   {rows.map((d) => {
                     const o = outcome(d);
                     return (
-                      <tr key={d.id}>
-                        <td className="dim" title={d.received_at}>{ago(d.received_at)}</td>
+                      <tr key={d.id} className={isFresh(d.received_at) ? "fresh" : undefined}>
+                        <td className="dim" title={d.received_at}><Ago iso={d.received_at} initial={ago(d.received_at)} /></td>
                         <td>{d.module ?? "—"}</td>
                         <td className="mono">{d.event ?? "—"}</td>
                         <td className="mono dim">{d.work_order_number ?? d.zuper_uid?.slice(0, 8) ?? "—"}</td>
+                        <td><Pair top={personName(d)} under={d.by_email} /></td>
+                        <td><Pair top={d.by_role} under={d.by_designation} /></td>
+                        <td><Pair top={d.by_emp_code} under={d.by_uid} mono /></td>
                         <td><span className={`pill ${o.tone}`}>{o.label}</span></td>
                         <td className="num dim">{d.attempts}</td>
                       </tr>
@@ -101,9 +125,30 @@ export default async function Page({ searchParams }: { searchParams: Promise<{ f
               </table>
             </div>
           )}
+
+          {rows.length > 15 ? pager : null}
         </>
       )}
     </main>
+  );
+}
+
+const clean = (v: string | null) => v?.trim() || null;
+const personName = (d: Delivery) => [clean(d.by_first), clean(d.by_last)].filter(Boolean).join(" ") || null;
+
+/**
+ * Two short lines in one cell: who over their email, role over designation,
+ * employee code over Zuper user uid. All seven come from the delivery's
+ * `triggered_by`, the person whose action in Zuper fired it.
+ */
+function Pair({ top, under, mono }: { top: string | null; under: string | null; mono?: boolean }) {
+  const a = clean(top), b = clean(under);
+  if (!a && !b) return <span className="dim">—</span>;
+  return (
+    <span className="pair">
+      <span>{a ?? "—"}</span>
+      {b ? <span className={mono ? "note mono" : "note"}>{b}</span> : null}
+    </span>
   );
 }
 

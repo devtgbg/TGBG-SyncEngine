@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { LiveRefresh } from "./live";
 
 export const metadata: Metadata = {
   title: "Zupersync log",
@@ -14,6 +15,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <strong>Zupersync</strong>
           <a href="/">From Zuper</a>
           <a href="/pushes">To Zuper</a>
+          <LiveRefresh />
         </nav>
         {children}
       </body>

@@ -52,7 +52,7 @@ body {
 }
 
 main {
-  max-width: 1040px;
+  max-width: 1320px;
   margin: 0 auto;
   padding-block: 40px 64px;
   padding-left: 20px;
@@ -63,7 +63,7 @@ main {
 }
 
 nav.site {
-  max-width: 1040px; margin: 0 auto; padding: 14px 20px 0;
+  max-width: 1320px; margin: 0 auto; padding: 14px 20px 0;
   display: flex; flex-wrap: wrap; align-items: baseline; gap: 18px;
 }
 nav.site strong { font-size: 13px; letter-spacing: 0.02em; margin-right: 6px; }
@@ -138,4 +138,73 @@ tbody tr:hover { background: var(--muted-bg); }
 @media (max-width: 560px) {
   main { padding-block: 24px 40px; }
   .tile strong { font-size: 20px; }
+}
+
+/* ── Live updates ─────────────────────────────────────────────────────────── */
+
+/* The indicator sits at the far end of the nav. The word carries the state; the
+   dot's colour only repeats it. */
+nav.site .live {
+  margin-left: auto;
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 12px; color: var(--dim);
+}
+nav.site .live i {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--ok-ink);
+}
+nav.site .live.offline { color: var(--warn-ink); }
+nav.site .live.offline i { background: var(--warn-ink); }
+nav.site .live i.blip { animation: blip 1.2s ease-out; }
+
+@keyframes blip {
+  0% { box-shadow: 0 0 0 0 var(--ok-ink); }
+  100% { box-shadow: 0 0 0 9px transparent; }
+}
+
+/* A row that has just arrived is tinted, then settles. The element persists
+   across refreshes, so the animation runs once per row, not once per refresh. */
+tr.fresh td { animation: fresh 4s ease-out; }
+@keyframes fresh {
+  0%, 25% { background: var(--ok-bg); }
+  100% { background: transparent; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  nav.site .live i.blip, tr.fresh td { animation: none; }
+}
+
+/* Two values to a cell, one over the other: seven facts about a person in three
+   columns rather than seven. */
+.pair { display: inline-flex; flex-direction: column; line-height: 1.35; }
+.pair .note.mono { font-size: 11px; }
+
+/* ── Pages of rows ────────────────────────────────────────────────────────── */
+
+.pager {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px;
+  font-size: 13px; color: var(--dim);
+}
+.pager .range { font-variant-numeric: tabular-nums; }
+.pager .pages { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-left: auto; }
+.pager .sizes { display: inline-flex; align-items: center; gap: 4px; }
+.pager a, .pager b, .pager .off, .pager .gap {
+  min-width: 30px; padding: 4px 9px; border-radius: 6px; text-align: center;
+  border: 1px solid transparent; font-variant-numeric: tabular-nums;
+}
+.pager a { color: var(--ink); text-decoration: none; border-color: var(--line); background: var(--surface); }
+.pager a:hover { border-color: var(--accent); color: var(--accent); }
+/* --bg, not white: the dark theme's accent is a light blue, where white text would not read. */
+.pager b { font-weight: 600; color: var(--bg); background: var(--accent); border-color: var(--accent); }
+.pager .off { color: var(--dim); opacity: 0.5; }
+.pager .gap { min-width: 0; padding-inline: 2px; }
+
+.pinned {
+  margin: 0; padding: 8px 12px; border-radius: 8px;
+  background: var(--muted-bg); color: var(--muted-ink); font-size: 13px;
+}
+.pinned a { color: var(--accent); }
+
+@media (max-width: 560px) {
+  .pager .pages { margin-left: 0; width: 100%; }
 }

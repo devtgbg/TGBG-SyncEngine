@@ -132,10 +132,28 @@ real traffic.
 `dashboard/` is a read-only Next.js app on `:3021` with two pages:
 
 - **From Zuper** (`/`) — every delivery: accepted or refused, applied, not
-  synced (a deliberate skip) or failed, and why.
+  synced (a deliberate skip) or failed, and why. It also shows who made the change
+  in Zuper: name, email, role, designation, employee code and Zuper user uid, read
+  from the delivery's `triggered_by`. A change made through Zuper's API shows the
+  account that owns the API key.
 - **To Zuper** (`/pushes`) — every change made in Tuper, the Zuper requests
   planned for it, what is not pushed and why, and whether it was sent. While
   `PUSH_MODE=dry-run`, this page is the review before going live.
+
+Both pages stay current on their own. The open page asks `/api/pulse` every 3
+seconds for a fingerprint of the newest 100 rows (ids and state columns only, no
+bodies) and re-renders in place only when it changes, so the filter, the scroll
+position and any opened request body are kept. A row that has just arrived is
+tinted briefly. A background tab does not poll, and everything is re-read once a
+minute regardless, which catches a change to a row older than the newest 100.
+Rows come 50 to a page (25 or 100 on request), with the filter's own total. Page
+1 is the live head of the log. A link to an older page carries `upto`, the
+timestamp of the newest row when it was rendered, and the query ignores anything
+newer, so a delivery arriving while someone reads page 3 does not push every row
+down by one. The rows on a pinned page still show their current outcome.
+
+Polling rather than Supabase Realtime is deliberate: Realtime needs a key in the
+browser and row-level policies on tables that hold customer data.
 
 Every page is behind HTTP Basic sign-in (`DASHBOARD_USER`,
 `DASHBOARD_PASSWORD`); in production an unset pair answers 503 rather than

@@ -6,7 +6,8 @@
  * Nothing on this page sends anything.
  */
 
-import { pushTotals, recentPushes, type Push } from "@/lib/db";
+import { pushTotals, pushesPage, type Push } from "@/lib/db";
+import { Pager, Pinned, readPaging } from "../pager";
 
 export const dynamic = "force-dynamic";
 
@@ -94,17 +95,29 @@ function Requests({ p }: { p: Push }) {
   );
 }
 
-export default async function Pushes({ searchParams }: { searchParams: Promise<{ status?: string }> }) {
-  const { status = "" } = await searchParams;
+export default async function Pushes({ searchParams }: { searchParams: Promise<{ status?: string; page?: string; size?: string; upto?: string }> }) {
+  const sp = await searchParams;
+  const status = sp.status ?? "";
+  const paging = readPaging(sp);
   let rows: Push[] = [];
+  let matching = 0;
   let totals: Record<string, number> = {};
   let error: string | null = null;
   try {
-    [rows, totals] = await Promise.all([recentPushes(100, status || undefined), pushTotals()]);
+    const [list, all] = await Promise.all([
+      pushesPage({ limit: paging.size, offset: paging.offset, upto: paging.upto, status: status || undefined }),
+      pushTotals(),
+    ]);
+    rows = list.rows; matching = list.total; totals = all;
   } catch (err) {
     const e = err as { message?: string };
     error = e?.message ?? String(err);
   }
+
+  const pager = (
+    <Pager base="/pushes" keep={{ status }} paging={paging} total={matching} shown={rows.length}
+      anchor={paging.upto ?? (paging.page === 1 ? rows[0]?.queued_at : undefined)} />
+  );
 
   return (
     <main>
@@ -134,8 +147,11 @@ export default async function Pushes({ searchParams }: { searchParams: Promise<{
             ))}
           </nav>
 
+          <Pinned upto={paging.upto} base="/pushes" keep={{ status }} size={paging.size} />
+          {pager}
+
           {rows.length === 0 ? (
-            <p className="empty">No changes from Tuper{status ? " with that status" : " yet"}.</p>
+            <p className="empty">{paging.page > 1 ? "No rows on this page." : `No changes from Tuper${status ? " with that status" : " yet"}.`}</p>
           ) : (
             <div className="scroll">
               <table>
@@ -146,7 +162,7 @@ export default async function Pushes({ searchParams }: { searchParams: Promise<{
                   {rows.map((p) => {
                     const s = STATUS[p.status] ?? { label: p.status, tone: "muted" as const };
                     return (
-                      <tr key={p.id}>
+                      <tr key={p.id} className={Date.now() - new Date(p.queued_at).getTime() < 15_000 ? "fresh" : undefined}>
                         <td className="dim" title={p.queued_at}>{when(p.queued_at)}</td>
                         <td className="mono">{p.planned?.workOrder ?? "—"}</td>
                         <td className="wrap"><Changes p={p} /></td>
@@ -163,6 +179,8 @@ export default async function Pushes({ searchParams }: { searchParams: Promise<{
               </table>
             </div>
           )}
+
+          {rows.length > 15 ? pager : null}
         </>
       )}
     </main>
