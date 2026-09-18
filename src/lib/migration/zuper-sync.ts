@@ -600,6 +600,9 @@ async function writeJobHistory(ctx: Ctx, jobId: string, r: any, isNew: boolean):
     rows.push({
       tenant_id: ctx.tenantId, job_id: jobId, from_status_id: prev, to_status_id: to, status_color: hexColor(s.status_color),
       remarks: T(s.remarks), remarks_free_text: T(s.remarks_free_text), changed_by: mapGet(await ctxMap(ctx, "users"), by), ...createdAt(s),
+      // The customer's signature taken at this change (Zuper's link to the picture) and who signed. Job cards print it
+      // from the status: 13 of GBG's 19 read {{customer_signature}} inside "Completed".
+      signature_path: T(s.customer_signature), signer_name: T(s.customer_signature_name),
       ...(response ? { form_response_id: response } : {}),
     });
     prev = to;
