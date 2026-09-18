@@ -463,8 +463,11 @@ function stubUidFields(entityName: string, uid: string): Record<string, string> 
   return k ? { [k]: uid } : { uid };
 }
 
-/** Mark a record deleted rather than re-fetching what Zuper has already removed. */
-function markDeleted(entityName: string, uid: string): Promise<SyncOneResult> {
+/**
+ * Mark a record deleted rather than re-fetching what Zuper has already removed. Exported for `npm run compare`, which
+ * uses it for records Zuper no longer lists and answers 404 for — what a missed delete webhook would have done.
+ */
+export function markDeleted(entityName: string, uid: string): Promise<SyncOneResult> {
   return trackWrite({ entity: entityName, uid }, () => flagDeleted(entityName, uid));
 }
 

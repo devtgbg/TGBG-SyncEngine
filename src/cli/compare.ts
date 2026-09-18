@@ -6,6 +6,7 @@
  *   npm run compare -- --apply             # re-sync what is missing or behind, the way a webhook does
  *   npm run compare -- --apply --max 200   # at most 200 records this run
  *   npm run compare -- --out report.json   # the full lists, not just the counts
+ *   npm run compare -- --from report.json --kinds jobs --apply --deletions   # act on a saved report
  *
  * For each kind it reads Zuper's whole list (the importer's own endpoints) and every Tuper record mapped to a Zuper uid
  * (zuper_sync_map, through Tuper's API), and says:
@@ -16,18 +17,19 @@
  *   only in Tuper  held by Tuper, no longer listed by Zuper — split into flagged deleted, and still live
  *
  * --apply re-syncs the missing and the behind, one at a time, paced, and recorded as an admin re-sync (the dashboard's
- * To Tuper page shows each). "Only in Tuper" is only ever reported: Zuper's lists leave some records out (inactive
- * users, for one), so absence from a list is not proof of deletion, and nothing is flagged deleted on that alone.
+ * To Tuper page shows each). "Only in Tuper" is left alone unless --deletions is given too, and even then absence from a
+ * list is not taken as proof — Zuper's lists leave some records out (inactive users, for one). Zuper is asked for each
+ * record: a 404 flags it deleted in Tuper, as the missed delete webhook would have; a record it still has is re-synced.
  *
  * Read-only unless --apply. The sweep does the same for a window every 30 minutes; this does it for everything.
  */
 
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { config, errorText } from "../config.js";
 import { flush, withCause } from "../api-log.js";
 import { tuper as db } from "../tuper-client.js";
 import { getSyncConfig, zuperFilterPages, zuperGet, type SyncConfig } from "../lib/migration/zuper-sync.js";
-import { syncRecord } from "../processor.js";
+import { markDeleted, syncRecord } from "../processor.js";
 import { resolveRoute } from "../routes.js";
 
 const argv = process.argv.slice(2);
@@ -49,7 +51,7 @@ interface Kind {
 
 /** GET list paging, as the importer pages /api/organization, /api/customers and /api/user/all. */
 async function* getPages(cfg: SyncConfig, path: string): AsyncGenerator<any[]> {
-  let last = "";
+  let last = "", seen = 0;
   for (let page = 1; page <= 2000; page++) {
     const j = await zuperGet(cfg, `${path}${path.includes("?") ? "&" : "?"}page=${page}&count=100`);
     const rows: any[] = j?.data ?? [];
@@ -57,15 +59,41 @@ async function* getPages(cfg: SyncConfig, path: string): AsyncGenerator<any[]> {
     if (!rows.length || sig === last) return;   // Zuper repeats the last page past the end
     last = sig;
     yield rows;
+    // Some lists cap a page below `count` (users: 10), so a short page is not the end: the total is, or an empty or
+    // repeated page. The first run stopped users after one page of ten and called 42 of them "only in Tuper".
+    seen += rows.length;
     const total = Number(j?.total_records);
-    if (rows.length < 100) return;
-    if (Number.isFinite(total) && page * 100 >= total) return;
+    if (Number.isFinite(total) && total > 0 && seen >= total) return;
+  }
+}
+
+const DAY = 86_400_000;
+const isoSeconds = (t: number) => new Date(t).toISOString().replace(/\.\d{3}Z$/, "Z");
+
+/**
+ * Every job, a month of updated_at at a time, newest first. Deep in Zuper's whole job list its answers fail ("error
+ * while multiplanner was selecting best plan", 500) and are retried with backoff: a first run reached page 403 of ~470
+ * after four hours. By month every page is near the start of its list, where Zuper answers at once. The GET with a full
+ * ISO timestamp is the one the sweep uses (sweep.ts: the POST filter ignores its filter keys).
+ */
+async function* jobsByMonth(cfg: SyncConfig): AsyncGenerator<any[]> {
+  const start = Date.parse("2015-01-01T00:00:00Z");
+  for (let to = Date.now() + 60_000; to > start; to -= 30 * DAY) {
+    const q = `filter.updated_at_from=${encodeURIComponent(isoSeconds(to - 30 * DAY))}&filter.updated_at_to=${encodeURIComponent(isoSeconds(to))}`;
+    for (let page = 1; page <= 200; page++) {
+      const j = await zuperGet(cfg, `/api/jobs?page=${page}&count=100&${q}`);
+      const rows: any[] = j?.data ?? [];
+      if (rows.length) yield rows;
+      const pages = Number(j?.total_pages ?? 0);
+      if (rows.length < 100 || (Number.isFinite(pages) && pages > 0 && page >= pages)) break;
+    }
   }
 }
 
 const KINDS: Kind[] = [
-  { name: "jobs", table: "jobs", event: "job.update", uid: (r) => r.job_uid,
-    pages: (c) => zuperFilterPages(c, "/api/jobs/filter", 100, { sort: "ASC", sort_by: "created_at" }) },
+  { name: "jobs", table: "jobs", event: "job.update", uid: (r) => r.job_uid, pages: jobsByMonth,
+    // The importer refuses a job with neither ("no customer or organization"): nine such, from 2023-2025, on 2026-09-18.
+    excluded: (r) => !r.customer?.customer_uid && !r.organization?.organization_uid },
   { name: "customers", table: "customers", event: "customer.update", uid: (r) => r.customer_uid, pages: (c) => getPages(c, "/api/customers") },
   { name: "organizations", table: "organizations", event: "organization.update", uid: (r) => r.organization_uid, pages: (c) => getPages(c, "/api/organization") },
   { name: "users", table: "users", event: "user.update", uid: (r) => r.user_uid, pages: (c) => getPages(c, "/api/user/all"),
@@ -151,6 +179,7 @@ async function compare(cfg: SyncConfig, k: Kind, pace: () => Promise<void>): Pro
 
 async function main() {
   const apply = has("apply");
+  const deletions = apply && has("deletions");
   const max = Number(opt("max") ?? 1000);
   const wanted = opt("kinds")?.split(",").map((s) => s.trim());
   const kinds = wanted ? KINDS.filter((k) => wanted.includes(k.name)) : KINDS;
@@ -161,11 +190,16 @@ async function main() {
   const results: Result[] = [];
   const pad = (v: unknown, n: number) => String(v).padStart(n);
   console.log(`${"kind".padEnd(14)}${pad("in Zuper", 9)}${pad("in Tuper", 9)}${pad("missing", 9)}${pad("behind", 8)}${pad("only in Tuper", 15)}`);
+  // --from: act on a report written by an earlier --out, instead of reading both sides again.
+  const from = opt("from");
+  const saved: Result[] = from ? JSON.parse(readFileSync(from, "utf8")).results : [];
   for (const k of kinds) {
     const started = Date.now();
     let r: Result;
     try {
-      r = await compare(cfg, k, pace);
+      const prior = saved.find((x) => x.kind === k.name);
+      if (from && !prior) continue;
+      r = prior ?? await compare(cfg, k, pace);
     } catch (err) {
       r = { kind: k.name, inZuper: 0, excluded: 0, inTuper: 0, missing: [], behind: [], onlyInTuperDeleted: [], onlyInTuperLive: [], error: errorText(err) };
     }
@@ -180,32 +214,54 @@ async function main() {
   if (out) { writeFileSync(out, JSON.stringify({ at: new Date().toISOString(), results }, null, 2)); console.log(`\nfull lists: ${out}`); }
 
   const todo = results.flatMap((r) => [...r.missing, ...r.behind].map((uid) => ({ kind: r.kind, uid })));
+  const gone = deletions ? results.flatMap((r) => r.onlyInTuperLive.map((uid) => ({ kind: r.kind, uid }))) : [];
   if (!apply) {
-    console.log(`\nREAD-ONLY. ${todo.length} record(s) missing or behind; --apply re-syncs them (at most --max, default 1000).`);
+    const live = results.reduce((n, r) => n + r.onlyInTuperLive.length, 0);
+    console.log(`
+READ-ONLY. ${todo.length} record(s) missing or behind: --apply re-syncs them (at most --max, default 1000).`);
+    if (live) console.log(`${live} live in Tuper but not listed by Zuper: --apply --deletions asks Zuper for each, and flags deleted only those it answers 404 for.`);
     return;
   }
 
-  console.log(`\nRe-syncing ${Math.min(todo.length, max)} of ${todo.length} record(s)…`);
-  let ok = 0, failed = 0;
+  let written = 0, flagged = 0, stillThere = 0, failed = 0;
   const errors = new Map<string, number>();
+  const fail = (kind: string, err: unknown) => {
+    failed++;
+    const e = `${kind}: ${errorText(err).replace(/[0-9a-f]{8}-[0-9a-f-]{27}/g, "<uid>").slice(0, 120)}`;
+    errors.set(e, (errors.get(e) ?? 0) + 1);
+  };
   await withCause({ origin: "admin" }, async () => {
+    console.log(`
+Re-syncing ${Math.min(todo.length, max)} of ${todo.length} record(s) missing or behind…`);
     for (const item of todo.slice(0, max)) {
+      const route = resolveRoute("", KINDS.find((k) => k.name === item.kind)!.event);
+      await pace();
+      try { await syncRecord(item.kind, item.uid, { enrich: route?.enrich }); written++; } catch (err) { fail(item.kind, err); }
+      if ((written + failed) % 25 === 0) console.log(`  ${written + failed} done: ${written} written, ${failed} failed`);
+    }
+    if (!gone.length) return;
+    // Absent from Zuper's list is not proof on its own; Zuper's own answer for the record is. 404: what a missed delete
+    // webhook would have done, the record flagged deleted in Tuper. 200: Zuper has it after all, so it is re-synced.
+    console.log(`
+Asking Zuper about ${gone.length} record(s) live in Tuper but not in its list…`);
+    for (const item of gone) {
       const kind = KINDS.find((k) => k.name === item.kind)!;
       const route = resolveRoute("", kind.event);
+      const detail = route?.detail;
+      if (!detail) continue;
       await pace();
+      let status = 0;
+      try { await zuperGet(cfg, detail(item.uid)); status = 200; } catch (err) { status = Number(/→ (\d{3})/.exec(errorText(err))?.[1] ?? 0); }
       try {
-        await syncRecord(item.kind, item.uid, { enrich: route?.enrich });
-        ok++;
-      } catch (err) {
-        failed++;
-        const e = errorText(err).replace(/[0-9a-f]{8}-[0-9a-f-]{27}/g, "<uid>").slice(0, 120);
-        errors.set(`${item.kind}: ${e}`, (errors.get(`${item.kind}: ${e}`) ?? 0) + 1);
-      }
-      if ((ok + failed) % 25 === 0) console.log(`  ${ok + failed} done: ${ok} written, ${failed} failed`);
+        if (status === 404) { if ((await markDeleted(item.kind, item.uid)).action === "deleted") flagged++; }
+        else if (status === 200) { await syncRecord(item.kind, item.uid, { enrich: route?.enrich }); stillThere++; }
+        else throw new Error(`Zuper answered ${status || "nothing"} — left as it is`);
+      } catch (err) { fail(item.kind, err); }
     }
   });
   await flush();
-  console.log(`\n${ok} written, ${failed} failed.`);
+  console.log(`
+${written} re-synced, ${flagged} flagged deleted (Zuper 404), ${stillThere} still in Zuper and re-synced, ${failed} failed.`);
   for (const [e, n] of errors) console.log(`  ${n}× ${e}`);
   if (failed) process.exitCode = 1;
 }
