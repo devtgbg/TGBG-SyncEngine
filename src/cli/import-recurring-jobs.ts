@@ -25,6 +25,9 @@ async function zuper(path: string): Promise<any> {
         headers: { "x-api-key": config.zuper.apiKey, "content-type": "application/json" },
         signal: AbortSignal.timeout(90_000),
       });
+      // A job Zuper no longer has is not a reason to end the run: it is one of the records the first import counted
+      // as gone, and the pass simply has nothing to link for it.
+      if (res.status === 404) return null;
       if (!res.ok) throw new Error(String(res.status));
       return await res.json();
     } catch (e) {
@@ -58,39 +61,69 @@ const minutes = (v: unknown) => (Number.isFinite(Number(v)) ? Math.round(Number(
 // Zuper says so on the job itself (recurring_job.recurring_job_uid), not on the repeat and not in the job list, so it
 // has to be asked job by job. Only a job Zuper marked as recurring can have come from one, which is 9,856 of GBG's
 // 46,000 rather than all of them.
+//
+// It walks every unlinked job once, newest first, by a created_at cursor. An earlier version took "the newest 1,000
+// unlinked" each run; a job it couldn't link stayed unlinked, so once those 1,000 were all unlinkable every run read
+// the same 1,000 again and never reached the rest.
 if (process.argv.includes("--link")) {
-  const { data: jobRows, error: jErr } = await client.schema("jms").from("jobs")
-    .select("id").eq("tenant_id", tenantId).is("deleted_at", null).eq("is_recurring", true).is("recurring_job_id", null)
-    .order("created_at", { ascending: false }).limit(1000);
-  if (jErr) throw jErr;
-  const jobs = ((jobRows ?? []) as any[]).map((r) => r.id as string);
-  console.log(`${jobs.length} recurring jobs with no repeat yet${apply ? "" : " (dry run)"}`);
+  const PAGE = 500;
+  let cursor: string | null = null;
+  let seen = 0, linked = 0, none = 0, unmapped = 0, gone = 0;
+  // A repeat Zuper names that Tuper never imported — told apart from a job Tuper can't find in Zuper at all, because
+  // the two need different fixes (import the repeat; or accept the job has no Zuper record).
+  const missingRepeats = new Map<string, number>();
 
-  const jobUid = new Map<string, string>();
-  for (let i = 0; i < jobs.length; i += 60) {
-    const { data: m } = await client.schema("jms").from("zuper_sync_map")
-      .select("zuper_uid, jms_id").eq("tenant_id", tenantId).eq("entity", "jobs").in("jms_id", jobs.slice(i, i + 60));
-    for (const r of (m ?? []) as any[]) jobUid.set(r.jms_id, r.zuper_uid);
-  }
+  for (;;) {
+    let q = client.schema("jms").from("jobs")
+      .select("id, created_at").eq("tenant_id", tenantId).is("deleted_at", null).eq("is_recurring", true).is("recurring_job_id", null)
+      .order("created_at", { ascending: false }).limit(PAGE);
+    if (cursor) q = q.lt("created_at", cursor);
+    const { data: jobRows, error: jErr } = await q;
+    if (jErr) throw jErr;
+    const rows = (jobRows ?? []) as any[];
+    if (!rows.length) break;
+    cursor = rows[rows.length - 1].created_at as string;
+    const jobs = rows.map((r) => r.id as string);
+    seen += jobs.length;
 
-  let linked = 0, none = 0, unknown = 0;
-  for (const jobId of jobs) {
-    const uid = jobUid.get(jobId);
-    if (!uid) { unknown++; continue; }
-    const job = (await zuper(`/api/jobs/${uid}`))?.data;
-    const repeatUid = job?.recurring_job?.recurring_job_uid;
-    if (!repeatUid) { none++; continue; }
-    const repeatId = mine.get(repeatUid);
-    if (!repeatId) { unknown++; continue; }
-    if (apply) {
-      const { error } = await client.schema("jms").from("jobs")
-        .update({ recurring_job_id: repeatId }).eq("id", jobId).eq("tenant_id", tenantId);
-      if (error) throw error;
+    const jobUid = new Map<string, string>();
+    for (let i = 0; i < jobs.length; i += 60) {
+      const { data: m } = await client.schema("jms").from("zuper_sync_map")
+        .select("zuper_uid, jms_id").eq("tenant_id", tenantId).eq("entity", "jobs").in("jms_id", jobs.slice(i, i + 60));
+      for (const r of (m ?? []) as any[]) jobUid.set(r.jms_id, r.zuper_uid);
     }
-    linked++;
-    if (linked % 50 === 0) console.log(`  ${linked} linked so far`);
+
+    for (const jobId of jobs) {
+      const uid = jobUid.get(jobId);
+      if (!uid) { unmapped++; continue; }
+      const res = await zuper(`/api/jobs/${uid}`);
+      if (!res) { gone++; continue; }
+      const repeatUid = res.data?.recurring_job?.recurring_job_uid;
+      if (!repeatUid) { none++; continue; }
+      const repeatId = mine.get(repeatUid);
+      if (!repeatId) { missingRepeats.set(repeatUid, (missingRepeats.get(repeatUid) ?? 0) + 1); continue; }
+      if (apply) {
+        const { error } = await client.schema("jms").from("jobs")
+          .update({ recurring_job_id: repeatId }).eq("id", jobId).eq("tenant_id", tenantId);
+        if (error) throw error;
+      }
+      linked++;
+    }
+    const waiting = Array.from(missingRepeats.values()).reduce((a, b) => a + b, 0);
+    console.log(`  ${seen} read: ${linked} linked, ${none} not from a repeat, ${waiting} waiting on a repeat Tuper lacks, ${unmapped} with no Zuper record, ${gone} Zuper no longer has`);
   }
-  console.log(`\n${linked} jobs pointed at their repeat, ${none} turned out not to come from one, ${unknown} unmatched`);
+
+  const waiting = Array.from(missingRepeats.values()).reduce((a, b) => a + b, 0);
+  console.log(`\n${seen} unlinked recurring jobs read${apply ? "" : " (dry run)"}`);
+  console.log(`  ${linked} pointed at their repeat`);
+  console.log(`  ${none} turned out not to come from one`);
+  console.log(`  ${waiting} come from ${missingRepeats.size} repeats Tuper hasn't imported`);
+  console.log(`  ${unmapped} have no Zuper record in the sync map`);
+  console.log(`  ${gone} Zuper no longer has`);
+  if (missingRepeats.size) {
+    const top = Array.from(missingRepeats.entries()).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    console.log(`  the repeats with the most jobs waiting: ${top.map(([u, n]) => `${u} (${n})`).join(", ")}`);
+  }
   process.exit(0);
 }
 
