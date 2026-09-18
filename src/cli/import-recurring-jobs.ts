@@ -2,6 +2,7 @@
  * Import Zuper's recurring jobs — the repeats themselves, not the jobs they make.
  *
  *   npx tsx src/cli/import-recurring-jobs.ts [--apply] [--limit 100]
+ *   npx tsx src/cli/import-recurring-jobs.ts --link [--apply]     # point each job at the repeat it came from
  *
  * Tuper kept a repeat as a flag on the first job, so its Recurring Jobs page listed every job that came from one.
  * Zuper lists the repeats: GET /api/recurring_jobs, 1,312 of them, each with its rule, how long it runs, how many
@@ -52,6 +53,46 @@ const [categories, customers, organizations, users, mine] = await Promise.all([
 
 const address = (a: any) => (a && typeof a === "object" && Object.keys(a).length ? a : null);
 const minutes = (v: unknown) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : null);
+
+// ── --link: which repeat each job came from ──
+// Zuper says so on the job itself (recurring_job.recurring_job_uid), not on the repeat and not in the job list, so it
+// has to be asked job by job. Only a job Zuper marked as recurring can have come from one, which is 9,856 of GBG's
+// 46,000 rather than all of them.
+if (process.argv.includes("--link")) {
+  const { data: jobRows, error: jErr } = await client.schema("jms").from("jobs")
+    .select("id").eq("tenant_id", tenantId).is("deleted_at", null).eq("is_recurring", true).is("recurring_job_id", null)
+    .order("created_at", { ascending: false }).limit(1000);
+  if (jErr) throw jErr;
+  const jobs = ((jobRows ?? []) as any[]).map((r) => r.id as string);
+  console.log(`${jobs.length} recurring jobs with no repeat yet${apply ? "" : " (dry run)"}`);
+
+  const jobUid = new Map<string, string>();
+  for (let i = 0; i < jobs.length; i += 60) {
+    const { data: m } = await client.schema("jms").from("zuper_sync_map")
+      .select("zuper_uid, jms_id").eq("tenant_id", tenantId).eq("entity", "jobs").in("jms_id", jobs.slice(i, i + 60));
+    for (const r of (m ?? []) as any[]) jobUid.set(r.jms_id, r.zuper_uid);
+  }
+
+  let linked = 0, none = 0, unknown = 0;
+  for (const jobId of jobs) {
+    const uid = jobUid.get(jobId);
+    if (!uid) { unknown++; continue; }
+    const job = (await zuper(`/api/jobs/${uid}`))?.data;
+    const repeatUid = job?.recurring_job?.recurring_job_uid;
+    if (!repeatUid) { none++; continue; }
+    const repeatId = mine.get(repeatUid);
+    if (!repeatId) { unknown++; continue; }
+    if (apply) {
+      const { error } = await client.schema("jms").from("jobs")
+        .update({ recurring_job_id: repeatId }).eq("id", jobId).eq("tenant_id", tenantId);
+      if (error) throw error;
+    }
+    linked++;
+    if (linked % 50 === 0) console.log(`  ${linked} linked so far`);
+  }
+  console.log(`\n${linked} jobs pointed at their repeat, ${none} turned out not to come from one, ${unknown} unmatched`);
+  process.exit(0);
+}
 
 let read = 0, written = 0, skipped = 0;
 for (let page = 1; ; page++) {
