@@ -42,10 +42,17 @@ if (error) throw error;
 const jobs = (rows ?? []) as { id: string; title: string }[];
 console.log(`${jobs.length} jobs to look at${apply ? "" : " (dry run — pass --apply to write)"}`);
 
-const { data: mapRows } = await client.schema("jms").from("zuper_sync_map")
-  .select("zuper_uid, jms_id").eq("tenant_id", tenantId).eq("entity", "jobs")
-  .in("jms_id", jobs.map((j) => j.id));
-const uidOf = new Map<string, string>(((mapRows ?? []) as any[]).map((r) => [r.jms_id, r.zuper_uid]));
+// The map, 60 ids at a time: a single `in` of a thousand ids makes a URL the server won't take, and the rows come
+// back empty — which read as "nothing to take" for every job rather than as the failure it was.
+const uidOf = new Map<string, string>();
+for (let i = 0; i < jobs.length; i += 60) {
+  const part = jobs.slice(i, i + 60).map((j) => j.id);
+  const { data: mapRows, error: mErr } = await client.schema("jms").from("zuper_sync_map")
+    .select("zuper_uid, jms_id").eq("tenant_id", tenantId).eq("entity", "jobs").in("jms_id", part);
+  if (mErr) throw mErr;
+  for (const r of (mapRows ?? []) as any[]) uidOf.set(r.jms_id, r.zuper_uid);
+}
+if (!uidOf.size) throw new Error("no job is mapped to a Zuper uid — refusing to report every job as having nothing to take");
 
 let filled = 0, plain = 0, missing = 0;
 for (const j of jobs) {
