@@ -37,6 +37,7 @@ import { tuper as db } from "./tuper-client.js";
 import { one, sql } from "./store.js";
 import { config, errorText } from "./config.js";
 import { withCause } from "./api-log.js";
+import { noteRecord, trackWrite } from "./tuper-writes.js";
 import { ENTITIES, getSyncConfig, zuperGet, type SyncConfig } from "./lib/migration/zuper-sync.js";
 import { detailPathFor, isSelfFetching, resolveRoute, type NoteHost, type Route } from "./routes.js";
 
@@ -137,21 +138,26 @@ export interface SyncOneResult {
   id: string | null;
 }
 
+type SyncOneOpts = {
+  raw?: any; detail?: ((uid: string) => string) | null; selfFetching?: boolean; client?: SupabaseClient; tenantId?: string;
+  /** For a self-fetching entity: the full record, so the maps are seeded from it rather than from a uid stub. */
+  seed?: any;
+};
+
 /**
  * Sync exactly one record.
  *
  * `raw` is the record as Zuper returns it. Pass it when you already have it;
  * otherwise give a `detail` path and it is fetched.
+ *
+ * Recorded in sync.tuper_writes (src/tuper-writes.ts) when it is the whole of a write — a customer or a note the sweep
+ * found behind. Inside a larger one (a job's passes, a note host, a list pass) it counts towards that instead.
  */
-export async function syncOne(
-  entityName: string,
-  uid: string,
-  opts: {
-    raw?: any; detail?: ((uid: string) => string) | null; selfFetching?: boolean; client?: SupabaseClient; tenantId?: string;
-    /** For a self-fetching entity: the full record, so the maps are seeded from it rather than from a uid stub. */
-    seed?: any;
-  } = {},
-): Promise<SyncOneResult> {
+export function syncOne(entityName: string, uid: string, opts: SyncOneOpts = {}): Promise<SyncOneResult> {
+  return trackWrite({ entity: entityName, uid }, () => writeOne(entityName, uid, opts));
+}
+
+async function writeOne(entityName: string, uid: string, opts: SyncOneOpts): Promise<SyncOneResult> {
   const e = ENTITIES[entityName];
   if (!e) throw new Error(`unknown entity ${entityName}`);
 
@@ -182,6 +188,8 @@ export async function syncOne(
   // Ensure the uid is present however the entity reads it.
   const uidKey = Object.keys(r).find((k) => k.endsWith("_uid") && r[k] === uid);
   if (!uidKey) r = { ...r, ...stubUidFields(entityName, uid) };
+  // Named now, so a write that fails further on still says which record it was.
+  noteRecord(entityName, opts.seed ?? r);
 
   // A self-fetching entity only has a uid stub here; the record it will fetch
   // names other ids (parent job, assets, statuses), so seed from the full record
@@ -256,6 +264,7 @@ export async function syncOne(
     await write();
   }
 
+  noteRecord(entityName, r, id);
   if ((e as any).afterWrite) await (e as any).afterWrite(ctx, id!, r, isNew);
   return { entity: entityName, uid: rowUid, action: isNew ? "created" : "updated", id };
 }
@@ -314,22 +323,30 @@ export async function syncRecord(
   return oneAtATime(uid, async () => {
     // Never let a push problem stop the inbound sync: Zuper stays the system of record.
     if (beforeInbound) await beforeInbound(entity, uid).catch((err) => console.warn(`[zupersync] push before inbound sync failed for ${entity} ${uid}: ${errorText(err)}`));
-    const selfFetching = opts.selfFetching ?? isSelfFetching(entity);
-    const detail = opts.detail ?? detailPathFor(entity);
-    // Read the record once: the first pass writes from it, and the second pass
-    // (which fetches for itself) seeds its id maps from it.
-    let raw: any;
-    if (detail && !selfFetching) {
-      const cfg = await getSyncConfig(db(), config.tenantId);
-      raw = (await zuperGet(cfg, detail(uid)))?.data ?? null;
-      if (!raw) throw new Error(`Zuper returned no record for ${entity} ${uid}`);
-    }
-    const result = await syncOne(entity, uid, raw ? { raw } : { detail, selfFetching });
-    for (const next of opts.enrich ?? []) {
-      await syncOne(next, uid, { detail: detailPathFor(next), selfFetching: isSelfFetching(next), seed: raw });
-    }
-    return result;
+    // One row in sync.tuper_writes for the record and all its passes.
+    return trackWrite({ entity, uid }, () => readAndWrite(entity, uid, opts));
   });
+}
+
+async function readAndWrite(
+  entity: string, uid: string, opts: { enrich?: string[]; detail?: ((uid: string) => string) | null; selfFetching?: boolean },
+): Promise<SyncOneResult> {
+  const selfFetching = opts.selfFetching ?? isSelfFetching(entity);
+  const detail = opts.detail ?? detailPathFor(entity);
+  // Read the record once: the first pass writes from it, and the second pass
+  // (which fetches for itself) seeds its id maps from it.
+  let raw: any;
+  if (detail && !selfFetching) {
+    const cfg = await getSyncConfig(db(), config.tenantId);
+    raw = (await zuperGet(cfg, detail(uid)))?.data ?? null;
+    if (!raw) throw new Error(`Zuper returned no record for ${entity} ${uid}`);
+    noteRecord(entity, raw);
+  }
+  const result = await syncOne(entity, uid, raw ? { raw } : { detail, selfFetching });
+  for (const next of opts.enrich ?? []) {
+    await syncOne(next, uid, { detail: detailPathFor(next), selfFetching: isSelfFetching(next), seed: raw });
+  }
+  return result;
 }
 
 /** Where each note host's notes are listed, and how the host is mapped. */
@@ -358,7 +375,8 @@ export interface NoteSyncResult extends SyncOneResult {
 export async function syncHostNotes(
   host: NoteHost, hostUid: string, opts: { deletion?: boolean; noteUid?: string | null } = {},
 ): Promise<NoteSyncResult> {
-  return oneAtATime(`notes:${hostUid}`, async () => {
+  // One row in sync.tuper_writes for the host's notes, however many were written.
+  return oneAtATime(`notes:${hostUid}`, () => trackWrite({ entity: "notes", uid: hostUid, label: `notes on a ${host}` }, async (): Promise<NoteSyncResult> => {
     const client = db();
     const tenantId = config.tenantId;
     const cfg = await getSyncConfig(client, tenantId);
@@ -427,7 +445,10 @@ export async function syncHostNotes(
       action: deleted ? "deleted" : written ? "updated" : "skipped",
       notes: { listed: listed.size, written, deleted },
     };
-  });
+  }, (r) => ({
+    action: r.action, id: r.id,
+    detail: `${r.notes.listed} listed in Zuper, ${r.notes.written} written, ${r.notes.deleted} deleted`,
+  })));
 }
 
 /** Give a stub record the uid field its entity reads. */
@@ -443,7 +464,11 @@ function stubUidFields(entityName: string, uid: string): Record<string, string> 
 }
 
 /** Mark a record deleted rather than re-fetching what Zuper has already removed. */
-async function markDeleted(entityName: string, uid: string): Promise<SyncOneResult> {
+function markDeleted(entityName: string, uid: string): Promise<SyncOneResult> {
+  return trackWrite({ entity: entityName, uid }, () => flagDeleted(entityName, uid));
+}
+
+async function flagDeleted(entityName: string, uid: string): Promise<SyncOneResult> {
   const e = ENTITIES[entityName];
   const client = db();
   const tenantId = config.tenantId;

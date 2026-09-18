@@ -16,6 +16,7 @@ import { config, errorText, secretConfigured } from "./config.js";
 import { one, sql } from "./store.js";
 import { tuper } from "./tuper-client.js";
 import { withCause } from "./api-log.js";
+import { trackWrite } from "./tuper-writes.js";
 import { ENTITIES, getSyncConfig, syncEntity, type Ctx } from "./lib/migration/zuper-sync.js";
 
 export const admin = Router();
@@ -70,7 +71,13 @@ admin.post("/sync/:entity", async (req: Request, res: Response) => {
     const cfg = await getSyncConfig(client as never, config.tenantId);
     if (!cfg.api_key) throw new Error("no Zuper API key configured");
     const ctx: Ctx = { client: client as never, tenantId: config.tenantId, cfg, maps: {}, extra: {} };
-    const result = await withCause({ origin: "admin" }, () => syncEntity(ctx, name));
+    // The whole re-run is one row in sync.tuper_writes, with every call it made.
+    const result = await withCause({ origin: "admin" }, () => trackWrite({ entity: name, label: `every ${name} record` },
+      () => syncEntity(ctx, name),
+      (r) => ({
+        action: "re-synced", detail: `${r.fetched} read from Zuper, ${r.upserted} written, ${r.failed} failed`,
+        ok: !r.failed, error: r.failed ? `${r.failed} record(s) failed` : null,
+      })));
     console.log(`[zupersync] admin sync ${name}: ${result.fetched} fetched, ${result.upserted} upserted, ${result.failed} failed`);
   } catch (err) {
     console.error(`[zupersync] admin sync ${name} failed:`, errorText(err));

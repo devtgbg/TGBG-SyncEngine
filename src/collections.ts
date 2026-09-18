@@ -26,6 +26,7 @@ import { config, errorText } from "./config.js";
 import { tuper as db } from "./tuper-client.js";
 import { getSyncConfig, zuperFilterPages, zuperGet } from "./lib/migration/zuper-sync.js";
 import { syncOne } from "./processor.js";
+import { trackWrite } from "./tuper-writes.js";
 import type { Collection } from "./routes.js";
 
 export type { Collection };
@@ -132,8 +133,16 @@ function coalesce(key: string, run: () => Promise<CollectionResult>): Promise<Co
 export function syncCollection(name: Collection, opts: { days?: number } = {}): Promise<CollectionResult> {
   const days = Math.max(1, opts.days ?? 3);
   switch (name) {
-    case "timesheets": return coalesce(`timesheets:${days}`, () => timesheets(days));
-    case "timeoff_requests": return coalesce(name, timeoffRequests);
-    case "timeoff_types": return coalesce(name, timeoffTypes);
+    case "timesheets": return coalesce(`timesheets:${days}`, tracked(name, `punches, last ${days} days`, () => timesheets(days)));
+    case "timeoff_requests": return coalesce(name, tracked(name, "time off requests", timeoffRequests));
+    case "timeoff_types": return coalesce(name, tracked(name, "time off types", timeoffTypes));
   }
 }
+
+/** A pass is one row in sync.tuper_writes, however many records it rewrote; a burst sharing it is one pass. */
+const tracked = (entity: Collection, label: string, run: () => Promise<CollectionResult>) => () =>
+  trackWrite({ entity, label }, run, (r) => ({
+    action: r.written ? "updated" : "unchanged",
+    detail: `${r.written} written of ${r.listed} listed${r.failed ? `, ${r.failed} failed` : ""}`,
+    ok: !r.failed, error: r.failed ? r.errors[0] ?? null : null,
+  }));

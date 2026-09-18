@@ -214,6 +214,8 @@ export const config = {
     days: Math.max(1, Number(optional("API_LOG_DAYS", "7"))),
     bodyHours: Math.max(1, Number(optional("API_LOG_BODY_HOURS", "48"))),
     bodyMax: Math.max(1_000, Number(optional("API_LOG_BODY_MAX", "64000"))),
+    /** sync.tuper_writes: one small row per record written to Tuper, so kept longer than the calls. */
+    writesDays: Math.max(1, Number(optional("TUPER_WRITES_DAYS", "30"))),
   },
 } as const;
 
