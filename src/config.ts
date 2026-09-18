@@ -203,6 +203,18 @@ export const config = {
     fullEveryMinutes: Math.max(30, Number(optional("SWEEP_FULL_EVERY_MINUTES", "180"))),
     perMinute: Math.min(120, Math.max(1, Number(optional("SWEEP_REQUESTS_PER_MINUTE", "45")))),
   },
+
+  /**
+   * The record of every call made to Zuper's API and Tuper's (src/api-log.ts, sync.api_calls), which the dashboard
+   * shows beside the webhooks. Bodies are the bulk of it, so they are cut at bodyMax characters and dropped after
+   * bodyHours; the rows themselves go after days.
+   */
+  apiLog: {
+    enabled: optional("API_LOG", "on") !== "off",
+    days: Math.max(1, Number(optional("API_LOG_DAYS", "7"))),
+    bodyHours: Math.max(1, Number(optional("API_LOG_BODY_HOURS", "48"))),
+    bodyMax: Math.max(1_000, Number(optional("API_LOG_BODY_MAX", "64000"))),
+  },
 } as const;
 
 /** True once an inbound secret is configured; until then deliveries are captured but not trusted. */

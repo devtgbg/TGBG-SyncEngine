@@ -59,6 +59,7 @@
  */
 
 import { config, errorText } from "./config.js";
+import { withCause } from "./api-log.js";
 import { tuper as db } from "./tuper-client.js";
 import { getSyncConfig, zuperGet } from "./lib/migration/zuper-sync.js";
 import { syncRecord } from "./processor.js";
@@ -202,24 +203,28 @@ export function startSweep(): void {
     return;
   }
   const everyMs = config.sweep.everyMinutes * 60_000;
+  const pass = async () => {
+    const r = await sweepJobs();
+    if (r.drifted || r.unmapped || r.failed) {
+      console.log(`[zupersync] sweep: ${r.inWindow} in window, ${r.drifted} drifted, ${r.unmapped} unmapped, ${r.resynced} resynced, ${r.failed} failed${r.stoppedEarly ? " (capped)" : ""}`);
+    }
+    // The first pass after a start is a full one, then every fullEveryMinutes.
+    const full = Date.now() - lastFull >= config.sweep.fullEveryMinutes * 60_000;
+    const others = await sweepOtherRecords({ full });
+    if (full) lastFull = Date.now();
+    // Punches and time off are rewritten every pass; only gaps and failures are news.
+    const news = others.filter((k) => k.behind || k.missing || k.failed);
+    if (news.length) {
+      console.log(`[zupersync] sweep${full ? " (full)" : ""}: ` + news.map((k) =>
+        `${k.kind} ${k.missing} missing, ${k.behind} behind, ${k.resynced} synced${k.failed ? `, ${k.failed} failed (${k.errors[0] ?? ""})` : ""}`).join("; "));
+    }
+  };
   timer = setInterval(async () => {
     if (running) return; // never overlap; a slow sweep must not stack
     running = true;
     try {
-      const r = await sweepJobs();
-      if (r.drifted || r.unmapped || r.failed) {
-        console.log(`[zupersync] sweep: ${r.inWindow} in window, ${r.drifted} drifted, ${r.unmapped} unmapped, ${r.resynced} resynced, ${r.failed} failed${r.stoppedEarly ? " (capped)" : ""}`);
-      }
-      // The first pass after a start is a full one, then every fullEveryMinutes.
-      const full = Date.now() - lastFull >= config.sweep.fullEveryMinutes * 60_000;
-      const others = await sweepOtherRecords({ full });
-      if (full) lastFull = Date.now();
-      // Punches and time off are rewritten every pass; only gaps and failures are news.
-      const news = others.filter((k) => k.behind || k.missing || k.failed);
-      if (news.length) {
-        console.log(`[zupersync] sweep${full ? " (full)" : ""}: ` + news.map((k) =>
-          `${k.kind} ${k.missing} missing, ${k.behind} behind, ${k.resynced} synced${k.failed ? `, ${k.failed} failed (${k.errors[0] ?? ""})` : ""}`).join("; "));
-      }
+      // Every call the pass makes is recorded as the sweep's (src/api-log.ts).
+      await withCause({ origin: "sweep" }, pass);
     } catch (err) {
       console.warn("[zupersync] sweep failed:", errorText(err));
     } finally {

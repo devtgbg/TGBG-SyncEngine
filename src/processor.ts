@@ -36,6 +36,7 @@ import type { TuperClient as SupabaseClient } from "./tuper-client.js";
 import { tuper as db } from "./tuper-client.js";
 import { one, sql } from "./store.js";
 import { config, errorText } from "./config.js";
+import { withCause } from "./api-log.js";
 import { ENTITIES, getSyncConfig, zuperGet, type SyncConfig } from "./lib/migration/zuper-sync.js";
 import { detailPathFor, isSelfFetching, resolveRoute, type NoteHost, type Route } from "./routes.js";
 
@@ -611,7 +612,8 @@ export async function processPending(limit = 50): Promise<{ attempted: number; o
   let ok = 0, failed = 0;
   for (const row of rows) {
     try {
-      await processEvent({ id: row.id, module: row.module, event: row.event, uid: row.zuper_uid, workOrder: row.work_order_number, body: row.body });
+      await withCause({ origin: "replay", eventId: row.id }, () =>
+        processEvent({ id: row.id, module: row.module, event: row.event, uid: row.zuper_uid, workOrder: row.work_order_number, body: row.body }));
       ok++;
     } catch { failed++; }
   }

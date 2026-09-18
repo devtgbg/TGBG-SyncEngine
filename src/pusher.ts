@@ -47,6 +47,7 @@ import type { TuperClient as SupabaseClient } from "./tuper-client.js";
 import { config, errorText } from "./config.js";
 import { tuper as db } from "./tuper-client.js";
 import { sql } from "./store.js";
+import { logCall, withCause } from "./api-log.js";
 import { getSyncConfig, zuperGet, type SyncConfig } from "./lib/migration/zuper-sync.js";
 import { JOB_CREATE_LOCK, oneAtATime, setBeforeInbound } from "./processor.js";
 // The two modules import each other; both only define functions, so neither needs the other while loading.
@@ -549,17 +550,25 @@ async function planCreate(client: SupabaseClient, j: Record<string, any>, plan: 
 
 /** One write to Zuper. Never retried here — see the header. */
 async function send(cfg: SyncConfig, r: PlannedRequest): Promise<{ ok: boolean; status: number; body: any }> {
-  const res = await fetch(cfg.api_base + r.path, {
-    method: r.method,
-    headers: { "x-api-key": cfg.api_key ?? "", "content-type": "application/json", accept: "application/json" },
-    body: r.body === undefined ? undefined : JSON.stringify(r.body),
-    signal: AbortSignal.timeout(30_000),
-  });
+  const started = Date.now();
+  let res: Response;
+  try {
+    res = await fetch(cfg.api_base + r.path, {
+      method: r.method,
+      headers: { "x-api-key": cfg.api_key ?? "", "content-type": "application/json", accept: "application/json" },
+      body: r.body === undefined ? undefined : JSON.stringify(r.body),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (err) {
+    logCall({ system: "zuper", method: r.method, path: r.path, action: r.why, status: null, ok: false, started, error: errorText(err), request: r.body });
+    throw err;
+  }
   const text = await res.text();
   let body: any = null;
   try { body = JSON.parse(text); } catch { body = { raw: text.slice(0, 200) }; }
   // A 200 can carry {type:"error"}.
   const ok = res.ok && body?.type !== "error";
+  logCall({ system: "zuper", method: r.method, path: r.path, action: r.why, status: res.status, ok, started, request: r.body, response: text });
   return { ok, status: res.status, body };
 }
 
@@ -854,7 +863,7 @@ export function startPusher(): void {
     if (running) return;
     running = true;
     try {
-      const r = await pushPending(mode);
+      const r = await withCause({ origin: "push" }, () => pushPending(mode));
       if (r.jobs) console.log(`[zupersync] push (${mode}): ${r.jobs} record(s) — ${r.planned} planned, ${r.sent} sent, ${r.skipped} skipped, ${r.failed} failed${r.waiting ? `, ${r.waiting} waiting` : ""}`);
     } catch (err) {
       const msg = errorText(err);

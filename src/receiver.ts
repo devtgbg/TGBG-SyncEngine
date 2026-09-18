@@ -23,6 +23,7 @@ import { timingSafeEqual } from "node:crypto";
 import { config, errorText, secretConfigured } from "./config.js";
 import { one } from "./store.js";
 import { resolveRoute } from "./routes.js";
+import { withCause } from "./api-log.js";
 
 export const receiver = Router();
 
@@ -178,7 +179,8 @@ receiver.post("/", async (req: Request, res: Response) => {
   setImmediate(async () => {
     try {
       const { processEvent } = await import("./processor.js");
-      await processEvent({ id: eventId, ...ids, body: req.body });
+      // Every API call the processing makes is recorded against this delivery (src/api-log.ts).
+      await withCause({ origin: "webhook", eventId }, () => processEvent({ id: eventId, ...ids, body: req.body }));
     } catch (err) {
       console.warn("[zupersync] post-ack processing failed:", errorText(err));
     }

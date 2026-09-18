@@ -18,6 +18,7 @@ import { setEntityTags } from "../list-contract/entity-tags";
 import { addDays as addDaysYmd, cleanFileName, kindOf } from "../helpers";
 import { sanitizeRichText, richTextToPlain } from "../rich-text";
 import { one as storeOne, sql as storeSql } from "../../store.js";
+import { logCall } from "../../api-log.js";
 
 export interface SyncConfig { api_key: string | null; api_base: string; company: string | null; enabled: boolean; interval_hours: number; last_run_at: string | null; next_run_at: string | null; is_syncing: boolean }
 
@@ -52,19 +53,24 @@ const zHeaders = (cfg: SyncConfig) => ({ "x-api-key": cfg.api_key ?? "", "conten
 /** One Zuper call, retried with backoff (2s … 30s, six tries) on 429/5xx. Zuper's list endpoints
  *  fail intermittently at deep offsets (jobs past ~27,000: 500, then 200 on a later try). */
 async function zuperJson(cfg: SyncConfig, path: string, init: RequestInit, what: string): Promise<any> {
+  const method = (init.method ?? "GET").toUpperCase();
   for (let attempt = 1; ; attempt++) {
+    const started = Date.now();
     let res: Response;
     try {
       // A reset or timed-out connection is as transient as a 5xx: retried the same way. Callers only use
       // this for reads and for the idempotent list filters, so a repeat is safe.
       res = await fetch(cfg.api_base + path, { ...init, headers: zHeaders(cfg), signal: AbortSignal.timeout(60_000) });
     } catch (err) {
-      if (attempt >= 6) throw new Error(`Zuper ${what} → network error: ${err instanceof Error ? (err.cause as Error | undefined)?.message ?? err.message : String(err)}`);
+      const reason = err instanceof Error ? (err.cause as Error | undefined)?.message ?? err.message : String(err);
+      logCall({ system: "zuper", method, path, status: null, ok: false, started, attempt, error: reason, request: init.body });
+      if (attempt >= 6) throw new Error(`Zuper ${what} → network error: ${reason}`);
       await new Promise((r) => setTimeout(r, Math.min(30_000, 1000 * 2 ** attempt)));
       continue;
     }
-    if (res.ok) return res.json();
-    await res.text().catch(() => "");
+    const text = await res.text().catch(() => "");
+    logCall({ system: "zuper", method, path, status: res.status, ok: res.ok, started, attempt, request: init.body, response: text });
+    if (res.ok) return JSON.parse(text);
     if (attempt >= 6 || (res.status < 500 && res.status !== 429)) throw new Error(`Zuper ${what} → ${res.status}`);
     await new Promise((r) => setTimeout(r, Math.min(30_000, 1000 * 2 ** attempt)));
   }

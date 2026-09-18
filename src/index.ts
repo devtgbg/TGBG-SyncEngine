@@ -21,6 +21,7 @@ import { receiver } from "./receiver.js";
 import { startReplay } from "./reconcile.js";
 import { pushState, startPusher } from "./pusher.js";
 import { startSweep } from "./sweep.js";
+import { flush as flushApiLog, startApiLogPurge } from "./api-log.js";
 
 const app = express();
 
@@ -113,4 +114,14 @@ app.listen(config.port, () => {
   startSweep();
   // Changes made in Tuper, towards Zuper. Dry run unless PUSH_MODE=live.
   startPusher();
+  // Old API call bodies and rows go on a timer (src/api-log.ts).
+  startApiLogPurge();
+});
+
+// A deploy stops the container with SIGTERM. The API calls recorded in the last second are still in memory: write them
+// before going, but never hold the stop up for long.
+process.once("SIGTERM", () => {
+  const exit = () => process.exit(0);
+  setTimeout(exit, 5_000).unref();
+  void flushApiLog().finally(exit);
 });

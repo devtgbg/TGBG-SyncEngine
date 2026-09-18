@@ -15,6 +15,7 @@ import { timingSafeEqual } from "node:crypto";
 import { config, errorText, secretConfigured } from "./config.js";
 import { one, sql } from "./store.js";
 import { tuper } from "./tuper-client.js";
+import { withCause } from "./api-log.js";
 import { ENTITIES, getSyncConfig, syncEntity, type Ctx } from "./lib/migration/zuper-sync.js";
 
 export const admin = Router();
@@ -69,7 +70,7 @@ admin.post("/sync/:entity", async (req: Request, res: Response) => {
     const cfg = await getSyncConfig(client as never, config.tenantId);
     if (!cfg.api_key) throw new Error("no Zuper API key configured");
     const ctx: Ctx = { client: client as never, tenantId: config.tenantId, cfg, maps: {}, extra: {} };
-    const result = await syncEntity(ctx, name);
+    const result = await withCause({ origin: "admin" }, () => syncEntity(ctx, name));
     console.log(`[zupersync] admin sync ${name}: ${result.fetched} fetched, ${result.upserted} upserted, ${result.failed} failed`);
   } catch (err) {
     console.error(`[zupersync] admin sync ${name} failed:`, errorText(err));

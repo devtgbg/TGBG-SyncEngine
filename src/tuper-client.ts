@@ -17,6 +17,7 @@
  *   • subscribe to anything. Changes made in Tuper arrive as webhooks, like Zuper's.
  */
 import { config } from "./config.js";
+import { logCall } from "./api-log.js";
 
 export interface DbError { code: string | null; message: string; details: string | null; hint: string | null }
 export interface DbResult<T = any> { data: T; error: DbError | null }
@@ -29,7 +30,21 @@ const TIMEOUT_MS = 60_000;
 /** core.users is the one table outside jms the sync service touches; Tuper names it core_users. */
 const tableName = (schema: Schema, table: string) => (schema === "core" ? `core_${table}` : table);
 
-async function post(path: string, body: unknown): Promise<DbResult> {
+/** What a call to the sync endpoints does, in the words the API log is read by: "update jobs", "rpc renumber_job". */
+function actionOf(path: string, body: any): string | null {
+  if (path === "/api/sync/query") return `select ${body?.table ?? "?"}`;
+  if (path === "/api/sync/mutate") return `${body?.op ?? "?"} ${body?.table ?? "?"}`;
+  if (path === "/api/sync/rpc") return `rpc ${body?.name ?? "?"}`;
+  if (path === "/api/sync/auth-user") return "create login";
+  return null;
+}
+
+/** `quiet` keeps a call out of the API log: the health check runs every 30 seconds and says nothing about the sync. */
+async function post(path: string, body: unknown, opts: { quiet?: boolean } = {}): Promise<DbResult> {
+  const started = Date.now();
+  const log = (status: number | null, ok: boolean, response: string | null, error?: string) => {
+    if (!opts.quiet) logCall({ system: "tuper", method: "POST", path, action: actionOf(path, body), status, ok, started, error, request: body, response });
+  };
   try {
     const res = await fetch(`${config.tuper.url}${path}`, {
       method: "POST",
@@ -40,6 +55,11 @@ async function post(path: string, body: unknown): Promise<DbResult> {
     const text = await res.text();
     let parsed: any = null;
     try { parsed = text ? JSON.parse(text) : null; } catch { /* not json */ }
+    // A select that finds nothing answers 404. For a `maybe` query that is the expected answer, not a failure, and the
+    // log must not count every "is this record new?" lookup as one.
+    const found = res.ok && parsed?.type === "success";
+    const emptyMaybe = res.status === 404 && (body as { single?: string } | null)?.single === "maybe";
+    log(res.status, found || emptyMaybe, text, found || emptyMaybe ? undefined : parsed?.message ?? `HTTP ${res.status}`);
 
     if (res.ok && parsed?.type === "success") return { data: parsed.data ?? null, error: null };
     // Tuper hands the database's own error back under `data` — the caller's retries depend on the code.
@@ -55,6 +75,7 @@ async function post(path: string, body: unknown): Promise<DbResult> {
     };
   } catch (err) {
     const message = err instanceof Error ? (err.name === "TimeoutError" ? `no answer from Tuper within ${TIMEOUT_MS / 1000}s` : err.message) : "request failed";
+    log(null, false, null, message);
     return { data: null, error: { code: "NETWORK", message, details: null, hint: null } };
   }
 }
@@ -175,11 +196,15 @@ const auth = {
       return { data: { user: { id: (res.data as { id: string }).id, email: input.email } }, error: null };
     },
     async deleteUser(id: string) {
-      const res = await fetch(`${config.tuper.url}/api/sync/auth-user/${encodeURIComponent(id)}`, {
+      const path = `/api/sync/auth-user/${encodeURIComponent(id)}`;
+      const started = Date.now();
+      const res = await fetch(`${config.tuper.url}${path}`, {
         method: "DELETE",
         headers: { "x-api-key": config.tuper.apiKey },
         signal: AbortSignal.timeout(TIMEOUT_MS),
       }).catch(() => null);
+      const text = res ? await res.text().catch(() => null) : null;
+      logCall({ system: "tuper", method: "DELETE", path, action: "remove login", status: res?.status ?? null, ok: !!res?.ok, started, response: text, error: res ? undefined : "no answer" });
       return { data: null, error: res?.ok ? null : { message: "could not remove the login" } };
     },
   },
@@ -209,6 +234,6 @@ export function tuper(): TuperClient {
 
 /** A cheap call that proves the key works, for /health. */
 export async function tuperReachable(): Promise<{ ok: boolean; detail?: string }> {
-  const res = await post("/api/sync/query", { table: "job_categories", select: "id", limit: 1 });
+  const res = await post("/api/sync/query", { table: "job_categories", select: "id", limit: 1 }, { quiet: true });
   return res.error ? { ok: false, detail: res.error.message } : { ok: true };
 }
