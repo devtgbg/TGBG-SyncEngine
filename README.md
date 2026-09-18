@@ -62,6 +62,18 @@ masked, bodies over `API_LOG_BODY_MAX` are cut, bodies go after
 `API_LOG_BODY_HOURS` (48) and rows after `API_LOG_DAYS` (7). The health check is
 not recorded.
 
+**Every record written to Tuper is recorded too**, one row each, in
+`sync.tuper_writes` (`src/tuper-writes.ts`) — the mirror of `sync.outbox`, which
+holds what goes to Zuper. A write is whatever turns one Zuper record into Tuper
+rows: a job with its details and activity, a customer, a deletion, one record's
+notes, one pass over the recent punches, an admin re-sync of a whole entity. The
+outermost is the one recorded, so a job's three passes are one row; it says what
+the record is (a work order number, a customer's name, named as soon as Zuper's
+record is read so a failure still says which), what happened to it in Tuper
+(created, updated, deleted — or failed, and why), its cause, and what it cost.
+Every call made inside it carries its id (`sync.api_calls.write_id`). Rows go
+after `TUPER_WRITES_DAYS` (30).
+
 ### Routing
 
 `src/routes.ts` holds Zuper's whole event catalogue: **12 modules, 203 events** —
@@ -102,6 +114,11 @@ Things that break routing silently if assumed otherwise:
   notes; punches and time off. Customers, organizations, assets and products are
   ~100 list pages, so they run on the first pass after a start and then every
   `SWEEP_FULL_EVERY_MINUTES` (180). `npm run sweep -- --records [--full] [--apply]`.
+- **A list Zuper refuses stops the pass.** A page of a `…/filter` list that fails
+  is re-read a record at a time, so one record Zuper cannot serialise costs only
+  that record. But when the first five records fail too, with nothing come back,
+  the fault is the list itself (a wrong path, a key without access) and the page's
+  error is thrown — before 2026-09-18 it paged on for ever.
 - **Job line items are not synced.** None of 12,000 jobs changed since 2025 has
   one, and replacing Tuper's job line items with Zuper's empty list would lose
   data. Photos reach Tuper through checklist answers and note attachments (53 of
@@ -177,7 +194,7 @@ real traffic.
 `dashboard/` is a read-only Next.js app on `:3021`. It reads **only the service's
 own store** — the same `DATABASE_URL` — and nothing of Tuper's: no Supabase, no
 `jms`. Every session it opens is `default_transaction_read_only`, so it cannot
-write even over the service's credentials. Three pages:
+write even over the service's credentials. Four pages:
 
 - **Webhooks** (`/`) — every delivery from Zuper *and* from Tuper, filtered by
   source and by outcome: accepted or refused, applied (Zuper) or queued for Zuper
@@ -206,6 +223,12 @@ write even over the service's credentials. Three pages:
   when nothing displays it. Check that with a production build — under
   `next dev`, React also writes the raw rows a page awaited into the payload for
   its developer tools.
+- **To Tuper** (`/tuper`) — every record written into Tuper, one row each, whatever
+  caused it: a Zuper webhook, a replay, the sweep catching what a webhook missed,
+  an admin re-sync. What the record is, what happened to it in Tuper, what it cost
+  in calls, and why it failed when it did, with the last day's created, updated,
+  deleted and failed counts. Opening a row lists every call its writing took. A
+  Zuper delivery's panel on **Webhooks** links to the records it wrote.
 - **API calls** (`/calls`) — every request to Zuper's API and to Tuper's, newest
   first, filtered by system, failures and cause, with the last hour's volume,
   failures and median time per system. Pages by id, not offset, because the log
@@ -369,6 +392,8 @@ each file once (recorded in `public.sync_migrations`):
   `triggered_by`.
 - `003_close_uidless_tuper_deliveries.sql` — closes, with the reason, the Tuper
   deliveries that arrived without a record uid before the receiver learned to.
+- `004_tuper_writes.sql` — one row per record written to Tuper, and
+  `api_calls.write_id` tying each call to it.
 
 ### `migrations/` — Tuper's database, historical
 
