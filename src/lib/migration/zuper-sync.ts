@@ -81,7 +81,13 @@ const filterPage = async (cfg: SyncConfig, path: string, page: number, limit: nu
 /** Page through a POST …/filter list a page at a time, so big lists (46k jobs) never sit in memory.
  *  Zuper fails a whole page when it can't serialize one record in it (seen: jobs p271 → 500), so a
  *  page that keeps failing is refetched a record at a time and only the records that still fail
- *  are skipped (and logged) — one bad record no longer stops the import. */
+ *  are skipped (and logged) — one bad record no longer stops the import.
+ *
+ *  But when the records of the page fail as the page did, the fault is the list, not a record: a
+ *  wrong path, a key without access, Zuper refusing it. Skipping on then never ends — each page fails,
+ *  each record in it fails, and the next page is asked for (a mock without the timesheet list ran to
+ *  349,000 calls). So once the first five records in a row fail with nothing come back — which one bad
+ *  record cannot cause — the page's error is thrown instead. */
 export async function* zuperFilterPages(cfg: SyncConfig, path: string, pageSize = 100, extra: Record<string, unknown> = {}): AsyncGenerator<any[]> {
   for (let page = 1; ; page++) {
     let rows: any[], more: boolean;
@@ -90,6 +96,7 @@ export async function* zuperFilterPages(cfg: SyncConfig, path: string, pageSize 
       more = rows.length === pageSize;
     } catch (pageErr) {
       rows = []; more = true;
+      let failedToo = 0;
       const offset = (page - 1) * pageSize; // with limit 1, page n is record n
       for (let i = 1; i <= pageSize; i++) {
         try {
@@ -97,6 +104,8 @@ export async function* zuperFilterPages(cfg: SyncConfig, path: string, pageSize 
           if (!one.length) { more = false; break; } // past the end of the list
           rows.push(...one);
         } catch (recErr) {
+          failedToo++;
+          if (!rows.length && failedToo >= 5) throw pageErr;
           console.log(`  Zuper ${path}: skipped record #${offset + i} (${recErr instanceof Error ? recErr.message : recErr}) after page ${page} failed (${pageErr instanceof Error ? pageErr.message : pageErr})`);
         }
       }
