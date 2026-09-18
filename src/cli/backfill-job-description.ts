@@ -25,7 +25,7 @@ async function zuperJob(uid: string): Promise<any | null> {
       });
       if (res.status === 404) return null;
       if (!res.ok) throw new Error(String(res.status));
-      return (await res.json())?.data ?? null;
+      return ((await res.json()) as { data?: any })?.data ?? null;
     } catch (e) {
       if (attempt === 4) { console.error("  giving up on", uid, e instanceof Error ? e.message : e); return null; }
       await new Promise((r) => setTimeout(r, attempt * 2000));
