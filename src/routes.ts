@@ -206,7 +206,9 @@ const MODULES: Record<string, ModuleSpec> = {
       "job.update_checklist": ["Update Job Checklist"],
       "job.recurring_update": ["Update Recurring Job"],
       "job.update_recurrence": ["Update Recurring Job Rule"],
-      "job.new_recurrence": ["New Recurring Job"],
+      // Names only the series (recurring_job_uid), no job: the jobs a recurrence makes arrive as their own job.new
+      // (2026-09-17: six job.new within the same second as the one job.new_recurrence, all synced).
+      "job.new_recurrence": ["New Recurring Job", { skip: "names only the recurring series; each job it makes arrives as its own job.new" }],
       // Deletes the recurrence rule, not the job.
       "job.delete_recurrence": ["Delete Recurring Job"],
       "job.status_alert": ["Status Alert", NO_STATE("sending an alert")],
