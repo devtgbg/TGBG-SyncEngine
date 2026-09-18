@@ -77,7 +77,7 @@ after `TUPER_WRITES_DAYS` (30).
 ### Routing
 
 `src/routes.ts` holds Zuper's whole event catalogue: **12 modules, 203 events** —
-118 synced (12 of them deletions), 85 stored with a reason and skipped.
+117 synced (12 of them deletions), 86 stored with a reason and skipped.
 
 The catalogue is Zuper's own, not transcribed from its UI. `GET
 /api/misc/{MODULE}/events` — the call Zuper's New Webhook form makes when a module
@@ -126,8 +126,8 @@ Things that break routing silently if assumed otherwise:
 - **A work order number Tuper already used is moved, not refused.** While both
   systems number jobs, a job made in Tuper can take the number Zuper gives its next
   job. The import then moves the Tuper-made job to a new number
-  (`jms.renumber_job`, through `/api/sync/rpc`) and writes Zuper's. Tuper's sync
-  API has to allow that function — see *Known problems*.
+  (`jms.renumber_job`, through `/api/sync/rpc`, or its two steps where Tuper
+  refuses it — see *Known problems*) and writes Zuper's.
 
 Entities Zuper offers no by-uid read for (timesheets, timelogs) are **refused,
 not stubbed**. Handing a bare uid to a transform written for a full record would
@@ -368,7 +368,7 @@ with one header whose key and value match `ZUPER_WEBHOOK_HEADER` and
 `ZUPER_WEBHOOK_SECRET`. Zuper's webhook form calls these fields literally `key`
 and `value`; there is no separate secret field. `npm run webhooks` lists what is
 registered against what is needed (plan by default; `apply` creates the missing
-ones). On 2026-09-18 all 118 synced events were registered. `GET /webhooks/zuper`
+ones). On 2026-09-18 all 117 synced events were registered (and `job.new_recurrence`, now a skip). `GET /webhooks/zuper`
 answers a liveness probe, which is what Zuper's "test URL" check uses.
 
 **In Tuper**, point them at `https://zupersync.golfbuggyguy.com/webhooks/tuper`,
@@ -491,15 +491,15 @@ npm run check-push        # read-only: are the pusher's decisions right?
 
 Found 2026-09-18, all on Tuper's side:
 
-- **New Zuper jobs fail when a Tuper-made job holds their number.** The import
-  calls `renumber_job` to move the Tuper job aside; Tuper's sync API refuses it
-  (`'renumber_job' is not a function the sync service may call`) because its
-  allowlist names `renumber_jobs` and `renumber_requests`, while the database
-  functions are `renumber_job`, `renumber_request`, `renumber_contract` and
-  `renumber_product`. Every job created in Tuper takes the next number, so each
-  one costs the matching Zuper job its sync until the allowlist is fixed. Those
-  deliveries fail after five tries; once fixed, reset their `attempts` in
-  `sync.webhook_events` and the replay picks them up.
+- **Tuper's sync API refuses `renumber_job` and `renumber_request`**
+  (`'… is not a function the sync service may call'`): its allowlist names
+  `renumber_jobs` and `renumber_requests`, while the database functions are
+  `renumber_job`, `renumber_request`, `renumber_contract` and `renumber_product`.
+  It kept 15 new Zuper jobs (WO 54614–54629) out of Tuper on 2026-09-18. Worked
+  around here: a renumber function is `next_*` then an update of the number
+  (migration 00076), both of which a sync key may do, so on that refusal
+  `record-numbers.ts` does the two itself. Fixing the allowlist in Tuper makes the
+  workaround unnecessary.
 - **Tuper's webhooks for Zupersync are registered as `JOBS` / `CUSTOMERS`**, so
   their `job.new`, `job.update`, `job.delete` and `customer.*` bodies carry no
   uid (see *Registering the webhooks*).
