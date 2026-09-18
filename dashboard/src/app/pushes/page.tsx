@@ -1,23 +1,23 @@
 /**
  * Changes made in Tuper, and what Zupersync will do (or did) with them in Zuper.
  *
- * While PUSH_MODE is dry-run this page is the review: each row shows the change,
- * the exact requests that would be sent, and what will not be pushed and why.
+ * Each change arrives as a Tuper webhook and is queued here. While pushing is off nothing is planned or sent, and the
+ * page says so; in dry-run each row shows the exact requests that would be sent, and what will not be pushed and why.
  * Nothing on this page sends anything.
  */
 
-import { pushTotals, pushesPage, type Push } from "@/lib/db";
+import { pushTotals, pushesPage, serviceState, type Push, type ServiceState } from "@/lib/db";
 import { Pager, Pinned, readPaging } from "../pager";
 
 export const dynamic = "force-dynamic";
 
 const FILTERS = [
   { key: "", label: "All" },
+  { key: "queued", label: "Queued" },
   { key: "planned", label: "Planned" },
   { key: "sent", label: "Sent" },
   { key: "failed", label: "Failed" },
   { key: "skipped", label: "Not pushed" },
-  { key: "queued", label: "Queued" },
 ] as const;
 
 const STATUS: Record<Push["status"], { label: string; tone: "ok" | "warn" | "bad" | "muted" }> = {
@@ -39,7 +39,14 @@ const COLUMN: Record<string, string> = {
   service_address: "Service address", billing_address: "Billing address",
   is_deleted: "Deleted", deleted_at: "Deleted at", is_delayed: "Delayed",
   _assignees: "Assigned people", _teams: "Teams", work_order_number: "Work order",
+  // customers
+  first_name: "First name", last_name: "Last name", company_name: "Company", email: "Email", contact_no: "Phone numbers",
+  has_sla: "Has an SLA", do_not_service: "Do not service", is_active: "Active", _addresses: "Addresses",
+  additional_emails: "Other emails", category_id: "Category", account_manager_id: "Account manager", tax_exempt: "Tax exempt",
 };
+
+/** The kind of record, as a person would say it. */
+const KIND: Record<string, string> = { jobs: "job", customers: "customer" };
 
 const when = (iso: string) =>
   new Date(iso).toLocaleString("en-GB", { timeZone: "Asia/Dubai", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
@@ -54,7 +61,8 @@ function show(v: unknown): string {
 }
 
 function Changes({ p }: { p: Push }) {
-  if (p.operation === "create") return <span>New job</span>;
+  if (p.operation === "create") return <span>New {KIND[p.entity] ?? p.entity}</span>;
+  if (p.operation === "delete") return <span>Deleted in Tuper</span>;
   const seen = new Set<string>();
   const items = Object.keys(p.changed ?? {}).filter((k) => {
     const label = COLUMN[k] ?? k;
@@ -62,12 +70,14 @@ function Changes({ p }: { p: Push }) {
     seen.add(label);
     return true;
   });
+  if (!items.length) return <span className="dim">Tuper did not say which fields</span>;
   return (
     <div className="changes">
       {items.map((k) => (
         <span key={k}>
           {COLUMN[k] ?? k}
-          {k.startsWith("_") || k === "current_status_id" || k.endsWith("_id") ? null : (
+          {/* A change that arrived by webhook names the field only (value true); one from the old triggers carried both ends. */}
+          {k.startsWith("_") || k === "current_status_id" || k.endsWith("_id") || p.changed[k] === true ? null : (
             <>: <span className="from">{show(p.previous?.[k])}</span> → {show(p.changed[k])}</>
           )}
         </span>
@@ -95,6 +105,29 @@ function Requests({ p }: { p: Push }) {
   );
 }
 
+/** Whether anything on this page will be acted on, from the running service itself. */
+function Mode({ state }: { state: ServiceState | null }) {
+  if (!state?.push) return <p className="pinned">Could not ask the service whether pushing is on. Its <code>/health</code> says.</p>;
+  const { mode, sentToZuper, plannedOnly } = state.push;
+  if (mode === "off") {
+    return (
+      <p className="pinned hold">
+        <strong>Pushing to Zuper is on hold</strong> (PUSH_MODE=off). Changes made in Tuper are queued here; nothing is planned
+        and nothing is sent. Zuper stays as it is, and its next webhook for a record puts Zuper&apos;s values back in Tuper.
+      </p>
+    );
+  }
+  if (mode === "dry-run" || !sentToZuper.length) {
+    return <p className="pinned">Dry run: each change is planned and the requests are shown here. Nothing is sent to Zuper.</p>;
+  }
+  return (
+    <p className="pinned live-mode">
+      <strong>Live</strong> for {sentToZuper.join(", ")}: those changes are sent to Zuper.
+      {plannedOnly.length ? ` Planned only, never sent: ${plannedOnly.join(", ")}.` : ""}
+    </p>
+  );
+}
+
 export default async function Pushes({ searchParams }: { searchParams: Promise<{ status?: string; page?: string; size?: string; upto?: string }> }) {
   const sp = await searchParams;
   const status = sp.status ?? "";
@@ -102,13 +135,15 @@ export default async function Pushes({ searchParams }: { searchParams: Promise<{
   let rows: Push[] = [];
   let matching = 0;
   let totals: Record<string, number> = {};
+  let state: ServiceState | null = null;
   let error: string | null = null;
   try {
-    const [list, all] = await Promise.all([
+    const [list, all, s] = await Promise.all([
       pushesPage({ limit: paging.size, offset: paging.offset, upto: paging.upto, status: status || undefined }),
       pushTotals(),
+      serviceState(),
     ]);
-    rows = list.rows; matching = list.total; totals = all;
+    rows = list.rows; matching = list.total; totals = all; state = s;
   } catch (err) {
     const e = err as { message?: string };
     error = e?.message ?? String(err);
@@ -124,21 +159,23 @@ export default async function Pushes({ searchParams }: { searchParams: Promise<{
       <header className="head">
         <h1>Changes going to Zuper</h1>
         <p>
-          Every change made to a job in Tuper is queued here. Zupersync works out the Zuper requests from the job as it is now,
-          and skips anything Zuper already has. In dry-run mode nothing is sent: &ldquo;would send&rdquo; rows are the review.
+          Every change made in Tuper arrives as a Tuper webhook and is queued here. When pushing is on, Zupersync works out
+          the Zuper requests from the record as it is then, and skips anything Zuper already has.
         </p>
       </header>
 
       {error ? (
-        <p className="error">Could not read the outbox: {error}</p>
+        <p className="error">Could not read the queue: {error}</p>
       ) : (
         <>
+          <Mode state={state} />
+
           <section className="tiles">
+            <div className={`tile ${totals.queued ? "warn" : ""}`}><strong>{(totals.queued ?? 0).toLocaleString()}</strong><span>queued</span></div>
             <div className="tile warn"><strong>{(totals.planned ?? 0).toLocaleString()}</strong><span>would send</span></div>
             <div className="tile ok"><strong>{(totals.sent ?? 0).toLocaleString()}</strong><span>sent</span></div>
             <div className={`tile ${totals.failed ? "bad" : ""}`}><strong>{(totals.failed ?? 0).toLocaleString()}</strong><span>failed</span></div>
             <div className="tile"><strong>{(totals.skipped ?? 0).toLocaleString()}</strong><span>not pushed</span></div>
-            <div className={`tile ${totals.queued ? "warn" : ""}`}><strong>{(totals.queued ?? 0).toLocaleString()}</strong><span>queued</span></div>
           </section>
 
           <nav className="filters">
@@ -156,16 +193,27 @@ export default async function Pushes({ searchParams }: { searchParams: Promise<{
             <div className="scroll">
               <table>
                 <thead>
-                  <tr><th>When (Dubai)</th><th>Job</th><th>Change in Tuper</th><th>Zuper</th><th>Status</th></tr>
+                  <tr><th>When (Dubai)</th><th>Record</th><th>Change in Tuper</th><th>By</th><th>Zuper</th><th>Status</th></tr>
                 </thead>
                 <tbody>
                   {rows.map((p) => {
                     const s = STATUS[p.status] ?? { label: p.status, tone: "muted" as const };
+                    const record = p.planned?.label ?? p.planned?.workOrder ?? p.cause_wo ?? (p.zuper_uid ? p.zuper_uid.slice(0, 8) : "new in Tuper");
+                    const by = [p.by_first, p.by_last].map((x) => x?.trim()).filter(Boolean).join(" ");
                     return (
                       <tr key={p.id} className={Date.now() - new Date(p.queued_at).getTime() < 15_000 ? "fresh" : undefined}>
                         <td className="dim" title={p.queued_at}>{when(p.queued_at)}</td>
-                        <td className="mono">{p.planned?.workOrder ?? "—"}</td>
+                        <td>
+                          <span className="pair">
+                            <span className="mono" title={p.cause_title ?? undefined}>{record}</span>
+                            <span className="note">
+                              {KIND[p.entity] ?? p.entity}
+                              {p.event_id ? <> · <a href={`/?open=${p.event_id}`}>{p.cause_event ?? "webhook"}</a></> : null}
+                            </span>
+                          </span>
+                        </td>
                         <td className="wrap"><Changes p={p} /></td>
+                        <td>{by || <span className="dim">—</span>}</td>
                         <td className="wrap"><Requests p={p} /></td>
                         <td>
                           <span className={`pill ${s.tone}`}>{s.label}</span>

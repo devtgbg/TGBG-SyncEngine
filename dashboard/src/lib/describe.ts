@@ -7,7 +7,7 @@
  * a field that is missing is left out rather than guessed at.
  *
  * This describes the WEBHOOK, not the write. Zupersync treats a delivery as a
- * trigger and re-reads the record from Zuper, so what reached jms.* is the
+ * trigger and re-reads the record from Zuper, so what reached Tuper is the
  * record as it stood a moment later: usually the same thing, not always.
  *
  * What Zuper sends differs by event, and the view is only as good as that:
@@ -122,8 +122,13 @@ export function describe(event: string | null, body: unknown, names: Record<stri
     if (str(b.remarks_free_text)) push(changes, "Free-text remarks", b.remarks_free_text, names);
     if (s.eta) push(changes, "ETA", s.eta, names);
     if (Array.isArray(s.checklist) && s.checklist.length) push(changes, "Checklist", `${s.checklist.length} answer(s) sent with the status`, names);
-    notes.push("Zuper sends the new status only, not the one it replaced.");
-    return { headline: `${ev.endsWith("rollback") ? "Status rolled back to" : "Status set to"} "${str(s.status_name) || "?"}" on ${job}`, changes, notes };
+    const name = str(s.status_name);
+    // Tuper's deliveries have been seen with "status": null — say so rather than print a question mark.
+    notes.push(name ? "The webhook sends the new status only, not the one it replaced." : "The webhook does not say which status: its status field is empty.");
+    return {
+      headline: name ? `${ev.endsWith("rollback") ? "Status rolled back to" : "Status set to"} "${name}" on ${job}` : `Status changed on ${job}`,
+      changes, notes,
+    };
   }
 
   if (ev === "job.feedback") {
@@ -175,7 +180,7 @@ export function describe(event: string | null, body: unknown, names: Record<stri
     return { headline: kind.charAt(0).toUpperCase() + kind.slice(1), changes, notes };
   }
 
-  if (ev.endsWith(".delete")) return { headline: "Deleted in Zuper", changes, notes: ["The record is marked deleted in jms.*, not removed."] };
+  if (ev.endsWith(".delete")) return { headline: "Deleted", changes, notes: ["A deletion is recorded as a flag on the record, not by removing it."] };
 
   // *.update: Zuper names the fields and sends the record as it now stands.
   if (Array.isArray(b.updated_fields)) {

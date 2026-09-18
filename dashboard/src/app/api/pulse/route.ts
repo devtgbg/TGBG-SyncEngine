@@ -10,10 +10,13 @@ import { pulse } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
+const VIEWS = ["deliveries", "pushes", "calls"] as const;
+
 export async function GET(req: Request) {
-  const page = new URL(req.url).searchParams.get("view") === "pushes" ? "pushes" : "deliveries";
+  const asked = new URL(req.url).searchParams.get("view");
+  const view = VIEWS.find((v) => v === asked) ?? "deliveries";
   try {
-    return Response.json({ v: await pulse(page) }, { headers: { "cache-control": "no-store" } });
+    return Response.json({ v: await pulse(view) }, { headers: { "cache-control": "no-store" } });
   } catch (err) {
     const e = err as { message?: string };
     return Response.json({ error: e?.message ?? String(err) }, { status: 503, headers: { "cache-control": "no-store" } });

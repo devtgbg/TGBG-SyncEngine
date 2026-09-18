@@ -4,7 +4,7 @@ import { LiveRefresh } from "./live";
 
 export const metadata: Metadata = {
   title: "Zupersync log",
-  description: "What Zuper sent, and what Zupersync did with it.",
+  description: "What Zuper and Tuper sent, the API calls Zupersync made about it, and what is going back to Zuper.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -13,7 +13,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body>
         <nav className="site">
           <strong>Zupersync</strong>
-          <a href="/">From Zuper</a>
+          <a href="/">Webhooks</a>
+          <a href="/calls">API calls</a>
           <a href="/pushes">To Zuper</a>
           <LiveRefresh />
         </nav>

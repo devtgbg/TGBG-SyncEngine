@@ -12,7 +12,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 
 /** A table row that opens its delivery. Keyboard: Tab to the row, Enter to open. */
-export function Row({ href, className, children }: { href: string; className?: string; children: React.ReactNode }) {
+export function Row({ href, className, label = "Open this delivery", children }: { href: string; className?: string; label?: string; children: React.ReactNode }) {
   const router = useRouter();
   const open = () => {
     // Dragging across a row to copy a uid is not a click on it.
@@ -24,7 +24,7 @@ export function Row({ href, className, children }: { href: string; className?: s
       className={className}
       tabIndex={0}
       role="link"
-      aria-label="Open this delivery"
+      aria-label={label}
       onClick={open}
       onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); open(); } }}
     >

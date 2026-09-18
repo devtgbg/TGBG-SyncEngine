@@ -1,4 +1,4 @@
-# The Zupersync delivery log — Next.js on :3021.
+# The Zupersync log — Next.js on :3021. Reads only the service's own store (DATABASE_URL).
 #
 # Build context is this directory (set Coolify's base directory to `dashboard`).
 #

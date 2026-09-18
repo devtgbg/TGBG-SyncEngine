@@ -2,7 +2,7 @@
   "name": "zupersync-dashboard",
   "version": "0.1.0",
   "private": true,
-  "description": "Read-only view of what Zupersync has received from Zuper and what it did with it.",
+  "description": "Read-only view of what Zupersync received from Zuper and Tuper, the API calls it made, and what is going back to Zuper.",
   "scripts": {
     "dev": "next dev -p 3021",
     "build": "next build",
@@ -10,13 +10,14 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.0",
     "next": "^15.3.0",
+    "pg": "^8.23.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/pg": "^8.23.1",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "typescript": "^5.6.0"
