@@ -69,9 +69,17 @@ for (const j of jobs) {
   if (!html) { missing++; continue; }
   if (!/[<&]/.test(html)) { plain++; continue; }          // nothing to keep: it was plain text in Zuper too
   if (apply) {
-    const { error: uErr } = await client.schema("jms").from("jobs")
-      .update({ description_html: html }).eq("id", j.id).eq("tenant_id", tenantId);
-    if (uErr) throw uErr;
+    // The server this writes through is a development one that recompiles as files change, and answers a page of
+    // HTML while it does. That is worth waiting out rather than abandoning a run thousands of jobs in.
+    let wrote = false;
+    for (let attempt = 1; attempt <= 4 && !wrote; attempt++) {
+      const { error: uErr } = await client.schema("jms").from("jobs")
+        .update({ description_html: html }).eq("id", j.id).eq("tenant_id", tenantId);
+      if (!uErr) { wrote = true; break; }
+      if (attempt === 4) { console.error(`  could not write ${j.id}: ${uErr.message?.slice(0, 80)}`); missing++; }
+      else await new Promise((r) => setTimeout(r, attempt * 3000));
+    }
+    if (!wrote) continue;
   }
   filled++;
   if (filled % 25 === 0) console.log(`  ${filled} filled in so far`);
