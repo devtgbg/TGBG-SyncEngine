@@ -323,6 +323,108 @@ export async function callCounts(eventIds: string[]): Promise<Record<string, Cal
   }
 }
 
+// ── Records written to Tuper (sync.tuper_writes) ─────────────────────────────
+
+export interface TuperWrite {
+  id: string;
+  write_id: string;
+  at: string;
+  ms: number;
+  entity: string;
+  zuper_uid: string | null;
+  tuper_id: string | null;
+  label: string | null;
+  action: string;
+  ok: boolean;
+  error: string | null;
+  detail: string | null;
+  origin: Origin | null;
+  event_id: string | null;
+  zuper_calls: number;
+  tuper_calls: number;
+  failed_calls: number;
+  /** The delivery that caused it: its event, and the work order number it carried. */
+  cause_event: string | null;
+  cause_wo: string | null;
+}
+
+const WRITE_COLUMNS = `
+  w.id::text AS id, w.write_id, w.at, w.ms, w.entity, w.zuper_uid, w.tuper_id, w.label, w.action, w.ok, w.error, w.detail,
+  w.origin, w.event_id, w.zuper_calls, w.tuper_calls, w.failed_calls,
+  e.event AS cause_event, coalesce(e.work_order_number, e.body->>'work_order_number') AS cause_wo`;
+
+export interface WriteFilter { entity?: string; failed?: boolean; origin?: string }
+
+/** Newest first, a page at a time by id, like the call log. One extra row says whether there is an older page. */
+export async function writesPage(opts: WriteFilter & { before?: string; limit: number }): Promise<{ rows: TuperWrite[]; older: boolean }> {
+  const values: unknown[] = [tenantId()];
+  const parts = ["w.tenant_id = $1"];
+  if (opts.entity) { values.push(opts.entity); parts.push(`w.entity = $${values.length}`); }
+  if (opts.failed) parts.push("NOT w.ok");
+  if (opts.origin === "other") parts.push("w.origin IS NULL");
+  else if (opts.origin) { values.push(opts.origin); parts.push(`w.origin = $${values.length}`); }
+  if (opts.before && /^\d{1,19}$/.test(opts.before)) { values.push(opts.before); parts.push(`w.id < $${values.length}::bigint`); }
+  const rows = await q<TuperWrite>(
+    `SELECT ${WRITE_COLUMNS} FROM sync.tuper_writes w LEFT JOIN sync.webhook_events e ON e.id = w.event_id
+      WHERE ${parts.join(" AND ")} ORDER BY w.id DESC LIMIT ${Math.trunc(opts.limit) + 1}`, values);
+  return { rows: rows.slice(0, opts.limit), older: rows.length > opts.limit };
+}
+
+export interface WriteStats { created: number; updated: number; deleted: number; failed: number; total: number }
+
+/** The last 24 hours: how many records Tuper gained, changed and lost from Zuper, and how many could not be written. */
+export async function writeStats(): Promise<WriteStats> {
+  const [r] = await q<WriteStats>(
+    `SELECT count(*)::int AS total,
+            count(*) FILTER (WHERE ok AND action = 'created')::int AS created,
+            count(*) FILTER (WHERE ok AND action = 'updated')::int AS updated,
+            count(*) FILTER (WHERE ok AND action = 'deleted')::int AS deleted,
+            count(*) FILTER (WHERE NOT ok)::int AS failed
+       FROM sync.tuper_writes WHERE tenant_id = $1 AND at > now() - interval '24 hours'`, [tenantId()]);
+  return r ?? { created: 0, updated: 0, deleted: 0, failed: 0, total: 0 };
+}
+
+/** The kinds of record written lately, most frequent first, for the filter. */
+export async function writeEntities(): Promise<string[]> {
+  const rows = await q<{ entity: string }>(
+    `SELECT entity FROM sync.tuper_writes WHERE tenant_id = $1 AND at > now() - interval '7 days'
+      GROUP BY entity ORDER BY count(*) DESC LIMIT 12`, [tenantId()]);
+  return rows.map((r) => r.entity);
+}
+
+export async function writeById(id: string): Promise<TuperWrite | null> {
+  if (!/^\d{1,19}$/.test(id)) return null;
+  const [row] = await q<TuperWrite>(
+    `SELECT ${WRITE_COLUMNS} FROM sync.tuper_writes w LEFT JOIN sync.webhook_events e ON e.id = w.event_id
+      WHERE w.tenant_id = $1 AND w.id = $2::bigint`, [tenantId(), id]);
+  return row ?? null;
+}
+
+/** The records one delivery caused to be written. Empty until the table exists. */
+export async function writesFor(eventId: string): Promise<TuperWrite[]> {
+  if (!UUID.test(eventId)) return [];
+  try {
+    return await q<TuperWrite>(
+      `SELECT ${WRITE_COLUMNS} FROM sync.tuper_writes w LEFT JOIN sync.webhook_events e ON e.id = w.event_id
+        WHERE w.tenant_id = $1 AND w.event_id = $2 ORDER BY w.id`, [tenantId(), eventId]);
+  } catch (err) {
+    if (missingTable(err)) return [];
+    throw err;
+  }
+}
+
+/** The calls one record's writing made, in order. Bodies are read one call at a time (callById). */
+export async function callsForWrite(writeId: string, limit = 300): Promise<{ rows: ApiCall[]; total: number }> {
+  if (!UUID.test(writeId)) return { rows: [], total: 0 };
+  const [rows, count] = await Promise.all([
+    q<ApiCall>(
+      `SELECT ${CALL_COLUMNS} FROM sync.api_calls c LEFT JOIN sync.webhook_events e ON e.id = c.event_id
+        WHERE c.tenant_id = $1 AND c.write_id = $2 ORDER BY c.id LIMIT ${Math.trunc(limit)}`, [tenantId(), writeId]),
+    q<{ n: number }>("SELECT count(*)::int AS n FROM sync.api_calls WHERE tenant_id = $1 AND write_id = $2", [tenantId(), writeId]),
+  ]);
+  return { rows, total: count[0]?.n ?? 0 };
+}
+
 // ── Changes going to Zuper (sync.outbox) ─────────────────────────────────────
 
 export interface PlannedRequest { method: string; path: string; body?: unknown; why: string }
@@ -428,10 +530,11 @@ function fingerprint(s: string): string {
  * applied, failed or sent. The browser polls this instead of the page: one indexed query of ids and state columns, no
  * bodies, no customer data. Calls are only ever added, so the newest id is the whole story there.
  */
-export async function pulse(view: "deliveries" | "pushes" | "calls"): Promise<string> {
-  if (view === "calls") {
+export async function pulse(view: "deliveries" | "pushes" | "calls" | "writes"): Promise<string> {
+  if (view === "calls" || view === "writes") {
     try {
-      const [r] = await q<{ v: string | null }>("SELECT max(id)::text AS v FROM sync.api_calls WHERE tenant_id = $1", [tenantId()]);
+      const table = view === "calls" ? "sync.api_calls" : "sync.tuper_writes";
+      const [r] = await q<{ v: string | null }>(`SELECT max(id)::text AS v FROM ${table} WHERE tenant_id = $1`, [tenantId()]);
       return r?.v ?? "0";
     } catch (err) {
       if (missingTable(err)) return "none";

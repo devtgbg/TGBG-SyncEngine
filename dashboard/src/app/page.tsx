@@ -7,8 +7,8 @@
  */
 
 import {
-  callById, callCounts, callsFor, deliveriesPage, deliveryById, missingTable, sourceCounts, totals, userNames,
-  type ApiCall, type ApiCallDetail, type CallCount, type Delivery, type DeliveryDetail, type Source,
+  callById, callCounts, callsFor, deliveriesPage, deliveryById, missingTable, sourceCounts, totals, userNames, writesFor,
+  type ApiCall, type ApiCallDetail, type CallCount, type Delivery, type DeliveryDetail, type Source, type TuperWrite,
 } from "@/lib/db";
 import { userUidsIn } from "@/lib/describe";
 import { outcome } from "@/lib/outcome";
@@ -60,6 +60,7 @@ export default async function Page({ searchParams }: { searchParams: Promise<SP>
   let opened: DeliveryDetail | null = null;
   let openedCalls: { rows: ApiCall[]; total: number } | null = null;
   let openedCall: ApiCallDetail | null = null;
+  let written: TuperWrite[] = [];
   let names: Record<string, string> = {};
   let error: string | null = null;
   try {
@@ -74,6 +75,7 @@ export default async function Page({ searchParams }: { searchParams: Promise<SP>
     if (opened) {
       // An assignment names people by uid only; a name that cannot be found is no reason to fail the page.
       names = await userNames(userUidsIn(opened.body)).catch(() => ({}));
+      written = await writesFor(opened.id);
       try {
         openedCalls = await callsFor(opened.id);
         if (sp.call) {
@@ -205,7 +207,7 @@ export default async function Page({ searchParams }: { searchParams: Promise<SP>
       )}
 
       {opened ? (
-        <Detail d={opened} names={names} closeHref={here()} calls={openedCalls} call={openedCall}
+        <Detail d={opened} names={names} closeHref={here()} calls={openedCalls} call={openedCall} written={written}
           callHref={(id) => here(opened!.id, id)} />
       ) : null}
     </main>

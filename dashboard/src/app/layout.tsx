@@ -14,8 +14,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <nav className="site">
           <strong>Zupersync</strong>
           <a href="/">Webhooks</a>
-          <a href="/calls">API calls</a>
+          <a href="/tuper">To Tuper</a>
           <a href="/pushes">To Zuper</a>
+          <a href="/calls">API calls</a>
           <LiveRefresh />
         </nav>
         {children}

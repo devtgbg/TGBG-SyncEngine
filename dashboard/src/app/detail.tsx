@@ -7,13 +7,13 @@
  */
 
 import Link from "next/link";
-import type { ApiCall, ApiCallDetail, DeliveryDetail } from "@/lib/db";
+import type { ApiCall, ApiCallDetail, DeliveryDetail, TuperWrite } from "@/lib/db";
 import { describe, dubaiTime } from "@/lib/describe";
 import { outcome } from "@/lib/outcome";
 import { CallBodies, CallLine, after } from "./call-view";
 import { CopyButton, EscapeTo } from "./row";
 
-export function Detail({ d, names, closeHref, calls, call, callHref }: {
+export function Detail({ d, names, closeHref, calls, call, callHref, written }: {
   d: DeliveryDetail;
   names: Record<string, string>;
   closeHref: string;
@@ -21,6 +21,8 @@ export function Detail({ d, names, closeHref, calls, call, callHref }: {
   calls: { rows: ApiCall[]; total: number } | null;
   call: ApiCallDetail | null;
   callHref: (id?: string) => string;
+  /** The records this delivery caused to be written to Tuper (To Tuper). */
+  written: TuperWrite[];
 }) {
   const o = outcome(d);
   const fromTuper = d.source === "tuper";
@@ -116,6 +118,24 @@ export function Detail({ d, names, closeHref, calls, call, callHref }: {
               : "This is what the webhook says. Zupersync does not copy these values: it re-reads the record from Zuper and writes that through Tuper's API."}
           </p>
         </section>
+
+        {written.length ? (
+          <section>
+            <h3>Written to Tuper</h3>
+            <div className="call-list">
+              {written.map((w) => (
+                <a key={w.id} className={`call-line${w.ok ? "" : " failed"}`} href={`/tuper?open=${w.id}`}>
+                  <span className="dim mono">{w.entity}</span>
+                  <span className={`pill ${w.ok ? "ok" : "bad"}`}>{w.action}</span>
+                  <span className="what" title={w.error ?? undefined}>{w.label ?? w.zuper_uid ?? "—"}{w.error ? ` — ${w.error}` : ""}</span>
+                  <span className="dim mono">Z {w.zuper_calls} · T {w.tuper_calls}</span>
+                  <span className="num dim mono">{(w.ms / 1000).toFixed(1)}s</span>
+                </a>
+              ))}
+            </div>
+            <p className="note">Each opens on <a href="/tuper">To Tuper</a> with every call its writing took.</p>
+          </section>
+        ) : null}
 
         <section>
           <h3>API calls</h3>

@@ -10,7 +10,7 @@ import { pulse } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
-const VIEWS = ["deliveries", "pushes", "calls"] as const;
+const VIEWS = ["deliveries", "pushes", "calls", "writes"] as const;
 
 export async function GET(req: Request) {
   const asked = new URL(req.url).searchParams.get("view");
