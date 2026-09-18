@@ -62,6 +62,48 @@ const minutes = (v: unknown) => (Number.isFinite(Number(v)) ? Math.round(Number(
 // has to be asked job by job. Only a job Zuper marked as recurring can have come from one, which is 9,856 of GBG's
 // 46,000 rather than all of them.
 //
+// A job's `recurring_job` is the repeat itself — rule, how often, how long, addresses, first and last job, how many —
+// but not what each job it makes is called or for whom, so those come from the job. Zuper's created_by here is its
+// internal number, not a user uid, so it can't be mapped and is left empty.
+async function repeatFromJob(job: any): Promise<string | undefined> {
+  const r = job?.recurring_job;
+  const uid = r?.recurring_job_uid;
+  if (!uid || !r.rrule) return undefined;
+  const payload = {
+    tenant_id: tenantId,
+    job_title: String(job.job_title ?? "").trim(),
+    category_id: categories.get(job.job_category?.category_uid) ?? null,
+    customer_id: customers.get(job.customer?.customer_uid) ?? null,
+    organization_id: organizations.get(job.customer?.customer_organization?.organization_uid) ?? null,
+    service_address: address(r.customer_address),
+    billing_address: address(r.customer_billing_address),
+    rrule: String(r.rrule),
+    repeat_frequency: r.repeat_frequency ?? null,
+    repeat_every: Number(r.repeat_every) || 1,
+    repeat_on: r.repeat_on ?? {},
+    duration: r.duration ?? null,
+    job_start: r.job_start ?? null,
+    job_end: r.job_end ?? null,
+    job_duration_minutes: null,
+    job_count: Number(r.job_count) || 0,
+    time_zone: job.job_timezone ?? null,
+    is_deleted: r.is_deleted === true,
+    created_by: null,
+    ...(r.created_at ? { created_at: r.created_at } : {}),
+  };
+  const { data, error } = await client.schema("jms").from("recurring_jobs").insert(payload).select("id").single();
+  if (error) throw error;
+  const id = (data as { id: string }).id;
+  const { error: mErr } = await client.schema("jms").from("zuper_sync_map").upsert(
+    { tenant_id: tenantId, entity: "recurring_jobs", zuper_uid: uid, jms_id: id, synced_at: new Date().toISOString() },
+    { onConflict: "tenant_id,entity,zuper_uid" });
+  if (mErr) throw mErr;
+  mine.set(uid, id);
+  madeRepeats++;
+  return id;
+}
+let madeRepeats = 0;
+
 // It walks every unlinked job once, newest first, by a created_at cursor. An earlier version took "the newest 1,000
 // unlinked" each run; a job it couldn't link stayed unlinked, so once those 1,000 were all unlinkable every run read
 // the same 1,000 again and never reached the rest.
@@ -100,7 +142,10 @@ if (process.argv.includes("--link")) {
       if (!res) { gone++; continue; }
       const repeatUid = res.data?.recurring_job?.recurring_job_uid;
       if (!repeatUid) { none++; continue; }
-      const repeatId = mine.get(repeatUid);
+      let repeatId = mine.get(repeatUid);
+      // Zuper's repeat list leaves some live repeats out (862 of GBG's, found 2026-09-18), but every job carries its
+      // repeat whole, so a missing one is made from the job that names it.
+      if (!repeatId && apply) repeatId = await repeatFromJob(res.data);
       if (!repeatId) { missingRepeats.set(repeatUid, (missingRepeats.get(repeatUid) ?? 0) + 1); continue; }
       if (apply) {
         const { error } = await client.schema("jms").from("jobs")
@@ -115,7 +160,7 @@ if (process.argv.includes("--link")) {
 
   const waiting = Array.from(missingRepeats.values()).reduce((a, b) => a + b, 0);
   console.log(`\n${seen} unlinked recurring jobs read${apply ? "" : " (dry run)"}`);
-  console.log(`  ${linked} pointed at their repeat`);
+  console.log(`  ${linked} pointed at their repeat, ${madeRepeats} of those repeats made from the job because Zuper's list left them out`);
   console.log(`  ${none} turned out not to come from one`);
   console.log(`  ${waiting} come from ${missingRepeats.size} repeats Tuper hasn't imported`);
   console.log(`  ${unmapped} have no Zuper record in the sync map`);
