@@ -23,7 +23,8 @@
     "check-real-payload": "tsx src/cli/check-real-payload.ts",
     "sweep": "tsx src/cli/sweep.ts",
     "outbox": "tsx src/cli/outbox.ts",
-    "check-push": "tsx src/cli/check-push.ts"
+    "check-push": "tsx src/cli/check-push.ts",
+    "compare": "tsx src/cli/compare.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
