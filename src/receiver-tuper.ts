@@ -17,6 +17,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { config, errorText } from "./config.js";
 import { one, sql } from "./store.js";
 import { tuper } from "./tuper-client.js";
+import { withCause } from "./api-log.js";
 
 export const tuperReceiver = Router();
 
@@ -102,22 +103,33 @@ tuperReceiver.post("/", async (req: Request, res: Response) => {
   // Acknowledge first: queuing must never make Tuper record the delivery as failed.
   res.status(200).json({ ok: true, stored });
 
-  if (!v.verified || !event || !uid) return;
+  // Refused: stored for the record and never acted on, as with Zuper's.
+  if (!v.verified) return;
+  // Every verified delivery ends with an outcome. One left open would read as "waiting" for ever, and nothing
+  // replays a Tuper delivery.
+  if (!event) { await finish(stored, "the delivery names no event"); return; }
   const rule = EVENTS[event];
-  if (!rule) {
-    await finish(stored, `no rule for ${event}`);
+  if (!rule) { await finish(stored, `skipped: Zupersync does not push ${event} to Zuper`); return; }
+  if (!uid) {
+    // Seen on 2026-09-17: Tuper builds job.new, job.update, job.delete and customer.* bodies from the webhook's
+    // module, and leaves the uid out when that module is not one it knows (registered as JOBS instead of JOB).
+    const key = event.startsWith("job.") ? "job_uid" : "customer_uid";
+    await finish(stored, `Tuper sent ${event} without ${key}, so there is no record to queue. ` +
+      `Tuper leaves it out when the webhook's module is not one it knows: it must be ${key === "job_uid" ? "JOB" : "CUSTOMER"}.`);
     return;
   }
   try {
     const queued = rule(body);
-    if (!queued) { await finish(stored, `nothing to do for ${event}`); return; }
-    const { jmsId, zuperUid } = await identify(uid, queued.entity);
-    await sql(
-      `INSERT INTO sync.outbox (tenant_id, entity, jms_id, zuper_uid, operation, changed, origin, actor_id, event_id)
-       VALUES ($1, $2, $3, $4, $5, $6, 'app', $7, $8)`,
-      [config.tenantId, queued.entity, jmsId, zuperUid, queued.operation, JSON.stringify(queued.changed),
-       body.triggered_by?.user_uid ?? null, stored],
-    );
+    if (!queued) { await finish(stored, `skipped: nothing to queue for ${event}`); return; }
+    await withCause({ origin: "tuper-webhook", eventId: stored }, async () => {
+      const { jmsId, zuperUid } = await identify(uid, queued.entity);
+      await sql(
+        `INSERT INTO sync.outbox (tenant_id, entity, jms_id, zuper_uid, operation, changed, origin, actor_id, event_id)
+         VALUES ($1, $2, $3, $4, $5, $6, 'app', $7, $8)`,
+        [config.tenantId, queued.entity, jmsId, zuperUid, queued.operation, JSON.stringify(queued.changed),
+         body.triggered_by?.user_uid ?? null, stored],
+      );
+    });
     await finish(stored, null);
   } catch (err) {
     await finish(stored, errorText(err));
