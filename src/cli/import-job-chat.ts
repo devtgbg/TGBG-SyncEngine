@@ -65,13 +65,34 @@ const users = new Map<string, string>();
 
 let round = 0, asked = 0, found = 0, written = 0;
 const seen = await alreadyAsked();
+
+/** Every message on a job, a hundred a page. */
+async function messagesOf(uid: string): Promise<any[]> {
+  const out: any[] = [];
+  for (let page = 1; page <= 50; page++) {
+    const answer = await zuper(`/api/messaging/message?job_uid=${uid}&limit=100&page=${page}`);
+    const rows: any[] = answer?.data ?? [];
+    out.push(...rows);
+    if (rows.length < 100) break;
+  }
+  return out;
+}
+
+// Every job once, newest first, by a created_at cursor. The first version took "the newest 1,000 jobs" each round,
+// so once those had been asked it found nothing new and stopped: 988 of GBG's ~47,000 jobs were ever asked.
+let cursor: string | null = null;
 while (true) {
   round++;
-  const { data: rows, error } = await client.schema("jms").from("jobs")
-    .select("id").eq("tenant_id", tenantId).is("deleted_at", null)
-    .order("created_at", { ascending: false }).limit(LIMIT + seen.size > 1000 ? 1000 : LIMIT);
+  let q = client.schema("jms").from("jobs")
+    .select("id, created_at").eq("tenant_id", tenantId).is("deleted_at", null)
+    .order("created_at", { ascending: false }).limit(1000);
+  if (cursor) q = q.lt("created_at", cursor);
+  const { data: rows, error } = await q;
   if (error) throw error;
-  const jobIds = ((rows ?? []) as any[]).map((r) => r.id as string);
+  const page = (rows ?? []) as any[];
+  if (!page.length) { console.log("every job has been asked"); break; }
+  cursor = page[page.length - 1].created_at as string;
+  const jobIds = page.map((r) => r.id as string);
 
   // each job's Zuper uid, 60 at a time
   const uidOf = new Map<string, string>();
@@ -81,15 +102,13 @@ while (true) {
     for (const r of (m ?? []) as any[]) uidOf.set(r.jms_id, r.zuper_uid);
   }
 
-  const todo = jobIds.filter((id) => uidOf.get(id) && !seen.has(uidOf.get(id)!)).slice(0, LIMIT);
-  if (!todo.length) { console.log("nothing left to ask about"); break; }
-
+  const todo = jobIds.filter((id) => uidOf.get(id) && !seen.has(uidOf.get(id)!));
   for (const jobId of todo) {
+    if (!all && asked >= LIMIT) break;
     const uid = uidOf.get(jobId)!;
     asked++;
     seen.add(uid);
-    const answer = await zuper(`/api/messaging/message?job_uid=${uid}&limit=100&page=1`);
-    const messages: any[] = answer?.data ?? [];
+    const messages = await messagesOf(uid);
     if (apply) {
       await client.schema("jms").from("zuper_sync_map").upsert(
         { tenant_id: tenantId, entity: "job_chat_asked", zuper_uid: uid, jms_id: jobId, synced_at: new Date().toISOString() },
@@ -105,13 +124,18 @@ while (true) {
 
     const fresh = messages
       .filter((m) => m.message_uid && !known.has(m.message_uid))
-      .map((m) => ({
-        tenant_id: tenantId, entity_type: "job_chat", entity_id: jobId,
-        author_id: users.get(m.sender?.user_uid) ?? null,
-        body: String(m.message ?? "").trim() || (m.attachement_url ? "(file)" : ""),
-        created_at: m.created_at ?? new Date().toISOString(),
-        zuper_uid: m.message_uid,
-      }))
+      .map((m) => {
+        // A file sent in the chat keeps its link, under the words if there are any: it was "(file)" alone before.
+        const text = String(m.message ?? "").trim();
+        const file = typeof m.attachement_url === "string" && m.attachement_url ? m.attachement_url : "";
+        return {
+          tenant_id: tenantId, entity_type: "job_chat", entity_id: jobId,
+          author_id: users.get(m.sender?.user_uid) ?? null,
+          body: [text, file].filter(Boolean).join("\n"),
+          created_at: m.created_at ?? new Date().toISOString(),
+          zuper_uid: m.message_uid,
+        };
+      })
       .filter((r) => r.body);
     if (!fresh.length) continue;
     if (apply) {
@@ -122,6 +146,6 @@ while (true) {
     console.log(`  job ${jobId.slice(0, 8)}: ${fresh.length} message(s)`);
   }
   console.log(`round ${round}: asked about ${asked} jobs, ${found} found, ${written} written${apply ? "" : " (dry run)"}`);
-  if (!all || !apply) break;
+  if (!all && asked >= LIMIT) break;
 }
 console.log(`\ndone: asked about ${asked} jobs, ${found} messages found, ${written} written`);
