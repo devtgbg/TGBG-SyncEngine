@@ -13,6 +13,9 @@ import { config } from "../config.js";
 const apply = process.argv.includes("--apply");
 const limitAt = process.argv.indexOf("--limit");
 const LIMIT = limitAt > 0 ? Number(process.argv[limitAt + 1]) || 200 : 200;
+// --all keeps going, a batch at a time, until no job is left without one. The server caps a batch at 1,000
+// rows however large --limit is, so without this a full run means starting it thirty-odd times by hand.
+const ALL = process.argv.includes("--all");
 const client = db();
 const tenantId = config.tenantId;
 
@@ -34,6 +37,9 @@ async function zuperJob(uid: string): Promise<any | null> {
   return null;
 }
 
+let round = 0, totalFilled = 0, totalPlain = 0, totalMissing = 0;
+while (true) {
+round++;
 // the jobs still without one, oldest first so a run picks up where the last left off
 const { data: rows, error } = await client.schema("jms").from("jobs")
   .select("id, title").eq("tenant_id", tenantId).is("deleted_at", null).is("description_html", null)
@@ -70,4 +76,9 @@ for (const j of jobs) {
   filled++;
   if (filled % 25 === 0) console.log(`  ${filled} filled in so far`);
 }
-console.log(`\n${filled} given their formatting back, ${plain} were plain in Zuper too, ${missing} had nothing to take`);
+totalFilled += filled; totalPlain += plain; totalMissing += missing;
+console.log(`round ${round}: ${filled} given their formatting back, ${plain} were plain in Zuper too, ${missing} had nothing to take`);
+// Stop when there is nothing left, when a round changed nothing (the next would only repeat it), or on a dry run.
+if (!ALL || !jobs.length || !apply || filled + plain === 0) break;
+}
+console.log(`\ndone: ${totalFilled} given their formatting back over ${round} round(s), ${totalPlain} were plain in Zuper too, ${totalMissing} had nothing to take`);
