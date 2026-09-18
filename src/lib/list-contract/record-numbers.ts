@@ -38,11 +38,36 @@ export async function releaseNumber(
     .eq("tenant_id", tenantId).eq("entity", s.syncEntity).eq("jms_id", holder).limit(1).maybeSingle();
   if (mapError) throw mapError;
   if (imported) return null;
-  const { data: to, error: moveError } = await client.schema("jms").rpc(s.renumber, { p_tenant: tenantId, p_id: holder });
-  if (moveError) throw moveError;
+  const to = await moveToNext(client, tenantId, s, holder);
   if (s.activity) {
     const { logActivity } = await import("./threads");
     await logActivity(client, tenantId, s.activity, holder, null, "renumbered", { from: String(value), to: String(to), reason: "a record from Zuper with this number was imported" });
   }
   return { id: holder, from: String(value), to: String(to) };
+}
+
+/** Tuper's sync API names the functions a sync key may call; this is its answer for one it does not name. */
+const NOT_ALLOWED = /is not a function the sync service may call/;
+
+/**
+ * Give the record the next number: jms.renumber_* does it in one call. Tuper's sync API refuses renumber_job and
+ * renumber_request (its list names renumber_jobs and renumber_requests, seen 2026-09-18), which left every job Zuper
+ * numbered after a Tuper-made one out of Tuper. renumber_* is exactly next_* then an update of the number (migration
+ * 00076), and a sync key may call next_* and update the record, so on that refusal this does the two itself. The number
+ * is decided under next_*'s lock; a record made in Tuper between the two calls could take it first, which the unique
+ * index refuses — then it asks again.
+ */
+async function moveToNext(client: SupabaseClient, tenantId: string, s: (typeof SPEC)[NumberedKind], holder: string): Promise<string> {
+  const { data, error } = await client.schema("jms").rpc(s.renumber, { p_tenant: tenantId, p_id: holder });
+  if (!error) return String(data);
+  if (!NOT_ALLOWED.test(error.message)) throw error;
+  for (let attempt = 1; ; attempt++) {
+    const next = await client.schema("jms").rpc(s.next, { p_tenant: tenantId });
+    if (next.error) throw next.error;
+    const to = String(next.data);
+    const { error: moveError } = await client.schema("jms").from(s.table)
+      .update({ [s.column]: s.column === "product_no" ? Number(to) : to }).eq("tenant_id", tenantId).eq("id", holder);
+    if (!moveError) return to;
+    if (moveError.code !== "23505" || attempt >= 3) throw moveError;
+  }
 }
