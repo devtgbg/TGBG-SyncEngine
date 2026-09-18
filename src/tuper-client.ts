@@ -46,13 +46,21 @@ async function post(path: string, body: unknown, opts: { quiet?: boolean } = {})
     if (!opts.quiet) logCall({ system: "tuper", method: "POST", path, action: actionOf(path, body), status, ok, started, error, request: body, response });
   };
   try {
-    const res = await fetch(`${config.tuper.url}${path}`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-api-key": config.tuper.apiKey },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
-    const text = await res.text();
+    // An HTML page instead of an answer means the request never reached Tuper's API: a proxy's 502 while Tuper
+    // redeploys, or the dev server's error page while it recompiles. Nothing was done, so it is safe to ask again —
+    // a few times, waiting longer each time — where giving up would end a long import half way.
+    let res: Response, text: string;
+    for (let attempt = 1; ; attempt++) {
+      res = await fetch(`${config.tuper.url}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": config.tuper.apiKey },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+      text = await res.text();
+      if (!/^\s*<(!doctype|html)/i.test(text) || attempt >= 5) break;
+      await new Promise((r) => setTimeout(r, 2000 * 2 ** (attempt - 1)));
+    }
     let parsed: any = null;
     try { parsed = text ? JSON.parse(text) : null; } catch { /* not json */ }
     // A select that finds nothing answers 404. For a `maybe` query that is the expected answer, not a failure, and the
