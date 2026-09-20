@@ -1,842 +1,980 @@
 {
- "_source": "GET /api/misc/{MODULE}/events on eks-ap-south-1.zuperpro.com — the endpoint Zuper's own New Webhook form calls",
- "_captured": "2026-09-17",
- "modules": {
-  "JOB": [
-   [
-    "job.new",
-    "New Job"
-   ],
-   [
-    "job.update",
-    "Update Job"
-   ],
-   [
-    "job.schedule",
-    "Schedule Job"
-   ],
-   [
-    "job.update_schedule",
-    "Reschedule Job"
-   ],
-   [
-    "job.assign_users",
-    "Assign Users"
-   ],
-   [
-    "job.unassign_users",
-    "Unassign Users"
-   ],
-   [
-    "job.assign_teams",
-    "Assign Teams"
-   ],
-   [
-    "job.unassign_teams",
-    "Unassign Teams"
-   ],
-   [
-    "job.update_acceptance",
-    "Job Accept / Reject"
-   ],
-   [
-    "job.status_update",
-    "Status Update"
-   ],
-   [
-    "job.status_rollback",
-    "Status Rollback"
-   ],
-   [
-    "job.status_delete",
-    "Status Delete"
-   ],
-   [
-    "job.feedback",
-    "Job Feedback"
-   ],
-   [
-    "job.new_note",
-    "New Note"
-   ],
-   [
-    "job.update_note",
-    "Update Note"
-   ],
-   [
-    "job.delete_note",
-    "Delete Note"
-   ],
-   [
-    "job.delete",
-    "Delete Job"
-   ],
-   [
-    "job.bulk_action",
-    "Job Bulk Action"
-   ],
-   [
-    "job.update_checklist",
-    "Update Job Checklist"
-   ],
-   [
-    "job.recurring_update",
-    "Update Recurring Job"
-   ],
-   [
-    "job.update_recurrence",
-    "Update Recurring Job Rule"
-   ],
-   [
-    "job.new_recurrence",
-    "New Recurring Job"
-   ],
-   [
-    "job.delete_recurrence",
-    "Delete Recurring Job"
-   ],
-   [
-    "job.status_alert",
-    "Status Alert"
-   ],
-   [
-    "job.timelog_update",
-    "Update Job Timelog"
-   ],
-   [
-    "job.timelog",
-    "Create Job Timelog"
-   ],
-   [
-    "job.product_update",
-    "Update Job Product"
-   ],
-   [
-    "job.new_attachment",
-    "New Job Attachment"
-   ],
-   [
-    "job.delete_attachment",
-    "Delete Job Attachment"
-   ],
-   [
-    "job.update_attachment",
-    "Update Job Attachment"
-   ],
-   [
-    "job.new_message",
-    "New Job Message"
-   ],
-   [
-    "measurement.new",
-    "New Measurement"
-   ],
-   [
-    "measurement.update",
-    "Measurement Updated"
-   ],
-   [
-    "measurement.status_update",
-    "Measurement Status Updated"
-   ],
-   [
-    "measurement.delete",
-    "Measurement Deleted"
-   ]
-  ],
-  "CUSTOMER": [
-   [
-    "customer.create",
-    "New Customer"
-   ],
-   [
-    "customer.update",
-    "Customer Update"
-   ],
-   [
-    "customer.deactivate",
-    "Customer Deactivate"
-   ],
-   [
-    "customer.activate",
-    "Customer Activate"
-   ],
-   [
-    "customer.accounts_update",
-    "Customer Accounts Update"
-   ],
-   [
-    "customer.update_technician",
-    "Favourite Technician Update"
-   ],
-   [
-    "customer.new_note",
-    "New Note"
-   ],
-   [
-    "customer.update_note",
-    "Update Note"
-   ],
-   [
-    "customer.delete_note",
-    "Delete Note"
-   ],
-   [
-    "customer.add_card",
-    "New Customer Card"
-   ],
-   [
-    "customer.delete_card",
-    "Remove Customer Card"
-   ],
-   [
-    "customer.new_attachment",
-    "New Customer Attachment"
-   ],
-   [
-    "customer.delete_attachment",
-    "Delete Customer Attachment"
-   ],
-   [
-    "customer.update_attachment",
-    "Update Customer Attachment"
-   ],
-   [
-    "customer.bulk_action",
-    "Customer Bulk Action"
-   ]
-  ],
-  "ORGANIZATION": [
-   [
-    "organization.new",
-    "New Organization"
-   ],
-   [
-    "organization.update",
-    "Organization Update"
-   ],
-   [
-    "organization.delete",
-    "Organization Delete"
-   ],
-   [
-    "organization.bulk_action",
-    "Organization Bulk Action"
-   ],
-   [
-    "organization.assign_users",
-    "Assign Users"
-   ],
-   [
-    "organization.unassign_users",
-    "Unassign Users"
-   ],
-   [
-    "organization.new_attachment",
-    "New Organization Attachment"
-   ],
-   [
-    "organization.update_attachment",
-    "Update Organization Attachment"
-   ],
-   [
-    "organization.delete_attachment",
-    "Delete Organization Attachment"
-   ],
-   [
-    "import.organization",
-    "Import Organization"
-   ]
-  ],
-  "PROPERTY": [
-   [
-    "property.new",
-    "New Property"
-   ],
-   [
-    "property.update",
-    "Update Property"
-   ],
-   [
-    "property.activate",
-    "Property Activate"
-   ],
-   [
-    "property.deactivate",
-    "Property Deactivate"
-   ],
-   [
-    "property.delete",
-    "Property Delete"
-   ],
-   [
-    "property.bulk_action",
-    "Property Bulk Action"
-   ],
-   [
-    "property.assign_users",
-    "Assign Users"
-   ],
-   [
-    "property.unassign_users",
-    "Unassign Users"
-   ],
-   [
-    "property.new_attachment",
-    "New Property Attachment"
-   ],
-   [
-    "property.update_attachment",
-    "Update Property Attachment"
-   ],
-   [
-    "property.delete_attachment",
-    "Delete Property Attachment"
-   ]
-  ],
-  "TIMESHEET": [
-   [
-    "timesheet_approval.new",
-    "New Timesheet Approval"
-   ],
-   [
-    "timesheet_approval.update",
-    "Update Timesheet Approval"
-   ],
-   [
-    "timesheet_approval.delete",
-    "Delete Timesheet approval"
-   ],
-   [
-    "timesheet_approval.status_update",
-    "Timesheet Approval Status Update"
-   ],
-   [
-    "timesheet.update",
-    "Timesheet Update"
-   ],
-   [
-    "timesheet.delete",
-    "Timesheet Delete"
-   ],
-   [
-    "timesheet.new_location",
-    "Timesheet New Location"
-   ],
-   [
-    "timesheet.edit_location",
-    "Timesheet Edit Location"
-   ],
-   [
-    "timesheet.delete_location",
-    "Timesheet Delete Location"
-   ],
-   [
-    "timesheet.new_timeoff",
-    "New Timeoff"
-   ],
-   [
-    "timesheet.approve_timeoff",
-    "Approve Timeoff"
-   ],
-   [
-    "timesheet.reject_timeoff",
-    "Reject Timeoff"
-   ],
-   [
-    "timesheet.update_timeoff",
-    "Update Timeoff"
-   ],
-   [
-    "timesheet.delete_timeoff",
-    "Delete Timeoff"
-   ],
-   [
-    "timesheet.user_shift_create",
-    "New User Shift"
-   ],
-   [
-    "timesheet.user_shift_delete",
-    "Delete User Shift"
-   ],
-   [
-    "timesheet.new_timeoff_availability",
-    "New Timeoff Availability"
-   ],
-   [
-    "timesheet.edit_timeoff_availability",
-    "Edit Timeoff Availability"
-   ],
-   [
-    "timesheet.delete_timeoff_availability",
-    "Delete Timeoff Availability"
-   ],
-   [
-    "timesheet.new_timeoff_type",
-    "New Timeoff Type"
-   ],
-   [
-    "timesheet.edit_timeoff_type",
-    "Edit Timeoff Type"
-   ],
-   [
-    "timesheet.delete_timeoff_type",
-    "Delete Timeoff Type"
-   ],
-   [
-    "timesheet.employee_location_create",
-    "New Timesheet Location"
-   ],
-   [
-    "timesheet.employee_location_delete",
-    "Delete Timesheet Location"
-   ],
-   [
-    "timesheet.day_activity",
-    "Timesheet Day Activity"
-   ],
-   [
-    "timesheet.check_in",
-    "Timesheet Check In"
-   ],
-   [
-    "timesheet.check_out",
-    "Timesheet Check Out"
-   ],
-   [
-    "timesheet.break",
-    "Timesheet Break"
-   ],
-   [
-    "timesheet.resume_work",
-    "Timesheet Resume Work"
-   ],
-   [
-    "timesheet.master_shift_create",
-    "Timesheet Master Shift Create"
-   ],
-   [
-    "timesheet.master_shift_update",
-    "Timesheet Master Shift Updating"
-   ],
-   [
-    "timesheet.master_shift_delete",
-    "Timesheet Master Shift Delete"
-   ],
-   [
-    "timesheet.bulk_check_in",
-    "Timesheet Bulk Check In"
-   ],
-   [
-    "timesheet.bulk_check_out",
-    "Timesheet Bulk Check Out"
-   ],
-   [
-    "timesheet.bulk_resume_work",
-    "Timesheet Bulk Resume Work"
-   ],
-   [
-    "timesheet.bulk_break",
-    "Timesheet Bulk Break"
-   ]
-  ],
-  "PRODUCTS": [
-   [
-    "product.new",
-    "New Product"
-   ],
-   [
-    "product.update",
-    "Product Update"
-   ],
-   [
-    "product.delete",
-    "Product Delete"
-   ],
-   [
-    "product.location_new",
-    "New Product Location"
-   ],
-   [
-    "product.location_update",
-    "Product Location Update"
-   ],
-   [
-    "product.location_delete",
-    "Product Location Delete"
-   ],
-   [
-    "product.transcation_inward",
-    "Product Transaction Inward"
-   ],
-   [
-    "product.transcation_outward",
-    "Product Transaction Outward"
-   ],
-   [
-    "product.transcation_transfer",
-    "Product Transaction Transfer"
-   ],
-   [
-    "product.consumption",
-    "Product Consumption"
-   ],
-   [
-    "product.update_stock",
-    "Update Product Stock"
-   ],
-   [
-    "product.bulk_action",
-    "Product Bulk Action"
-   ]
-  ],
-  "ESTIMATES": [
-   [
-    "estimate.new",
-    "New Quote"
-   ],
-   [
-    "estimate.update",
-    "Quote Update"
-   ],
-   [
-    "estimate.status_update",
-    "Quote Status Update"
-   ],
-   [
-    "estimate.deposit",
-    "Quote Deposit Payment"
-   ],
-   [
-    "estimate.print",
-    "Print Quote"
-   ],
-   [
-    "estimate.send",
-    "Send Quote"
-   ],
-   [
-    "estimate.new_note",
-    "Quote New Note"
-   ],
-   [
-    "estimate.new_attachment",
-    "Quote New Attachment"
-   ],
-   [
-    "estimate.delete_attachment",
-    "Quote Delete Attachment"
-   ],
-   [
-    "estimate.delete_note",
-    "Quote Delete Note"
-   ],
-   [
-    "estimate.delete",
-    "Quote Delete"
-   ],
-   [
-    "estimate.bulk_action",
-    "Quote Bulk Action"
-   ],
-   [
-    "estimate.recover",
-    "Quote Recover"
-   ]
-  ],
-  "INVOICE": [
-   [
-    "invoice.new",
-    "New Invoice"
-   ],
-   [
-    "invoice.update",
-    "Invoice Update"
-   ],
-   [
-    "invoice.status_update",
-    "Invoice Status Update"
-   ],
-   [
-    "invoice.payment",
-    "Invoice Payment"
-   ],
-   [
-    "invoice.print",
-    "Print Invoice"
-   ],
-   [
-    "invoice.send",
-    "Send Invoice"
-   ],
-   [
-    "invoice.new_note",
-    "Invoice New Note"
-   ],
-   [
-    "invoice.new_attachment",
-    "Invoice Attachment"
-   ],
-   [
-    "invoice.delete_attachment",
-    "Invoice Delete Attachment"
-   ],
-   [
-    "invoice.delete_note",
-    "Invoice Delete Note"
-   ],
-   [
-    "invoice.delete",
-    "Invoice Delete"
-   ],
-   [
-    "invoice.bulk_action",
-    "Invoice Bulk Action"
-   ],
-   [
-    "invoice.payment_mode_create",
-    "Invoice New Payment Mode"
-   ],
-   [
-    "invoice.payment_mode_update",
-    "Invoice Update Payment Mode"
-   ],
-   [
-    "invoice.payment_mode_delete",
-    "Invoice Delete Payment Mode"
-   ],
-   [
-    "invoice.payment_term_create",
-    "Invoice New Payment Term"
-   ],
-   [
-    "invoice.payment_term_update",
-    "Invoice Update Payment Term"
-   ],
-   [
-    "invoice.payment_term_delete",
-    "Invoice Delete Payment Term"
-   ],
-   [
-    "invoice.update_note",
-    "Invoice Update Note"
-   ]
-  ],
-  "SERVICE_CONTRACTS": [
-   [
-    "service_contract.new",
-    "New Service Contract"
-   ],
-   [
-    "service_contract.update",
-    "Service Contract Update"
-   ],
-   [
-    "service_contract.delete",
-    "Service Contract Delete"
-   ],
-   [
-    "service_contract.status_update",
-    "Service Contract Status Update"
-   ],
-   [
-    "service_contract.renew",
-    "Service Contract Renewal"
-   ],
-   [
-    "service_contract.new_note",
-    "Service Contract New Note"
-   ],
-   [
-    "service_contract.delete_note",
-    "Service Contract Delete Note"
-   ],
-   [
-    "service_contract.update_note",
-    "Service Contract Update Note"
-   ],
-   [
-    "service_contract.bulk_action",
-    "Service Contract Bulk Action"
-   ],
-   [
-    "service_contract.activate",
-    "Service Contract Activate"
-   ],
-   [
-    "service_contract.deactivate",
-    "Service Contract Deactivate"
-   ]
-  ],
-  "ASSETS": [
-   [
-    "asset.new",
-    "New Asset"
-   ],
-   [
-    "asset.update",
-    "Asset Update"
-   ],
-   [
-    "asset.delete",
-    "Asset Delete"
-   ],
-   [
-    "asset.activate",
-    "Asset activate"
-   ],
-   [
-    "asset.deactivate",
-    "Asset Deactivate"
-   ],
-   [
-    "asset.new_attachment",
-    "New Asset Attachment"
-   ],
-   [
-    "asset.delete_attachment",
-    "Delete Aseet Attachment"
-   ],
-   [
-    "asset.update_attachment",
-    "Update Aseet Attachment"
-   ],
-   [
-    "asset.bulk_action",
-    "Asset Bulk Action"
-   ],
-   [
-    "asset.status_update",
-    "Asset Status Update"
-   ],
-   [
-    "asset.history",
-    "Asset History"
-   ],
-   [
-    "asset.recover",
-    "Asset Recover"
-   ],
-   [
-    "asset.new_note",
-    "Asset New Note"
-   ],
-   [
-    "asset.update_note",
-    "Asset Update Note"
-   ],
-   [
-    "asset.delete_note",
-    "Asset Delete Note"
-   ],
-   [
-    "inspection_form.submit",
-    "Inspection Form Submission"
-   ],
-   [
-    "inspection_form.update",
-    "Inspection Form Update"
-   ]
-  ],
-  "USER": [
-   [
-    "user.resource_create",
-    "New User Resource"
-   ],
-   [
-    "user.resource_delete",
-    "User Resource Delete"
-   ],
-   [
-    "user.resource_edit",
-    "User Resource Update"
-   ],
-   [
-    "user.trigger_sos",
-    "User Sos Trigger"
-   ],
-   [
-    "user.activate",
-    "User Activate"
-   ],
-   [
-    "user.deactivate",
-    "User Deactivate"
-   ],
-   [
-    "user.delete",
-    "User Delete"
-   ],
-   [
-    "user.new",
-    "New User"
-   ],
-   [
-    "user.update",
-    "User Update"
-   ],
-   [
-    "user.work_hours_update",
-    "User Work Hours Update"
-   ],
-   [
-    "user.login",
-    "User Login"
-   ],
-   [
-    "user.recover",
-    "User Recover"
-   ],
-   [
-    "user.add_skill",
-    "User New Skill"
-   ],
-   [
-    "user.remove_skill",
-    "User Delete Skill"
-   ],
-   [
-    "user.update_skill",
-    "User Update Skill"
-   ],
-   [
-    "user.preference_edit",
-    "User Preference Update"
-   ]
-  ],
-  "REQUEST": [
-   [
-    "request.new",
-    "New Request"
-   ],
-   [
-    "request.update",
-    "Update Request"
-   ],
-   [
-    "request.status_update",
-    "Update request status"
-   ],
-   [
-    "request.status_rollback",
-    "Status Rollback"
-   ],
-   [
-    "request.assign_users",
-    "Assign Users"
-   ],
-   [
-    "request.unassign_users",
-    "Unassign Users"
-   ],
-   [
-    "request.new_note",
-    "New Note"
-   ],
-   [
-    "request.delete",
-    "Delete Request"
-   ]
-  ]
- }
+  "_source": "GET /api/misc/{MODULE}/events on eks-ap-south-1.zuperpro.com - the endpoint Zuper's own New Webhook form calls. The 2026-09-17 capture walked a module list from /api/misc/modules, which now 404s and had never included these three; they were asked for by name on 2026-09-21 and answer 200.",
+  "_captured": "2026-09-17 (12 modules); 2026-09-21 (TEAM, PROJECT, PURCHASE_ORDER)",
+  "modules": {
+    "JOB": [
+      [
+        "job.new",
+        "New Job"
+      ],
+      [
+        "job.update",
+        "Update Job"
+      ],
+      [
+        "job.schedule",
+        "Schedule Job"
+      ],
+      [
+        "job.update_schedule",
+        "Reschedule Job"
+      ],
+      [
+        "job.assign_users",
+        "Assign Users"
+      ],
+      [
+        "job.unassign_users",
+        "Unassign Users"
+      ],
+      [
+        "job.assign_teams",
+        "Assign Teams"
+      ],
+      [
+        "job.unassign_teams",
+        "Unassign Teams"
+      ],
+      [
+        "job.update_acceptance",
+        "Job Accept / Reject"
+      ],
+      [
+        "job.status_update",
+        "Status Update"
+      ],
+      [
+        "job.status_rollback",
+        "Status Rollback"
+      ],
+      [
+        "job.status_delete",
+        "Status Delete"
+      ],
+      [
+        "job.feedback",
+        "Job Feedback"
+      ],
+      [
+        "job.new_note",
+        "New Note"
+      ],
+      [
+        "job.update_note",
+        "Update Note"
+      ],
+      [
+        "job.delete_note",
+        "Delete Note"
+      ],
+      [
+        "job.delete",
+        "Delete Job"
+      ],
+      [
+        "job.bulk_action",
+        "Job Bulk Action"
+      ],
+      [
+        "job.update_checklist",
+        "Update Job Checklist"
+      ],
+      [
+        "job.recurring_update",
+        "Update Recurring Job"
+      ],
+      [
+        "job.update_recurrence",
+        "Update Recurring Job Rule"
+      ],
+      [
+        "job.new_recurrence",
+        "New Recurring Job"
+      ],
+      [
+        "job.delete_recurrence",
+        "Delete Recurring Job"
+      ],
+      [
+        "job.status_alert",
+        "Status Alert"
+      ],
+      [
+        "job.timelog_update",
+        "Update Job Timelog"
+      ],
+      [
+        "job.timelog",
+        "Create Job Timelog"
+      ],
+      [
+        "job.product_update",
+        "Update Job Product"
+      ],
+      [
+        "job.new_attachment",
+        "New Job Attachment"
+      ],
+      [
+        "job.delete_attachment",
+        "Delete Job Attachment"
+      ],
+      [
+        "job.update_attachment",
+        "Update Job Attachment"
+      ],
+      [
+        "job.new_message",
+        "New Job Message"
+      ],
+      [
+        "measurement.new",
+        "New Measurement"
+      ],
+      [
+        "measurement.update",
+        "Measurement Updated"
+      ],
+      [
+        "measurement.status_update",
+        "Measurement Status Updated"
+      ],
+      [
+        "measurement.delete",
+        "Measurement Deleted"
+      ]
+    ],
+    "CUSTOMER": [
+      [
+        "customer.create",
+        "New Customer"
+      ],
+      [
+        "customer.update",
+        "Customer Update"
+      ],
+      [
+        "customer.deactivate",
+        "Customer Deactivate"
+      ],
+      [
+        "customer.activate",
+        "Customer Activate"
+      ],
+      [
+        "customer.accounts_update",
+        "Customer Accounts Update"
+      ],
+      [
+        "customer.update_technician",
+        "Favourite Technician Update"
+      ],
+      [
+        "customer.new_note",
+        "New Note"
+      ],
+      [
+        "customer.update_note",
+        "Update Note"
+      ],
+      [
+        "customer.delete_note",
+        "Delete Note"
+      ],
+      [
+        "customer.add_card",
+        "New Customer Card"
+      ],
+      [
+        "customer.delete_card",
+        "Remove Customer Card"
+      ],
+      [
+        "customer.new_attachment",
+        "New Customer Attachment"
+      ],
+      [
+        "customer.delete_attachment",
+        "Delete Customer Attachment"
+      ],
+      [
+        "customer.update_attachment",
+        "Update Customer Attachment"
+      ],
+      [
+        "customer.bulk_action",
+        "Customer Bulk Action"
+      ]
+    ],
+    "ORGANIZATION": [
+      [
+        "organization.new",
+        "New Organization"
+      ],
+      [
+        "organization.update",
+        "Organization Update"
+      ],
+      [
+        "organization.delete",
+        "Organization Delete"
+      ],
+      [
+        "organization.bulk_action",
+        "Organization Bulk Action"
+      ],
+      [
+        "organization.assign_users",
+        "Assign Users"
+      ],
+      [
+        "organization.unassign_users",
+        "Unassign Users"
+      ],
+      [
+        "organization.new_attachment",
+        "New Organization Attachment"
+      ],
+      [
+        "organization.update_attachment",
+        "Update Organization Attachment"
+      ],
+      [
+        "organization.delete_attachment",
+        "Delete Organization Attachment"
+      ],
+      [
+        "import.organization",
+        "Import Organization"
+      ]
+    ],
+    "PROPERTY": [
+      [
+        "property.new",
+        "New Property"
+      ],
+      [
+        "property.update",
+        "Update Property"
+      ],
+      [
+        "property.activate",
+        "Property Activate"
+      ],
+      [
+        "property.deactivate",
+        "Property Deactivate"
+      ],
+      [
+        "property.delete",
+        "Property Delete"
+      ],
+      [
+        "property.bulk_action",
+        "Property Bulk Action"
+      ],
+      [
+        "property.assign_users",
+        "Assign Users"
+      ],
+      [
+        "property.unassign_users",
+        "Unassign Users"
+      ],
+      [
+        "property.new_attachment",
+        "New Property Attachment"
+      ],
+      [
+        "property.update_attachment",
+        "Update Property Attachment"
+      ],
+      [
+        "property.delete_attachment",
+        "Delete Property Attachment"
+      ]
+    ],
+    "TIMESHEET": [
+      [
+        "timesheet_approval.new",
+        "New Timesheet Approval"
+      ],
+      [
+        "timesheet_approval.update",
+        "Update Timesheet Approval"
+      ],
+      [
+        "timesheet_approval.delete",
+        "Delete Timesheet approval"
+      ],
+      [
+        "timesheet_approval.status_update",
+        "Timesheet Approval Status Update"
+      ],
+      [
+        "timesheet.update",
+        "Timesheet Update"
+      ],
+      [
+        "timesheet.delete",
+        "Timesheet Delete"
+      ],
+      [
+        "timesheet.new_location",
+        "Timesheet New Location"
+      ],
+      [
+        "timesheet.edit_location",
+        "Timesheet Edit Location"
+      ],
+      [
+        "timesheet.delete_location",
+        "Timesheet Delete Location"
+      ],
+      [
+        "timesheet.new_timeoff",
+        "New Timeoff"
+      ],
+      [
+        "timesheet.approve_timeoff",
+        "Approve Timeoff"
+      ],
+      [
+        "timesheet.reject_timeoff",
+        "Reject Timeoff"
+      ],
+      [
+        "timesheet.update_timeoff",
+        "Update Timeoff"
+      ],
+      [
+        "timesheet.delete_timeoff",
+        "Delete Timeoff"
+      ],
+      [
+        "timesheet.user_shift_create",
+        "New User Shift"
+      ],
+      [
+        "timesheet.user_shift_delete",
+        "Delete User Shift"
+      ],
+      [
+        "timesheet.new_timeoff_availability",
+        "New Timeoff Availability"
+      ],
+      [
+        "timesheet.edit_timeoff_availability",
+        "Edit Timeoff Availability"
+      ],
+      [
+        "timesheet.delete_timeoff_availability",
+        "Delete Timeoff Availability"
+      ],
+      [
+        "timesheet.new_timeoff_type",
+        "New Timeoff Type"
+      ],
+      [
+        "timesheet.edit_timeoff_type",
+        "Edit Timeoff Type"
+      ],
+      [
+        "timesheet.delete_timeoff_type",
+        "Delete Timeoff Type"
+      ],
+      [
+        "timesheet.employee_location_create",
+        "New Timesheet Location"
+      ],
+      [
+        "timesheet.employee_location_delete",
+        "Delete Timesheet Location"
+      ],
+      [
+        "timesheet.day_activity",
+        "Timesheet Day Activity"
+      ],
+      [
+        "timesheet.check_in",
+        "Timesheet Check In"
+      ],
+      [
+        "timesheet.check_out",
+        "Timesheet Check Out"
+      ],
+      [
+        "timesheet.break",
+        "Timesheet Break"
+      ],
+      [
+        "timesheet.resume_work",
+        "Timesheet Resume Work"
+      ],
+      [
+        "timesheet.master_shift_create",
+        "Timesheet Master Shift Create"
+      ],
+      [
+        "timesheet.master_shift_update",
+        "Timesheet Master Shift Updating"
+      ],
+      [
+        "timesheet.master_shift_delete",
+        "Timesheet Master Shift Delete"
+      ],
+      [
+        "timesheet.bulk_check_in",
+        "Timesheet Bulk Check In"
+      ],
+      [
+        "timesheet.bulk_check_out",
+        "Timesheet Bulk Check Out"
+      ],
+      [
+        "timesheet.bulk_resume_work",
+        "Timesheet Bulk Resume Work"
+      ],
+      [
+        "timesheet.bulk_break",
+        "Timesheet Bulk Break"
+      ]
+    ],
+    "PRODUCTS": [
+      [
+        "product.new",
+        "New Product"
+      ],
+      [
+        "product.update",
+        "Product Update"
+      ],
+      [
+        "product.delete",
+        "Product Delete"
+      ],
+      [
+        "product.location_new",
+        "New Product Location"
+      ],
+      [
+        "product.location_update",
+        "Product Location Update"
+      ],
+      [
+        "product.location_delete",
+        "Product Location Delete"
+      ],
+      [
+        "product.transcation_inward",
+        "Product Transaction Inward"
+      ],
+      [
+        "product.transcation_outward",
+        "Product Transaction Outward"
+      ],
+      [
+        "product.transcation_transfer",
+        "Product Transaction Transfer"
+      ],
+      [
+        "product.consumption",
+        "Product Consumption"
+      ],
+      [
+        "product.update_stock",
+        "Update Product Stock"
+      ],
+      [
+        "product.bulk_action",
+        "Product Bulk Action"
+      ]
+    ],
+    "ESTIMATES": [
+      [
+        "estimate.new",
+        "New Quote"
+      ],
+      [
+        "estimate.update",
+        "Quote Update"
+      ],
+      [
+        "estimate.status_update",
+        "Quote Status Update"
+      ],
+      [
+        "estimate.deposit",
+        "Quote Deposit Payment"
+      ],
+      [
+        "estimate.print",
+        "Print Quote"
+      ],
+      [
+        "estimate.send",
+        "Send Quote"
+      ],
+      [
+        "estimate.new_note",
+        "Quote New Note"
+      ],
+      [
+        "estimate.new_attachment",
+        "Quote New Attachment"
+      ],
+      [
+        "estimate.delete_attachment",
+        "Quote Delete Attachment"
+      ],
+      [
+        "estimate.delete_note",
+        "Quote Delete Note"
+      ],
+      [
+        "estimate.delete",
+        "Quote Delete"
+      ],
+      [
+        "estimate.bulk_action",
+        "Quote Bulk Action"
+      ],
+      [
+        "estimate.recover",
+        "Quote Recover"
+      ]
+    ],
+    "INVOICE": [
+      [
+        "invoice.new",
+        "New Invoice"
+      ],
+      [
+        "invoice.update",
+        "Invoice Update"
+      ],
+      [
+        "invoice.status_update",
+        "Invoice Status Update"
+      ],
+      [
+        "invoice.payment",
+        "Invoice Payment"
+      ],
+      [
+        "invoice.print",
+        "Print Invoice"
+      ],
+      [
+        "invoice.send",
+        "Send Invoice"
+      ],
+      [
+        "invoice.new_note",
+        "Invoice New Note"
+      ],
+      [
+        "invoice.new_attachment",
+        "Invoice Attachment"
+      ],
+      [
+        "invoice.delete_attachment",
+        "Invoice Delete Attachment"
+      ],
+      [
+        "invoice.delete_note",
+        "Invoice Delete Note"
+      ],
+      [
+        "invoice.delete",
+        "Invoice Delete"
+      ],
+      [
+        "invoice.bulk_action",
+        "Invoice Bulk Action"
+      ],
+      [
+        "invoice.payment_mode_create",
+        "Invoice New Payment Mode"
+      ],
+      [
+        "invoice.payment_mode_update",
+        "Invoice Update Payment Mode"
+      ],
+      [
+        "invoice.payment_mode_delete",
+        "Invoice Delete Payment Mode"
+      ],
+      [
+        "invoice.payment_term_create",
+        "Invoice New Payment Term"
+      ],
+      [
+        "invoice.payment_term_update",
+        "Invoice Update Payment Term"
+      ],
+      [
+        "invoice.payment_term_delete",
+        "Invoice Delete Payment Term"
+      ],
+      [
+        "invoice.update_note",
+        "Invoice Update Note"
+      ]
+    ],
+    "SERVICE_CONTRACTS": [
+      [
+        "service_contract.new",
+        "New Service Contract"
+      ],
+      [
+        "service_contract.update",
+        "Service Contract Update"
+      ],
+      [
+        "service_contract.delete",
+        "Service Contract Delete"
+      ],
+      [
+        "service_contract.status_update",
+        "Service Contract Status Update"
+      ],
+      [
+        "service_contract.renew",
+        "Service Contract Renewal"
+      ],
+      [
+        "service_contract.new_note",
+        "Service Contract New Note"
+      ],
+      [
+        "service_contract.delete_note",
+        "Service Contract Delete Note"
+      ],
+      [
+        "service_contract.update_note",
+        "Service Contract Update Note"
+      ],
+      [
+        "service_contract.bulk_action",
+        "Service Contract Bulk Action"
+      ],
+      [
+        "service_contract.activate",
+        "Service Contract Activate"
+      ],
+      [
+        "service_contract.deactivate",
+        "Service Contract Deactivate"
+      ]
+    ],
+    "ASSETS": [
+      [
+        "asset.new",
+        "New Asset"
+      ],
+      [
+        "asset.update",
+        "Asset Update"
+      ],
+      [
+        "asset.delete",
+        "Asset Delete"
+      ],
+      [
+        "asset.activate",
+        "Asset activate"
+      ],
+      [
+        "asset.deactivate",
+        "Asset Deactivate"
+      ],
+      [
+        "asset.new_attachment",
+        "New Asset Attachment"
+      ],
+      [
+        "asset.delete_attachment",
+        "Delete Aseet Attachment"
+      ],
+      [
+        "asset.update_attachment",
+        "Update Aseet Attachment"
+      ],
+      [
+        "asset.bulk_action",
+        "Asset Bulk Action"
+      ],
+      [
+        "asset.status_update",
+        "Asset Status Update"
+      ],
+      [
+        "asset.history",
+        "Asset History"
+      ],
+      [
+        "asset.recover",
+        "Asset Recover"
+      ],
+      [
+        "asset.new_note",
+        "Asset New Note"
+      ],
+      [
+        "asset.update_note",
+        "Asset Update Note"
+      ],
+      [
+        "asset.delete_note",
+        "Asset Delete Note"
+      ],
+      [
+        "inspection_form.submit",
+        "Inspection Form Submission"
+      ],
+      [
+        "inspection_form.update",
+        "Inspection Form Update"
+      ]
+    ],
+    "USER": [
+      [
+        "user.resource_create",
+        "New User Resource"
+      ],
+      [
+        "user.resource_delete",
+        "User Resource Delete"
+      ],
+      [
+        "user.resource_edit",
+        "User Resource Update"
+      ],
+      [
+        "user.trigger_sos",
+        "User Sos Trigger"
+      ],
+      [
+        "user.activate",
+        "User Activate"
+      ],
+      [
+        "user.deactivate",
+        "User Deactivate"
+      ],
+      [
+        "user.delete",
+        "User Delete"
+      ],
+      [
+        "user.new",
+        "New User"
+      ],
+      [
+        "user.update",
+        "User Update"
+      ],
+      [
+        "user.work_hours_update",
+        "User Work Hours Update"
+      ],
+      [
+        "user.login",
+        "User Login"
+      ],
+      [
+        "user.recover",
+        "User Recover"
+      ],
+      [
+        "user.add_skill",
+        "User New Skill"
+      ],
+      [
+        "user.remove_skill",
+        "User Delete Skill"
+      ],
+      [
+        "user.update_skill",
+        "User Update Skill"
+      ],
+      [
+        "user.preference_edit",
+        "User Preference Update"
+      ]
+    ],
+    "REQUEST": [
+      [
+        "request.new",
+        "New Request"
+      ],
+      [
+        "request.update",
+        "Update Request"
+      ],
+      [
+        "request.status_update",
+        "Update request status"
+      ],
+      [
+        "request.status_rollback",
+        "Status Rollback"
+      ],
+      [
+        "request.assign_users",
+        "Assign Users"
+      ],
+      [
+        "request.unassign_users",
+        "Unassign Users"
+      ],
+      [
+        "request.new_note",
+        "New Note"
+      ],
+      [
+        "request.delete",
+        "Delete Request"
+      ]
+    ],
+    "TEAM": [
+      [
+        "team.create",
+        "New Team"
+      ],
+      [
+        "team.update",
+        "Team Update"
+      ],
+      [
+        "team.delete",
+        "Team Delete"
+      ],
+      [
+        "team.unassign",
+        "Team Unassign"
+      ],
+      [
+        "team.assign",
+        "Team Assign"
+      ]
+    ],
+    "PROJECT": [
+      [
+        "project.new",
+        "New Project"
+      ],
+      [
+        "project.update",
+        "Update Project"
+      ],
+      [
+        "project.delete",
+        "Delete Project"
+      ],
+      [
+        "project.update_status",
+        "Project Status Update"
+      ],
+      [
+        "project.add_job",
+        "Add Job to Project"
+      ],
+      [
+        "project.remove_job",
+        "Remove Job from Project"
+      ],
+      [
+        "project.new_dependency",
+        "New Project Dependency"
+      ],
+      [
+        "project.update_dependency",
+        "Update Project Dependency"
+      ],
+      [
+        "project.delete_dependency",
+        "Delete Project Dependency"
+      ],
+      [
+        "project.new_milestone",
+        "New Project Milestone"
+      ],
+      [
+        "project.update_milestone",
+        "Update Project Milestone"
+      ],
+      [
+        "project.update_milestone_status",
+        "Update Project Milestone Status"
+      ],
+      [
+        "project.delete_milestone",
+        "Delete Project Milestone"
+      ],
+      [
+        "project.new_phase",
+        "New Project Phase"
+      ],
+      [
+        "project.update_phase",
+        "Update Project Phase"
+      ],
+      [
+        "project.delete_phase",
+        "Delete Project Phase"
+      ],
+      [
+        "project.update_note",
+        "Update Project Note"
+      ],
+      [
+        "project.timelog",
+        "Project Timelog"
+      ],
+      [
+        "project.timelog_update",
+        "Project Timelog Update"
+      ],
+      [
+        "project.assign_users",
+        "Project Assign Users"
+      ],
+      [
+        "project.unassign_users",
+        "Project Unassign Users"
+      ],
+      [
+        "project.bulk_action",
+        "Project Bulk Action"
+      ]
+    ],
+    "PURCHASE_ORDER": [
+      [
+        "purchase_order.new",
+        "New Purchase Order"
+      ],
+      [
+        "purchase_order.update",
+        "Purchase Order Update"
+      ],
+      [
+        "purchase_order.delete",
+        "Purchase Order Delete"
+      ],
+      [
+        "purchase_order.status_update",
+        "Purchase Order Status Update"
+      ],
+      [
+        "purchase_order.send",
+        "Send Purchase Order"
+      ],
+      [
+        "purchase_order.new_note",
+        "Purchase Order New Note"
+      ]
+    ]
+  }
 }

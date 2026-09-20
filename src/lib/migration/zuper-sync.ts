@@ -352,6 +352,29 @@ function zAddress(a: any): Record<string, unknown> | null {
   return [out.street, out.landmark, out.city, out.state, out.country, out.zip_code].some(Boolean) ? out : null;
 }
 /** Replace a parent's SERVICE/BILLING rows in jms.addresses. */
+/**
+ * Who is on a team. Zuper sends the whole membership on every team row, so the list is replaced rather than merged —
+ * that is what makes someone leaving a team reach Tuper at all. A member Tuper has never heard of is skipped, not
+ * invented: only staff the users sync brought over can be on a team.
+ */
+async function writeTeamMembers(ctx: Ctx, teamId: string, row: any): Promise<void> {
+  const r = row?.team ?? row;                       // flat from the list, wrapped from the by-uid read
+  const members = Array.isArray(r?.users) ? r.users : [];
+  const users = await ctxMap(ctx, "users");
+  const seen = new Set<string>();
+  const rows: { tenant_id: string; team_id: string; user_id: string }[] = [];
+  for (const u of members) {
+    const id = mapGet(users, u?.user_uid);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    rows.push({ tenant_id: ctx.tenantId, team_id: teamId, user_id: id });
+  }
+  const table = () => ctx.client.schema("jms").from("team_members");
+  const { error: gone } = await table().delete().eq("tenant_id", ctx.tenantId).eq("team_id", teamId);
+  if (gone) throw gone;
+  if (rows.length) { const { error } = await table().insert(rows); if (error) throw error; }
+}
+
 async function writeAddresses(ctx: Ctx, parentType: string, parentId: string, isNew: boolean, service: any, billing: any): Promise<void> {
   const addresses = () => ctx.client.schema("jms").from("addresses");
   if (!isNew) {
@@ -965,6 +988,91 @@ export const ENTITIES: Record<string, Entity> = {
       };
     },
     afterWrite: (ctx, id, r) => writeProductStockAndFields(ctx, id, r),
+  },
+
+  // A team as its own record. Until now a team reached Tuper only when a job mentioned one (teamId above), which
+  // created it from the three fields a job carries; its time zone, whether it is dispatchable, who made it and who
+  // is on it never arrived, and a team.create in Zuper reached nothing at all.
+  teams: {
+    name: "teams", schema: "jms", table: "teams", deps: ["users"],
+    pages: (ctx) => zuperListPages(ctx.cfg, "/api/team"),
+    // The list sends the team flat; GET /api/team/{uid} wraps it in `team`. Both arrive here.
+    uid: (row) => (row.team ?? row).team_uid,
+    async transform(row, ctx) {
+      const r = row.team ?? row;
+      return {
+        name: S(r.team_name) ?? "Team",
+        description: T(r.team_description),
+        color: T(r.team_color),
+        // Zuper sends "" for a team on the company's own zone; Tuper reads null as the same thing.
+        timezone: T(r.team_timezone),
+        is_dispatchable: r.is_dispatchable === true,
+        is_active: r.is_active !== false,
+        is_deleted: r.is_deleted === true,
+        created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
+        ...createdAt(r),
+      };
+    },
+    afterWrite: (ctx, id, r) => writeTeamMembers(ctx, id, r),
+  },
+
+  // Projects and purchase orders. GBG's Zuper holds none of either today, so these map the record Zuper documents
+  // rather than one we have watched arrive: the fields below are the ones its own create and read bodies name. The
+  // first record made in Zuper is what confirms them — and because only mapped fields are written, a surprise shows
+  // up as a failed sync in the log instead of a row filled with nulls.
+  projects: {
+    name: "projects", schema: "jms", table: "projects", deps: ["users", "customers", "organizations"],
+    pages: (ctx) => zuperListPages(ctx.cfg, "/api/projects"),
+    uid: (row) => (row.project ?? row).project_uid,
+    async transform(row, ctx) {
+      const r = row.project ?? row;
+      const users = await ctxMap(ctx, "users");
+      return {
+        name: S(r.project_name ?? r.title) ?? "Project",
+        description: S(r.project_description ?? r.description),
+        prefix: T(r.prefix),
+        project_no: N(r.project_number),
+        status: T(r.project_status?.status_name ?? r.current_status?.status_name ?? r.status),
+        priority: T(r.priority)?.toUpperCase() ?? null,
+        completion_percentage: N(r.completion_percentage),
+        start_date: dubaiDate(r.start_date ?? r.project_start_date),
+        end_date: dubaiDate(r.end_date ?? r.project_end_date),
+        due_date: dubaiDate(r.due_date),
+        actual_start_date: dubaiDate(r.actual_start_date),
+        actual_end_date: dubaiDate(r.actual_end_date),
+        customer_id: mapGet(await ctxMap(ctx, "customers"), r.customer?.customer_uid),
+        organization_id: mapGet(await ctxMap(ctx, "organizations"), r.organization?.organization_uid),
+        project_manager_id: mapGet(users, r.project_manager?.user_uid),
+        is_active: r.is_active !== false,
+        is_deleted: r.is_deleted === true,
+        created_by: mapGet(users, r.created_by?.user_uid),
+        ...createdAt(r),
+      };
+    },
+  },
+  purchase_orders: {
+    name: "purchase_orders", schema: "jms", table: "purchase_orders", deps: ["users", "jobs"],
+    pages: (ctx) => zuperListPages(ctx.cfg, "/api/purchase_orders"),
+    uid: (row) => (row.purchase_order ?? row).purchase_order_uid,
+    async transform(row, ctx) {
+      const r = row.purchase_order ?? row;
+      return {
+        purchase_order_number: T(r.purchase_order_number),
+        prefix: T(r.prefix),
+        purchase_order_type: T(r.purchase_order_type)?.toUpperCase() ?? "PURCHASE_ORDER",
+        title: S(r.title ?? r.purchase_order_title),
+        status: T(r.status ?? r.purchase_order_status)?.toUpperCase() ?? "DRAFTED",
+        job_id: mapGet(await ctxMap(ctx, "jobs"), r.job?.job_uid),
+        purchase_order_date: dubaiDate(r.purchase_order_date),
+        due_date: dubaiDate(r.due_date),
+        reference_number: T(r.reference_number),
+        remarks: S(r.remarks),
+        total_price: N(r.total_price),
+        is_deleted: r.is_deleted === true,
+        created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
+        ...createdAt(r),
+      };
+    },
   },
 
   // ── History ──

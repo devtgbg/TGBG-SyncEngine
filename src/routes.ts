@@ -76,6 +76,12 @@ const ENTITY_FETCH: Record<string, { mode: FetchMode; path?: (uid: string) => st
   estimates: { mode: "detail", path: (u) => `/api/estimate/${u}` },
   invoices: { mode: "detail", path: (u) => `/api/invoice/${u}` },
   requests: { mode: "detail", path: (u) => `/api/request/${u}` },
+  teams: { mode: "detail", path: (u) => `/api/team/${u}` },                 // singular; the team sits under data.team
+  // Zuper serves both by uid (an unknown uid earns its own "Not found" envelope, not Express's 404 page), and this
+  // account holds none of either yet. The transforms map the documented record; the first one made in Zuper is what
+  // proves them, and a field that arrives differently shows up as a failed sync rather than a quietly wrong row.
+  projects: { mode: "detail", path: (u) => `/api/projects/${u}` },          // plural
+  purchase_orders: { mode: "detail", path: (u) => `/api/purchase_orders/${u}` },
 
   // No read-by-uid exists. Changes are refused rather than guessed at; DELETIONS
   // still work for mapped records, because marking a row deleted needs no fetch.
@@ -169,6 +175,10 @@ const TIMEOFF: EventRule = { entity: "timeoff_requests", uidFields: [], collecti
 const TIMEOFF_TYPES: EventRule = { entity: "timeoff_types", uidFields: [], collection: "timeoff_types" };
 const NOT_KEPT = (what: string): EventRule => ({ skip: `not kept in Tuper: ${what}` });
 const SHIFTS: EventRule = { skip: "shift planning is not used in Zuper here" };
+// Notes are read back per record kind, and the reader knows jobs, customers, requests and assets. Zuper holds no
+// projects or purchase orders on this account, so rather than guess at a path that has never answered, their note
+// events are recorded with this reason; the record itself still syncs.
+const NO_PROJECT_NOTES: EventRule = { skip: "notes on projects and purchase orders are not read back yet (none exist in Zuper)" };
 const ATTACHMENT: EventRule = { skip: "files attached to this kind of record are not synced (job files and note files are)" };
 const NO_STATE: (what: string) => EventRule = (what) => ({ skip: `${what} changes nothing on the record` });
 
@@ -462,6 +472,65 @@ const MODULES: Record<string, ModuleSpec> = {
     },
   },
 
+  TEAM: {
+    label: "Teams",
+    // The team list carries its membership, so every one of these re-reads the team and replaces who is on it.
+    entity: "teams",
+    uidFields: ["team_uid"],
+    events: {
+      "team.create": ["New Team"],
+      "team.update": ["Team Update"],
+      "team.delete": ["Team Delete", DELETE],
+      "team.assign": ["Team Assign"],
+      "team.unassign": ["Team Unassign"],
+    },
+  },
+  PROJECT: {
+    label: "Projects",
+    // GBG's Zuper holds no projects (GET /api/projects answers 0). The record and its endpoints exist on both sides,
+    // so the events route rather than fall through as unknown; the first project made in Zuper is what proves the
+    // mapping, and a shape Tuper refuses is logged as a failed sync rather than dropped.
+    entity: "projects",
+    uidFields: ["project_uid"],
+    events: {
+      "project.new": ["New Project"],
+      "project.update": ["Update Project"],
+      "project.delete": ["Delete Project", DELETE],
+      "project.update_status": ["Project Status Update"],
+      "project.add_job": ["Add Job to Project"],
+      "project.remove_job": ["Remove Job from Project"],
+      "project.new_dependency": ["New Project Dependency"],
+      "project.update_dependency": ["Update Project Dependency"],
+      "project.delete_dependency": ["Delete Project Dependency"],
+      "project.new_milestone": ["New Project Milestone"],
+      "project.update_milestone": ["Update Project Milestone"],
+      "project.update_milestone_status": ["Update Project Milestone Status"],
+      "project.delete_milestone": ["Delete Project Milestone"],
+      "project.new_phase": ["New Project Phase"],
+      "project.update_phase": ["Update Project Phase"],
+      "project.delete_phase": ["Delete Project Phase"],
+      "project.update_note": ["Update Project Note", NO_PROJECT_NOTES],
+      "project.assign_users": ["Project Assign Users"],
+      "project.unassign_users": ["Project Unassign Users"],
+      "project.timelog": ["Project Timelog"],
+      "project.timelog_update": ["Project Timelog Update"],
+      "project.bulk_action": ["Project Bulk Action"],
+    },
+  },
+  PURCHASE_ORDER: {
+    label: "Purchase Orders",
+    // Also none on GBG's account today (GET /api/purchase_orders answers 0); same reasoning as projects.
+    entity: "purchase_orders",
+    uidFields: ["purchase_order_uid"],
+    events: {
+      "purchase_order.new": ["New Purchase Order"],
+      "purchase_order.update": ["Purchase Order Update"],
+      "purchase_order.delete": ["Purchase Order Delete", DELETE],
+      "purchase_order.status_update": ["Purchase Order Status Update"],
+      "purchase_order.send": ["Send Purchase Order", NO_STATE("sending a purchase order")],
+      "purchase_order.new_note": ["Purchase Order New Note", NO_PROJECT_NOTES],
+    },
+  },
   USER: {
     label: "Users",
     entity: "users",
