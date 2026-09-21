@@ -1206,6 +1206,49 @@ async function writeRequestStatusHistory(ctx: Ctx, requestId: string, history: a
   if (delErr) throw delErr;
   if (rows.length) { const { error } = await tbl().insert(rows); if (error) throw error; }
 }
+/**
+ * The category and organization a customer names, when the answer carries the key: Zuper's null says "none", a
+ * missing key says nothing. A category is found by Zuper's uid, then by name (Tuper's "Residential" and "Commercial"
+ * are Zuper's), and made on sight otherwise ("Rental").
+ */
+async function customerLinks(ctx: Ctx, r: any): Promise<Record<string, unknown>> {
+  if (r == null || typeof r !== "object") return {};
+  return {
+    ...("customer_category" in r ? { category_id: await customerCategoryId(ctx, r.customer_category) } : {}),
+    ...("customer_organization" in r ? { organization_id: r.customer_organization ? await organizationId(ctx, r.customer_organization) : null } : {}),
+  };
+}
+async function customerCategoryId(ctx: Ctx, c: any): Promise<string | null> {
+  const uid = T(c?.category_uid), name = T(c?.category_name);
+  if (!uid || !name) return null;
+  const map = await ctxMap(ctx, "customer_categories");
+  if (map.has(uid)) return map.get(uid)!;
+  return once(ctx, `customer_category:${uid}`, async () => {
+    const tbl = () => ctx.client.schema("jms").from("customer_categories");
+    const { data, error } = await tbl().select("id, name").eq("tenant_id", ctx.tenantId);
+    if (error) throw error;
+    let id = ((data ?? []) as { id: string; name: string }[]).find((x) => x.name.trim().toLowerCase() === name.toLowerCase())?.id;
+    if (!id) {
+      const made = await tbl().insert({ tenant_id: ctx.tenantId, name, is_active: c.is_deleted !== true }).select("id").single();
+      if (made.error) throw made.error;
+      id = (made.data as { id: string }).id;
+    }
+    await setMap(ctx, "customer_categories", uid, id);
+    return id;
+  });
+}
+/** A customer's favourite technicians (00120), replaced by Zuper's list. People who are not Tuper users are left out. */
+async function writeFavoriteTechnicians(ctx: Ctx, customerId: string, list: any[]): Promise<void> {
+  const users = await ctxMap(ctx, "users");
+  const ids = [...new Set(list.map((u) => mapGet(users, u?.user_uid ?? u?.user?.user_uid)).filter((x): x is string => Boolean(x)))];
+  const tbl = () => ctx.client.schema("jms").from("customer_favorite_technicians");
+  const { error } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("customer_id", customerId);
+  if (error) throw error;
+  if (ids.length) {
+    const { error: insErr } = await tbl().insert(ids.map((user_id) => ({ tenant_id: ctx.tenantId, customer_id: customerId, user_id })));
+    if (insErr) throw insErr;
+  }
+}
 /** Tuper's copy of a Zuper document template (00082 imported them, keyed by source_uid). */
 async function documentTemplateId(ctx: Ctx, templateUid: unknown): Promise<string | null> {
   const uid = T(templateUid);
@@ -1653,7 +1696,12 @@ export const ENTITIES: Record<string, Entity> = {
     name: "customers", schema: "jms", table: "customers", concurrency: 8,
     pages: (ctx) => zuperListPages(ctx.cfg, "/api/customers"),
     uid: (r) => r.customer_uid,
-    transform: async (r, ctx) => ({ ...customerFields(r), no_of_jobs: num0(r.no_of_jobs), ...(await createdByField(ctx, r)) }),
+    transform: async (r, ctx) => ({
+      ...customerFields(r), no_of_jobs: num0(r.no_of_jobs), ...(await createdByField(ctx, r)),
+      // The list carries both, and the importer never read them (FIELD-PARITY 2026-09-21): an organization then only
+      // reached a customer a job happened to name, and no category came over at all.
+      ...(await customerLinks(ctx, r)),
+    }),
     async afterWrite(ctx, id, r, isNew) {
       await writeAddresses(ctx, "CUSTOMER", id, isNew, r.customer_address, r.customer_billing_address);
       // The customer's Zoho CRM / Zoho Books contact ids and its siblings — the list rows carry these.
@@ -1865,7 +1913,9 @@ export const ENTITIES: Record<string, Entity> = {
     async afterWrite(ctx, id, r, isNew) {
       await writeJobAssignments(ctx, id, r, isNew);
       await writeJobHistory(ctx, id, r, isNew);
-      await writeCustomFieldValues(ctx, "JOB", id, r.custom_fields);
+      // Every field the job carries, empty ones too, with Zuper's own definition (owner OK 2026-09-21): the older
+      // helper skipped empty values and fields Tuper had no definition for ("Time Input", "AMC Silver" …).
+      await writeZuperCustomFields(ctx, "JOB", id, r.custom_fields, r.custom_field_internal_object, r.created_at);
       await writeJobTeams(ctx, id, r, isNew);
       await writeJobTags(ctx, id, r.job_tags);
       // Files attached to the job itself (not to a note or a checklist). Only a full job read carries them - the
@@ -1932,7 +1982,9 @@ export const ENTITIES: Record<string, Entity> = {
       if (Array.isArray(r.job_status) && r.job_status.length) await writeJobHistory(ctx, id, r, false);
       // Its people as the detail has them — the list pass may have run before inactive staff were imported.
       if (Array.isArray(r.assigned_to)) await writeJobAssignments(ctx, id, r, false);
-      await writeCustomFieldValues(ctx, "JOB", id, r.custom_fields);
+      // Every field the job carries, empty ones too, with Zuper's own definition (owner OK 2026-09-21): the older
+      // helper skipped empty values and fields Tuper had no definition for ("Time Input", "AMC Silver" …).
+      await writeZuperCustomFields(ctx, "JOB", id, r.custom_fields, r.custom_field_internal_object, r.created_at);
       await linkCustomerOrganization(ctx, r.customer);
       await writeJobTeams(ctx, id, r, false);
       await writeJobTags(ctx, id, r.job_tags);
@@ -2156,10 +2208,38 @@ ENTITIES.customer_details = {
   uid: (r) => r.customer_uid,
   async transform(r, ctx) {
     const d = (await zuperGet(ctx.cfg, `/api/customers/${r.customer_uid}`)).data ?? {};
+    r._detail = d;
     const n = d.customer_notifications;
-    // Only what the list cannot say. A customer whose detail carries no preferences is left as it is.
-    if (!n || typeof n !== "object") return {};
-    return { notifications: { email: n.email !== false, sms: n.sms === true, call: n.call === true } };
+    const portal = d.portal_permissions && typeof d.portal_permissions === "object" ? d.portal_permissions : null;
+    // Only what Zuper's by-uid read says (owner OK 2026-09-21 to re-read every customer). A key the answer leaves out
+    // is left alone, so a customer Zuper answers nothing for is not blanked.
+    return {
+      ...(n && typeof n === "object" ? { notifications: { email: n.email !== false, sms: n.sms === true, call: n.call === true } } : {}),
+      ...sent(d, "customer_description", "description", (v) => T(v)),
+      ...sent(d, "plain_text_description", "plain_text_description", (v) => T(v)),
+      ...sent(d, "markdown_description", "markdown_description", (v) => T(v)),
+      ...sent(d, "visible_to_all", "visible_to_all", (v) => v === true),
+      ...sent(d, "is_portal_enabled", "is_portal_enabled", (v) => v === true),
+      ...(portal ? { portal_permissions: {
+        can_access_organization_records: portal.can_access_organization_records === true,
+        can_create_property: portal.can_create_property === true, can_create_asset: portal.can_create_asset === true,
+      } } : {}),
+      ...sent(d, "auto_charge", "auto_charge_enabled", (v) => v?.is_enabled === true),
+      ...("account_manager" in d ? { account_manager_id: mapGet(await ctxMap(ctx, "users"), d.account_manager?.user_uid) } : {}),
+      // Zuper's own address list: a collection of its own that does not follow later edits to the service and billing
+      // address (GBG's often still says "Dubai" where the service address now says "Jumeirah Golf Estates"), so it is
+      // kept as Zuper has it (00199).
+      ...(Array.isArray(d.customer_all_addresses) ? { address_list: d.customer_all_addresses } : {}),
+      ...(await createdByField(ctx, d)),
+      ...(await customerLinks(ctx, d)),
+    };
+  },
+  async afterWrite(ctx, id, r) {
+    const d = r._detail ?? {};
+    // The customer's favourite technicians (Zuper's favorited_users), replaced as a whole.
+    if (Array.isArray(d.favorited_users)) await writeFavoriteTechnicians(ctx, id, d.favorited_users);
+    // Its own files, which only the detail carries.
+    if (d.customer_uid) await writeRecordFiles(ctx, "customer", id, d);
   },
 };
 
@@ -2368,6 +2448,45 @@ ENTITIES.request_sources = {
       ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
       ...(r.updated_at ? { updated_at: String(r.updated_at) } : {}),
     };
+  },
+};
+/**
+ * Every job, a month of updated_at at a time, newest first (the harness's pager, compare.ts). Deep in Zuper's whole
+ * job list its answers fail; by month every page is near the start of its list, where Zuper answers at once.
+ */
+export async function* jobsByMonth(cfg: SyncConfig): AsyncGenerator<any[]> {
+  const DAY = 86_400_000;
+  const isoSeconds = (t: number) => new Date(t).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const start = Date.parse("2015-01-01T00:00:00Z");
+  for (let to = Date.now() + 60_000; to > start; to -= 30 * DAY) {
+    const q = `filter.updated_at_from=${encodeURIComponent(isoSeconds(to - 30 * DAY))}&filter.updated_at_to=${encodeURIComponent(isoSeconds(to))}`;
+    for (let page = 1; page <= 200; page++) {
+      const j = await zuperGet(cfg, `/api/jobs?page=${page}&count=100&${q}`);
+      const rows: any[] = j?.data ?? [];
+      if (rows.length) yield rows;
+      const pages = Number(j?.total_pages ?? 0);
+      if (rows.length < 100 || (Number.isFinite(pages) && pages > 0 && page >= pages)) break;
+    }
+  }
+}
+// A job's custom fields only, for every job (owner OK 2026-09-21): the list rows carry them, so this pages the list
+// by month and writes nothing on the job itself.
+ENTITIES.job_custom_fields = {
+  name: "job_custom_fields", schema: "jms", table: "jobs", mapEntity: "jobs", enrichOnly: true, concurrency: 8,
+  pages: (ctx) => jobsByMonth(ctx.cfg),
+  uid: (r) => r.job_uid,
+  async transform() { return {}; },
+  afterWrite: (ctx, id, r) => writeZuperCustomFields(ctx, "JOB", id, r.custom_fields, r.custom_field_internal_object, r.created_at),
+};
+// Zuper's customer categories (Residential, Rental, Commercial … for GBG). Tuper's own of the same name are kept.
+ENTITIES.customer_categories = {
+  name: "customer_categories", schema: "jms", table: "customer_categories",
+  fetch: (ctx) => zuperGet(ctx.cfg, "/api/customers/category?page=1&count=200").then((j) => j.data ?? []),
+  uid: (r) => r.category_uid,
+  async transform(r, ctx) {
+    // One of Tuper's own with the same name is the same category: mapped rather than made twice.
+    await customerCategoryId(ctx, r);
+    return { name: T(r.category_name) ?? "Category", is_active: r.is_deleted !== true };
   },
 };
 // Zuper's request statuses (Open, Booked, Canceled for GBG), in its order, with their colour and description.
