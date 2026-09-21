@@ -917,7 +917,9 @@ async function createdByField(ctx: Ctx, r: any): Promise<Record<string, unknown>
 /** A quote's or invoice's own billing and service contact and address → jms.addresses (parent QUOTE / INVOICE). */
 async function writeDocumentAddresses(ctx: Ctx, parentType: "QUOTE" | "INVOICE", parentId: string, r: any): Promise<void> {
   const rows = ([["BILLING", r.customer_billing_address], ["SERVICE", r.customer_service_address]] as const)
-    .filter(([, a]) => a && typeof a === "object")
+    // Zuper sends {} for an address a document does not have. Writing that as a row of nulls would make Tuper
+    // answer an address-shaped object where Zuper answers nothing, so an object with no values is not written.
+    .filter(([, a]) => a && typeof a === "object" && Object.values(a).some((v) => T(v as any) !== null))
     .map(([kind, a]: readonly [string, any]) => ({
       tenant_id: ctx.tenantId, parent_type: parentType, parent_id: parentId, address_kind: kind,
       street: T(a.street), landmark: T(a.landmark), city: T(a.city), state: T(a.state), country: T(a.country), zip_code: T(a.zip_code),
@@ -1727,6 +1729,10 @@ export const ENTITIES: Record<string, Entity> = {
     },
     async afterWrite(ctx, id, r, isNew) {
       await writeLineItems(ctx, "INVOICE", id, r.line_items, isNew);
+      // The invoice's own addresses — a snapshot of where the work was and who was billed when it was raised, not
+      // the customer's address of today. writeDocumentAddresses has taken "INVOICE" since it was written; it was
+      // only ever called for quotes, so every invoice answered an empty address (FIELD-PARITY 2026-09-21).
+      await writeDocumentAddresses(ctx, "INVOICE", id, r);
       await writeDocumentAddresses(ctx, "INVOICE", id, r);
       // The invoice's Zoho Books invoice id and its siblings, with Zuper's own key for each (custom_field_internal_object).
       await writeZuperCustomFields(ctx, "INVOICE", id, r.custom_fields, r.custom_field_internal_object);
