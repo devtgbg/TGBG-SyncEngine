@@ -222,6 +222,9 @@ const T = (v: any): string | null => { const t = v == null ? "" : String(v).trim
 const num0 = (v: any) => Number(v) || 0;
 const r2 = (n: number) => Math.round(n * 100) / 100;
 const ts = (v: any): string | null => (v ? String(v) : null);
+/** `{ [column]: value(r[key]) }` when Zuper's row carries `key`, else nothing — a partial row must not clear a column. */
+const sent = (r: any, key: string, column: string, value: (v: any) => unknown = ts): Record<string, unknown> =>
+  r != null && typeof r === "object" && key in r ? { [column]: value(r[key]) } : {};
 /** An instant's calendar date in the tenant's zone — Zuper keeps dates as local-midnight instants. */
 const dubaiDate = (v: any): string | null => {
   if (!v) return null;
@@ -638,10 +641,20 @@ async function writeJobTags(ctx: Ctx, jobId: string, tags: unknown): Promise<voi
 async function assetCategoryId(ctx: Ctx, c: any): Promise<string | null> {
   const uid = c?.category_uid, name = T(c?.category_name);
   if (!uid || !name) return null;
+  const description = "category_description" in c ? T(c.category_description) : undefined;
   const have = (await ctxMap(ctx, "asset_categories")).get(uid);
-  if (have) return have;
+  if (have) {
+    if (description !== undefined) {
+      await once(ctx, `asset_category_description:${uid}`, async () => {
+        const { error } = await ctx.client.schema("jms").from("asset_categories").update({ description }).eq("tenant_id", ctx.tenantId).eq("id", have);
+        if (error) throw error;
+        return have;
+      });
+    }
+    return have;
+  }
   return once(ctx, `asset_categories:${uid}`, async () => {
-    const { data, error } = await ctx.client.schema("jms").from("asset_categories").insert({ tenant_id: ctx.tenantId, name, is_active: c.is_deleted !== true }).select("id").single();
+    const { data, error } = await ctx.client.schema("jms").from("asset_categories").insert({ tenant_id: ctx.tenantId, name, is_active: c.is_deleted !== true, ...(description !== undefined ? { description } : {}) }).select("id").single();
     if (error) throw error;
     await setMap(ctx, "asset_categories", uid, (data as { id: string }).id);
     return (data as { id: string }).id;
@@ -733,10 +746,18 @@ async function writeJobHistory(ctx: Ctx, jobId: string, r: any, isNew: boolean):
   if (!isNew) { const { error } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("job_id", jobId); if (error) throw error; }
   if (rows.length) { const { error } = await tbl().insert(rows); if (error) throw error; }
 }
-/** A document's Zuper line items → jms.line_items (products linked through the products map). */
-async function writeLineItems(ctx: Ctx, parentType: "QUOTE" | "INVOICE" | "CONTRACT", parentId: string, items: any[] | undefined, isNew: boolean): Promise<void> {
+/** A document's Zuper line items → jms.line_items (products linked through the products map). `taxes` is the
+ *  document's own tax list: Zuper charges tax on the document, Tuper records it on each line, so every line Zuper did
+ *  not mark exempt carries the document's tax. */
+async function writeLineItems(ctx: Ctx, parentType: "QUOTE" | "INVOICE" | "CONTRACT", parentId: string, items: any[] | undefined, isNew: boolean, taxes?: any[]): Promise<void> {
   const products = await ctxMap(ctx, "products");
-  const locations = await ctxMap(ctx, "stock_locations");
+  const taxId = await documentTaxId(ctx, taxes);
+  // A line names a stock location Zuper may since have deleted (GBG's "The Pitstop - JGE", on 18 quote lines). It is
+  // found or made by name, inactive, as a product's stock does; mapping it by uid alone left those lines with none.
+  const lineLocations: (string | null)[] = [];
+  for (const l of items ?? []) {
+    lineLocations.push(T(l?.location_uid) ? await stockLocationId(ctx, { location_uid: l.location_uid, location_name: l.location_name }, false) : null);
+  }
   const tbl = () => ctx.client.schema("jms").from("line_items");
   if (!isNew) { const { error } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("parent_type", parentType).eq("parent_id", parentId); if (error) throw error; }
   const rows = (items ?? []).map((l: any, i: number) => {
@@ -751,7 +772,8 @@ async function writeLineItems(ctx: Ctx, parentType: "QUOTE" | "INVOICE" | "CONTR
       item_type: type === "SECTION" || type === "HEADER" ? "HEADER" : type === "BUNDLE" ? "BUNDLE" : type.startsWith("CUSTOM") ? "CUSTOM" : "ITEM",
       item_code: T(l.product_id), product_type: T(l.product_type), brand: T(l.brand), specification: T(l.specification),
       uom: T(l.uom), details: T(l.plain_text_description) ?? T(l.description),
-      unit_cost: l.purchase_price == null ? null : num0(l.purchase_price), location_id: mapGet(locations, l.location_uid),
+      unit_cost: l.purchase_price == null ? null : num0(l.purchase_price), location_id: lineLocations[i] ?? null,
+      tax_id: taxId && l?.tax?.tax_exempt !== true ? taxId : null,
     };
   });
   if (rows.length) { const { error } = await tbl().insert(rows); if (error) throw error; }
@@ -819,15 +841,29 @@ function zuperInternalKey(label: string, internal: Record<string, unknown> | und
 /** Definitions for the labels Zuper uses on an entity: in Zuper's own kind, and carrying what Zuper says about the
  *  field that Tuper's own columns cannot hold — the name it gives the kind, and its key inside
  *  custom_field_internal_object. A definition that already exists keeps its kind and only gains those two. */
-async function ensureZuperFieldDefinitions(ctx: Ctx, entityType: string, fields: any[], internal?: Record<string, unknown> | null): Promise<void> {
-  const known: Set<string> = (ctx.extra[`zuperFieldLabels:${entityType}`] ??= new Set<string>());
-  const fresh = fields.filter((f) => !known.has(String(f.label).trim().toLowerCase()));
+async function ensureZuperFieldDefinitions(ctx: Ctx, entityType: string, fields: any[], internal?: Record<string, unknown> | null, recordAt?: string | null): Promise<void> {
+  // Zuper names a field's kind and its internal key per RECORD, and older records keep older names: GBG's "JGE
+  // Registration Expiry" is DATETIME on today's assets and SINGLE_LINE on some old ones; "Battery Serial No." is keyed
+  // "…__1" on today's and "…._1" on old ones. The newest record the run sees decides (by when it was made); taking
+  // whichever came first let an old record's name stand for the field.
+  const seen: Map<string, string> = (ctx.extra[`zuperFieldLabels:${entityType}`] ??= new Map<string, string>());
+  const at = T(recordAt) ?? "";
+  const fresh = fields.filter((f) => {
+    const k = String(f.label).trim().toLowerCase();
+    return !seen.has(k) || (at !== "" && at > (seen.get(k) ?? ""));
+  });
   if (!fresh.length) return;
-  await once(ctx, `zuperFieldDefinitions:${entityType}:${fresh.map((f) => String(f.label).trim().toLowerCase()).sort().join("|")}`, async () => {
-    const { data: existing, error } = await ctx.client.schema("jms").from("custom_field_definitions")
-      .select("id, label, display_order, config").eq("tenant_id", ctx.tenantId).eq("entity_type", entityType);
-    if (error) throw error;
-    const defs = (existing ?? []) as { id: string; label: string; display_order: number | null; config: Record<string, unknown> | null }[];
+  for (const f of fresh) seen.set(String(f.label).trim().toLowerCase(), at);
+  await once(ctx, `zuperFieldDefinitions:${entityType}:${at}:${fresh.map((f) => String(f.label).trim().toLowerCase()).sort().join("|")}`, async () => {
+    // The definitions are read once a run and kept current here, so a newer record costs no extra read.
+    const rowsKey = `zuperFieldDefRows:${entityType}`;
+    if (!ctx.extra[rowsKey]) {
+      const { data: existing, error } = await ctx.client.schema("jms").from("custom_field_definitions")
+        .select("id, label, display_order, config").eq("tenant_id", ctx.tenantId).eq("entity_type", entityType);
+      if (error) throw error;
+      ctx.extra[rowsKey] = (existing ?? []) as { id: string; label: string; display_order: number | null; config: Record<string, unknown> | null }[];
+    }
+    const defs = ctx.extra[rowsKey] as { id: string; label: string; display_order: number | null; config: Record<string, unknown> | null }[];
     const have = new Map(defs.map((d) => [d.label.trim().toLowerCase(), d]));
     let order = Math.max(0, ...defs.map((d) => d.display_order ?? 0));
     const added: Record<string, unknown>[] = [];
@@ -851,12 +887,17 @@ async function ensureZuperFieldDefinitions(ctx: Ctx, entityType: string, fields:
           field_type: jmsFieldType(f.type), display_order: ++order,
           // Always present, even empty: one insert carries several definitions and they must all name the same
           // columns, or the ones that left `config` out are sent as NULL and the whole write fails on NOT NULL.
-          config: kept,
+          config: { ...kept, ...(at ? { zuper_seen_at: at } : {}) },
         });
-      } else if (Object.entries(kept).some(([k, v]) => (mine.config as Record<string, unknown> | null)?.[k] !== v)) {
+      } else if (Object.entries(kept).some(([k, v]) => (mine.config as Record<string, unknown> | null)?.[k] !== v)
+        // An event re-reads one record at a time, so what decided the field is kept with it (zuper_seen_at): an older
+        // record does not undo what a newer one said.
+        && !(at && typeof mine.config?.zuper_seen_at === "string" && at < mine.config.zuper_seen_at)) {
+        const config = { ...(mine.config ?? {}), ...kept, ...(at ? { zuper_seen_at: at } : {}) };
         const { error: keyErr } = await ctx.client.schema("jms").from("custom_field_definitions")
-          .update({ config: { ...(mine.config ?? {}), ...kept } }).eq("id", mine.id).eq("tenant_id", ctx.tenantId);
+          .update({ config }).eq("id", mine.id).eq("tenant_id", ctx.tenantId);
         if (keyErr) throw keyErr;
+        mine.config = config;
       }
     }
     if (added.length) {
@@ -864,19 +905,19 @@ async function ensureZuperFieldDefinitions(ctx: Ctx, entityType: string, fields:
         .upsert(added, { onConflict: "tenant_id,entity_type,field_key", ignoreDuplicates: true });
       if (insertError) throw insertError;
       delete ctx.extra[`customFieldDefs:${entityType}`]; // writeCustomFieldValues reloads them
+      delete ctx.extra[`zuperFieldDefRows:${entityType}`];
     }
     return null;
   });
-  for (const f of fresh) known.add(String(f.label).trim().toLowerCase());
 }
 
 /** A record's custom fields as Zuper answers them → Tuper's definitions and values. A date Zuper sends as something
  *  that is not a date is left out rather than failing the whole record on a typed column. */
-async function writeZuperCustomFields(ctx: Ctx, entityType: string, entityId: string, fields: unknown, internal?: unknown): Promise<void> {
+async function writeZuperCustomFields(ctx: Ctx, entityType: string, entityId: string, fields: unknown, internal?: unknown, recordAt?: unknown): Promise<void> {
   const list = (Array.isArray(fields) ? fields : []).filter((f) => T(f?.label));
   if (!list.length) return;
   const asObject = internal && typeof internal === "object" ? internal as Record<string, unknown> : null;
-  await ensureZuperFieldDefinitions(ctx, entityType, list, asObject);
+  await ensureZuperFieldDefinitions(ctx, entityType, list, asObject, T(recordAt));
   const key = `customFieldDefs:${entityType}`;
   if (!ctx.extra[key]) {
     const { data, error } = await ctx.client.schema("jms").from("custom_field_definitions").select("id, label, field_type")
@@ -934,6 +975,28 @@ async function writeDocumentAddresses(ctx: Ctx, parentType: "QUOTE" | "INVOICE",
   const { error } = await ctx.client.schema("jms").from("addresses").upsert(rows, { onConflict: "parent_type,parent_id,address_kind" });
   if (error) throw error;
 }
+/**
+ * What a quote went through that Tuper had no columns for until 00195: the instants behind its two dates (Zuper keeps
+ * the moment the person entered — Dubai midnight on 22 of GBG's 35 quotes, India midnight on 11), when it was sent,
+ * whether financing was offered, how its discount is applied, and the deposit's own timeline.
+ * A key Zuper did not send is left out rather than written as empty: a partial row must never clear what a full one
+ * wrote.
+ */
+function quoteState(r: any): Record<string, unknown> {
+  const has = (k: string) => r != null && typeof r === "object" && k in r;
+  const d = r?.deposit && typeof r.deposit === "object" ? r.deposit : null;
+  return {
+    ...(has("estimate_date") ? { quote_at: ts(r.estimate_date) } : {}),
+    ...(has("expiry_date") ? { expires_at: ts(r.expiry_date) } : {}),
+    ...(has("sent_date") ? { sent_at: ts(r.sent_date) } : {}),
+    ...(has("financing") ? { financing_enabled: r.financing?.is_enabled === true } : {}),
+    ...(has("discount") ? { discount_setting: r.discount && typeof r.discount === "object" ? r.discount : null } : {}),
+    ...(d ? {
+      deposit_requested_at: ts(d.created_at), deposit_collected_at: ts(d.collected_at),
+      deposit_payment_via: T(d.payment_via), deposit_credit_issued: "is_credit_issued" in d ? d.is_credit_issued === true : null,
+    } : {}),
+  };
+}
 /** A quote's Zuper status_history → jms.quote_status_history (00107), replacing the imported rows and keeping any
  *  Tuper made after the import. Nothing is touched when Zuper returned no history. */
 async function writeQuoteStatusHistory(ctx: Ctx, quoteId: string, history: any[] | undefined): Promise<void> {
@@ -951,6 +1014,140 @@ async function writeQuoteStatusHistory(ctx: Ctx, quoteId: string, history: any[]
       changed_at: String(h.created_at), source: "zuper",
     }));
   if (rows.length) { const { error } = await tbl().insert(rows); if (error) throw error; }
+}
+/**
+ * Tuper's copy of the tax a Zuper document was charged. Zuper publishes no list of taxes — its API answers 404 for
+ * /api/tax, /api/taxes, /api/misc/tax and the rest — so a tax is known from the documents that charge it (each names
+ * it in full under tax[].tax_id) and is made the first time one is seen. GBG charges one: "Standard Rate", 5%.
+ */
+async function documentTaxId(ctx: Ctx, taxes: any[] | undefined): Promise<string | null> {
+  const t = (Array.isArray(taxes) ? taxes : []).find((x) => T(x?.tax_uid ?? x?.tax_id?.tax_uid));
+  if (!t) return null;
+  const uid = T(t.tax_uid ?? t.tax_id?.tax_uid)!;
+  const map = await ctxMap(ctx, "taxes");
+  if (map.has(uid)) return map.get(uid)!;
+  return once(ctx, `tax:${uid}`, async () => {
+    const made = await ctx.client.schema("jms").from("taxes").insert({
+      tenant_id: ctx.tenantId, name: T(t.tax_name ?? t.tax_id?.tax_name) ?? "Tax",
+      rate_percent: num0(t.tax_percent ?? t.tax_id?.tax_rate), is_active: t.tax_id?.is_active !== false,
+    }).select("id").single();
+    if (made.error) throw made.error;
+    const id = (made.data as { id: string }).id;
+    await setMap(ctx, "taxes", uid, id);
+    return id;
+  });
+}
+/**
+ * A contract's invoice settings → its columns (00196). The billing period is matched by its length in months
+ * (Zuper's "Annually", 12 MONTHS, is Tuper's "Annual") and the payment term by name, as invoices match theirs.
+ */
+async function contractInvoiceSettings(ctx: Ctx, s: any): Promise<Record<string, unknown>> {
+  const months = String(s.billing_period?.billing_period_type ?? "MONTHS").toUpperCase() === "MONTHS" ? Number(s.billing_period?.billing_period_value) : NaN;
+  let billing_period_id: string | null = null;
+  if (Number.isFinite(months) && months > 0) {
+    const { data, error } = await ctx.client.schema("jms").from("contract_billing_periods").select("id")
+      .eq("tenant_id", ctx.tenantId).eq("interval_months", months).eq("is_active", true).limit(1);
+    if (error) throw error;
+    billing_period_id = ((data ?? []) as { id: string }[])[0]?.id ?? null;
+    const zuperName = T(s.billing_period?.billing_period_name);
+    if (billing_period_id && zuperName) {
+      const { error: nameErr } = await ctx.client.schema("jms").from("contract_billing_periods").update({ name: zuperName })
+        .eq("tenant_id", ctx.tenantId).eq("id", billing_period_id).neq("name", zuperName);
+      if (nameErr) throw nameErr;
+    }
+  }
+  return {
+    ...("billing_period" in s ? { billing_period_id } : {}),
+    ...("payment_term" in s ? { payment_term_id: await paymentTermId(ctx, s.payment_term) } : {}),
+    ...("invoice_template" in s ? { invoice_template_id: await documentTemplateId(ctx, s.invoice_template?.template_uid) } : {}),
+    ...sent(s, "auto_generate", "invoice_auto_generate", (v) => v === true),
+    ...sent(s, "auto_charge_enabled", "invoice_auto_charge", (v) => v === true),
+    ...sent(s, "generate_invoice_days", "invoice_days_before", (v) => (v == null ? null : Math.trunc(num0(v)))),
+    ...sent(s, "send_to_customer", "invoice_send_to_customer", (v) => v === true),
+  };
+}
+/** Tuper's copy of the package a contract was sold as, found by name or made from the contract's own copy of it. */
+async function contractPackageId(ctx: Ctx, p: any): Promise<string | null> {
+  const name = T(p?.package_name);
+  if (!name) return null;
+  return once(ctx, `contract_package:${name.toLowerCase()}`, async () => {
+    const tbl = () => ctx.client.schema("jms").from("contract_packages");
+    const { data, error } = await tbl().select("id").eq("tenant_id", ctx.tenantId).eq("name", name).limit(1);
+    if (error) throw error;
+    const row = {
+      description: T(p.package_description), prefix: T(p.prefix), term_months: p.package_terms == null ? null : Math.trunc(num0(p.package_terms)),
+      price: ((p.line_items ?? []) as any[]).reduce((sum, l) => sum + num0(l?.total), 0), is_active: p.is_deleted !== true,
+    };
+    const found = ((data ?? []) as { id: string }[])[0]?.id;
+    if (found) {
+      const { error: upErr } = await tbl().update(row).eq("tenant_id", ctx.tenantId).eq("id", found);
+      if (upErr) throw upErr;
+      return found;
+    }
+    const made = await tbl().insert({ tenant_id: ctx.tenantId, name, ...row }).select("id").single();
+    if (made.error) throw made.error;
+    return (made.data as { id: string }).id;
+  });
+}
+/** The request source a request names, written from the request's own copy of it the first time a run sees it. The
+ *  request keeps the name; this only makes sure the record behind the name exists (00197). */
+async function requestSource(ctx: Ctx, src: any): Promise<void> {
+  const uid = T(src?.request_source_uid), name = T(src?.request_source_name);
+  if (!uid || !name) return;
+  await once(ctx, `request_source:${uid}`, async () => {
+    const row = {
+      name, description: T(src.request_source_description), display_order: Math.trunc(num0(src.display_order)),
+      created_by: mapGet(await ctxMap(ctx, "users"), src.created_by?.user_uid), is_deleted: src.is_deleted === true,
+      ...(src.created_at ? { created_at: String(src.created_at) } : {}), ...(src.updated_at ? { updated_at: String(src.updated_at) } : {}),
+    };
+    const tbl = () => ctx.client.schema("jms").from("request_sources");
+    const have = (await ctxMap(ctx, "request_sources")).get(uid);
+    if (have) {
+      const { error } = await tbl().update(row).eq("tenant_id", ctx.tenantId).eq("id", have);
+      if (error) throw error;
+      return have;
+    }
+    const made = await tbl().insert({ tenant_id: ctx.tenantId, ...row }).select("id").single();
+    if (made.error) throw made.error;
+    const id = (made.data as { id: string }).id;
+    await setMap(ctx, "request_sources", uid, id);
+    return id;
+  });
+}
+/**
+ * A quote's or an invoice's notes. Zuper keeps them inside the document (notes[]) and its /api/notes list — which the
+ * notes entity reads — carries only job, request, asset, customer, project and purchase-order notes, so these never
+ * came over (GBG: two quotes and one invoice carry one each). Written by their Zuper uid, updated in place if seen
+ * before. Nothing is removed when a note is missing: a document without `notes` is a partial row, not an empty list.
+ */
+async function writeDocumentNotes(ctx: Ctx, entityType: "quote" | "invoice", entityId: string, r: any): Promise<void> {
+  if (!Array.isArray(r?.notes)) return;
+  const users = await ctxMap(ctx, "users");
+  const tbl = () => ctx.client.schema("jms").from("entity_comments");
+  for (const n of r.notes as any[]) {
+    const uid = T(n?.note_uid);
+    if (!uid) continue;
+    const raw = String(n.content ?? n.note ?? "");
+    const html = /<[a-z][\s\S]*>/i.test(raw) ? sanitizeRichText(raw) : "";
+    const row = {
+      entity_type: entityType, entity_id: entityId, author_id: mapGet(users, n.created_by?.user_uid),
+      body: (html ? T(richTextToPlain(html)) : T(raw)) ?? "", body_html: html || null,
+      visibility: n.is_private === true ? "ONLY_ME" : n.visible_to_customer === true ? "PUBLIC" : "INTERNAL",
+      is_pinned: false, notify: false, zuper_uid: uid, ...createdAt(n),
+    };
+    const { data, error } = await tbl().select("id").eq("tenant_id", ctx.tenantId).eq("zuper_uid", uid).limit(1);
+    if (error) throw error;
+    const have = ((data ?? []) as { id: string }[])[0]?.id;
+    if (have) {
+      const { error: upErr } = await tbl().update(row).eq("tenant_id", ctx.tenantId).eq("id", have);
+      if (upErr) throw upErr;
+      await setMap(ctx, "notes", uid, have);
+    } else {
+      const made = await tbl().insert({ tenant_id: ctx.tenantId, ...row }).select("id").single();
+      if (made.error) throw made.error;
+      await setMap(ctx, "notes", uid, (made.data as { id: string }).id);
+    }
+  }
 }
 /** Tuper's copy of a Zuper document template (00082 imported them, keyed by source_uid). */
 async function documentTemplateId(ctx: Ctx, templateUid: unknown): Promise<string | null> {
@@ -1391,7 +1588,7 @@ export const ENTITIES: Record<string, Entity> = {
     async afterWrite(ctx, id, r, isNew) {
       await writeAddresses(ctx, "ORGANIZATION", id, isNew, r.organization_address, r.organization_billing_address);
       // The organization's Zoho CRM account id and its siblings, when this is a by-uid read: the list rows carry none.
-      await writeZuperCustomFields(ctx, "ORGANIZATION", id, r.custom_fields, r.custom_field_internal_object);
+      await writeZuperCustomFields(ctx, "ORGANIZATION", id, r.custom_fields, r.custom_field_internal_object, r.created_at);
       // The organization's own files, when this is a by-uid read: the list rows the import pages through carry none.
       await writeRecordFiles(ctx, "organization", id, r);
     },
@@ -1404,7 +1601,7 @@ export const ENTITIES: Record<string, Entity> = {
     async afterWrite(ctx, id, r, isNew) {
       await writeAddresses(ctx, "CUSTOMER", id, isNew, r.customer_address, r.customer_billing_address);
       // The customer's Zoho CRM / Zoho Books contact ids and its siblings — the list rows carry these.
-      await writeZuperCustomFields(ctx, "CUSTOMER", id, r.custom_fields, r.custom_field_internal_object);
+      await writeZuperCustomFields(ctx, "CUSTOMER", id, r.custom_fields, r.custom_field_internal_object, r.created_at);
       // The customer's own files, when this is a by-uid read: the list rows the import pages through carry none.
       await writeRecordFiles(ctx, "customer", id, r);
     },
@@ -1444,7 +1641,7 @@ export const ENTITIES: Record<string, Entity> = {
     },
     insert: provisionImportedUser,
     // The person's own custom fields (GBG uses one, "Nickname") — again only on a by-uid read.
-    afterWrite: (ctx, id, r) => writeZuperCustomFields(ctx, "USER", id, r.custom_fields, r.custom_field_internal_object),
+    afterWrite: (ctx, id, r) => writeZuperCustomFields(ctx, "USER", id, r.custom_fields, r.custom_field_internal_object, r.created_at),
   },
   assets: {
     name: "assets", schema: "jms", table: "assets", deps: ["customers", "asset_categories"], concurrency: 8,
@@ -1461,6 +1658,9 @@ export const ENTITIES: Record<string, Entity> = {
         asset_location: r.asset_location && typeof r.asset_location === "object" ? r.asset_location : null,
         placed_in_service: dubaiDate(r.placed_in_service),
         purchase_date: dubaiDate(r.purchase_date), warranty_expiry: dubaiDate(r.warranty_expiry_date),
+        // The moment behind each date, as Zuper keeps it (Dubai midnight, or 23:59:59 for a warranty's end).
+        ...sent(r, "purchase_date", "purchased_at"), ...sent(r, "placed_in_service", "placed_in_service_at"),
+        ...sent(r, "warranty_expiry_date", "warranty_expires_at"),
         category_id: await assetCategoryId(ctx, r.asset_category), customer_id: await customerId(ctx, r.customer),
         organization_id: await organizationId(ctx, r.organization),
         parent_asset_id: mapGet(await ctxMap(ctx, "assets"), r.parent_asset?.asset_uid),
@@ -1470,7 +1670,7 @@ export const ENTITIES: Record<string, Entity> = {
     },
     async afterWrite(ctx, id, r) {
       // The asset's 36 custom fields (Rental Number, battery and motor serial numbers, AMC …) — the filter list carries them.
-      await writeZuperCustomFields(ctx, "ASSET", id, r.custom_fields, r.custom_field_internal_object);
+      await writeZuperCustomFields(ctx, "ASSET", id, r.custom_fields, r.custom_field_internal_object, r.created_at);
       // The asset's own files (asset_attachments), when this is a by-uid read: the filter list rows carry none.
       await writeRecordFiles(ctx, "asset", id, r);
     },
@@ -1499,6 +1699,17 @@ export const ENTITIES: Record<string, Entity> = {
         assigned_to: mapGet(await ctxMap(ctx, "users"), r.assigned_to?.[0]?.user?.user_uid ?? r.assigned_to?.user_uid),
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
         total: num0(r.contract_total),
+        // The moments behind the dates, and the activation date, which is its own (GBG's starts 1 Jan, activated 10 Jan).
+        ...sent(r, "start_date", "starts_at"), ...sent(r, "end_date", "ends_at"), ...sent(r, "activation_date", "activated_at"),
+        // What the contract prints with, how it is billed and what it was sold as — each was left unlinked.
+        template_id: await documentTemplateId(ctx, r.template?.template_uid),
+        ...(r.invoice_settings && typeof r.invoice_settings === "object" ? await contractInvoiceSettings(ctx, r.invoice_settings) : {}),
+        ...(r.contract_package && typeof r.contract_package === "object" ? { package_id: await contractPackageId(ctx, r.contract_package) } : {}),
+        ...sent(r, "job_settings", "job_auto_generate", (v) => (v && typeof v === "object" && "auto_generate" in v ? v.auto_generate === true : null)),
+        ...sent(r, "booking_settings", "booking_auto_generate", (v) => (v && typeof v === "object" && "auto_generate" in v ? v.auto_generate === true : null)),
+        ...sent(r, "discount", "discount_setting", (v) => (v && typeof v === "object" ? v : null)),
+        ...sent(r, "tax_exempt", "tax_exempt", (v) => v === true),
+        ...sent(r, "non_billable_total", "non_billable_total", (v) => (v == null ? null : num0(v))),
         is_active: r.is_active !== false && r.is_expired !== true, ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
       };
     },
@@ -1506,14 +1717,14 @@ export const ENTITIES: Record<string, Entity> = {
       // The contract is served at one address and billed at another, and covers a list of items — all three only on
       // the by-uid read. Zuper calls the service one `customer_address`.
       await writeAddresses(ctx, "CONTRACT", id, isNew, r.customer_address, r.billing_address);
-      if (Array.isArray(r.line_items)) await writeLineItems(ctx, "CONTRACT", id, r.line_items, isNew);
+      if (Array.isArray(r.line_items)) await writeLineItems(ctx, "CONTRACT", id, r.line_items, isNew, r.tax);
       // The contract's own files, when this is a by-uid read: the filter list rows carry none. Zuper's catalogue has no
       // service_contract attachment event, so these arrive on any other contract change or on the backfill.
       await writeRecordFiles(ctx, "service_contract", id, r);
     },
   },
   requests: {
-    name: "requests", schema: "jms", table: "requests", deps: ["customers", "organizations", "users", "assets"],
+    name: "requests", schema: "jms", table: "requests", deps: ["customers", "organizations", "users", "assets", "request_sources"],
     // Read in full: only GET /api/request/{uid} carries the asset the request is about. GBG has eight requests.
     fetch: (ctx) => withDetails(ctx.cfg, "/api/request/filter", (r) => `/api/request/${r.request_uid}`),
     uid: (r) => r.request_uid,
@@ -1524,6 +1735,8 @@ export const ENTITIES: Record<string, Entity> = {
         ctx.extra.requestStatuses = new Map(((data ?? []) as { id: string; status_type: string }[]).map((x) => [x.status_type, x.id])); // lowest display_order wins
       }
       const priority = String(r.request_priority ?? "").toUpperCase();
+      // The source record behind the name the request keeps (00197).
+      if (r.request_source && typeof r.request_source === "object") await requestSource(ctx, r.request_source);
       return {
         request_number: String(r.request_id ?? r.request_uid),
         title: T(r.request_title) ?? "Request",
@@ -1537,6 +1750,10 @@ export const ENTITIES: Record<string, Entity> = {
         priority: JOB_PRIORITIES.has(priority) ? priority : "LOW",
         assigned_to: mapGet(await ctxMap(ctx, "users"), r.assigned_to?.[0]?.user?.user_uid),
         due_date: ts(r.request_due_date), preferred_date_1: ts(r.request_preferred_date1?.start_time), preferred_date_2: ts(r.request_preferred_date2?.start_time),
+        ...sent(r, "request_preferred_date1", "preferred_date_1_end", (v) => ts(v?.end_time)),
+        ...sent(r, "request_preferred_date2", "preferred_date_2_end", (v) => ts(v?.end_time)),
+        // Zuper stores the flag: 4 of GBG's 8 requests are converted with no job to show for it.
+        ...sent(r, "is_converted", "is_converted", (v) => (v == null ? null : v === true)),
         request_source: T(r.request_source?.request_source_name),
         ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
       };
@@ -1690,17 +1907,19 @@ export const ENTITIES: Record<string, Entity> = {
         template_id: await documentTemplateId(ctx, r.template?.template_uid),
         description_html: T(r.estimate_description),
         deposit_amount: r.deposit?.total == null ? null : num0(r.deposit.total), deposit_status: T(r.deposit?.status),
+        ...quoteState(r),
         ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
       };
     },
     async afterWrite(ctx, id, r, isNew) {
-      await writeLineItems(ctx, "QUOTE", id, r.line_items, isNew);
+      await writeLineItems(ctx, "QUOTE", id, r.line_items, isNew, r.tax);
       await writeDocumentAddresses(ctx, "QUOTE", id, r);
       await writeQuoteStatusHistory(ctx, id, r.status_history);
       await ensureCustomFieldDefinitions(ctx, "QUOTE", (r.custom_fields ?? []).map((f: any) => String(f?.label ?? "")));
       await writeCustomFieldValues(ctx, "QUOTE", id, r.custom_fields);
       // The quote's own files. `fetch` reads every quote in full, so these come over on an import as well as on an event.
       await writeRecordFiles(ctx, "quote", id, r);
+      await writeDocumentNotes(ctx, "quote", id, r);
     },
   },
   invoices: {
@@ -1733,16 +1952,16 @@ export const ENTITIES: Record<string, Entity> = {
       };
     },
     async afterWrite(ctx, id, r, isNew) {
-      await writeLineItems(ctx, "INVOICE", id, r.line_items, isNew);
+      await writeLineItems(ctx, "INVOICE", id, r.line_items, isNew, r.tax);
       // The invoice's own addresses — a snapshot of where the work was and who was billed when it was raised, not
       // the customer's address of today. writeDocumentAddresses has taken "INVOICE" since it was written; it was
       // only ever called for quotes, so every invoice answered an empty address (FIELD-PARITY 2026-09-21).
       await writeDocumentAddresses(ctx, "INVOICE", id, r);
-      await writeDocumentAddresses(ctx, "INVOICE", id, r);
       // The invoice's Zoho Books invoice id and its siblings, with Zuper's own key for each (custom_field_internal_object).
-      await writeZuperCustomFields(ctx, "INVOICE", id, r.custom_fields, r.custom_field_internal_object);
+      await writeZuperCustomFields(ctx, "INVOICE", id, r.custom_fields, r.custom_field_internal_object, r.created_at);
       // The invoice's own files. `fetch` reads every invoice in full, so these come over on an import as well as on an event.
       await writeRecordFiles(ctx, "invoice", id, r);
+      await writeDocumentNotes(ctx, "invoice", id, r);
     },
   },
 };
@@ -1797,7 +2016,7 @@ const zuperFieldPass = (
   },
   afterWrite(ctx, id, r) {
     const d = r._fields ?? r;
-    return writeZuperCustomFields(ctx, entityType, id, d.custom_fields, d.custom_field_internal_object);
+    return writeZuperCustomFields(ctx, entityType, id, d.custom_fields, d.custom_field_internal_object, d.created_at);
   },
 });
 /** Every record of a kind Tuper has mapped to a Zuper uid, a hundred uids at a time. */
@@ -2015,6 +2234,7 @@ async function ensureCustomFieldDefinitions(ctx: Ctx, entityType: string, labels
       const { error: insertError } = await ctx.client.schema("jms").from("custom_field_definitions").upsert(rows, { onConflict: "tenant_id,entity_type,field_key", ignoreDuplicates: true });
       if (insertError) throw insertError;
       delete ctx.extra[`customFieldDefs:${entityType}`]; // writeCustomFieldValues reloads them
+      delete ctx.extra[`zuperFieldDefRows:${entityType}`];
     }
     return null;
   });
@@ -2075,6 +2295,23 @@ ENTITIES.product_categories = {
   fetch: (ctx) => zuperGet(ctx.cfg, "/api/products/category?page=1&count=500").then((j) => j.data ?? []),
   uid: (r) => r.category_uid,
   async transform(r) { return { name: T(r.category_name) ?? "Category" }; },
+};
+// Where a request came from ("Customer Portal", "Website" …). Zuper keeps these as records of their own and answers the
+// whole record as a request's request_source; Tuper had only the name until 00197. Zuper sends no event for them: this
+// list pass brings them all over, and a request brings over the one it names (requestSource), so an event keeps up.
+ENTITIES.request_sources = {
+  name: "request_sources", schema: "jms", table: "request_sources", deps: ["users"],
+  fetch: (ctx) => zuperGet(ctx.cfg, "/api/request/source").then((j) => j.data ?? []),
+  uid: (r) => r.request_source_uid,
+  async transform(r, ctx) {
+    return {
+      name: T(r.request_source_name) ?? "Source", description: T(r.request_source_description),
+      display_order: Math.trunc(num0(r.display_order)),
+      created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
+      ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
+      ...(r.updated_at ? { updated_at: String(r.updated_at) } : {}),
+    };
+  },
 };
 ENTITIES.stock_locations = {
   name: "stock_locations", schema: "jms", table: "locations",
