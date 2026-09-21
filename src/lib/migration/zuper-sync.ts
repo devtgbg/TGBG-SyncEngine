@@ -714,13 +714,24 @@ async function provisionImportedUser(ctx: Ctx, payload: Record<string, unknown>,
 /** Assigned users (those Tuper has; inactive staff are imported too since 2026-09-15) → jms.job_assignments. */
 async function writeJobAssignments(ctx: Ctx, jobId: string, r: any, isNew: boolean): Promise<void> {
   const users = await ctxMap(ctx, "users");
+  const teams = await ctxMap(ctx, "teams");
   const seen = new Set<string>();
   const rows: Record<string, unknown>[] = [];
   for (const a of r.assigned_to ?? []) {
     const userId = mapGet(users, a.user?.user_uid);
     if (!userId || seen.has(userId)) continue;
     seen.add(userId);
-    rows.push({ tenant_id: ctx.tenantId, job_id: jobId, user_id: userId, is_primary: a.is_primary === true, accepted_at: a.is_accepted ? ts(a.assigned_at) : null });
+    // When Zuper assigned them (older assignments carry no time; the row's own time stands then), the team they were
+    // assigned under (00201 — Zuper answers it on every assignment), and whether they accepted. Acceptance was only
+    // recorded when an assigned time came with it, so an older accepted assignment read as waiting.
+    const at = ts(a.assigned_at);
+    const accepted = a.is_accepted === true || String(a.acceptance_status ?? "").toUpperCase() === "ACCEPTED";
+    rows.push({
+      tenant_id: ctx.tenantId, job_id: jobId, user_id: userId, is_primary: a.is_primary === true,
+      team_id: mapGet(teams, a.team?.team_uid),
+      accepted_at: accepted ? at ?? ts(r.updated_at) ?? ts(r.created_at) : null,
+      ...(at ? { created_at: at } : {}),
+    });
   }
   const tbl = () => ctx.client.schema("jms").from("job_assignments");
   if (!isNew) { const { error } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("job_id", jobId); if (error) throw error; }
@@ -1257,8 +1268,10 @@ async function writeFavoriteTechnicians(ctx: Ctx, customerId: string, list: any[
     if (insErr) throw insErr;
   }
 }
-/** Tuper's copy of a Zuper document template (00082 imported them, keyed by source_uid). */
-async function documentTemplateId(ctx: Ctx, templateUid: unknown): Promise<string | null> {
+/** Tuper's copy of a Zuper document template (00082 imported them, keyed by source_uid). Given the template as a
+ *  document embeds it, it also records whether Zuper's template carries page options (00202): its "Invoice" template
+ *  never does, the others always, so the API answers template_options only where Zuper does. */
+async function documentTemplateId(ctx: Ctx, templateUid: unknown, embedded?: any): Promise<string | null> {
   const uid = T(templateUid);
   if (!uid) return null;
   const cache: Map<string, string | null> = (ctx.extra.templateIds ??= new Map());
@@ -1268,7 +1281,31 @@ async function documentTemplateId(ctx: Ctx, templateUid: unknown): Promise<strin
     if (error) throw error;
     cache.set(uid, (data as { id: string } | null)?.id ?? null);
   }
-  return cache.get(uid) ?? null;
+  const id = cache.get(uid) ?? null;
+  if (id && embedded && typeof embedded === "object") {
+    await once(ctx, `template_options:${uid}`, async () => {
+      const { error } = await ctx.client.schema("jms").from("document_templates")
+        .update({ page_options: "template_options" in embedded }).eq("tenant_id", ctx.tenantId).eq("id", id);
+      if (error) throw error;
+      return id;
+    });
+  }
+  return id;
+}
+/** An invoice's Zuper status_history → jms.invoice_status_history (00202), replaced as a whole: Zuper is the record of
+ *  an invoice's timeline. Nothing is touched when Zuper sent no history. */
+async function writeInvoiceStatusHistory(ctx: Ctx, invoiceId: string, history: any[] | undefined): Promise<void> {
+  if (!Array.isArray(history) || !history.length) return;
+  const users = await ctxMap(ctx, "users");
+  const rows = history.filter((h) => T(h?.status_name) && h?.created_at).map((h) => ({
+    tenant_id: ctx.tenantId, invoice_id: invoiceId, status: String(h.status_name).toUpperCase(), remarks: T(h.remarks),
+    changed_by: mapGet(users, h.done_by?.user_uid), done_by_type: String(h.done_by_type ?? "EMPLOYEE").toUpperCase(),
+    changed_at: String(h.created_at),
+  }));
+  const tbl = () => ctx.client.schema("jms").from("invoice_status_history");
+  const { error } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("invoice_id", invoiceId);
+  if (error) throw error;
+  if (rows.length) { const { error: insErr } = await tbl().insert(rows); if (insErr) throw insErr; }
 }
 /** Tuper's copy of a Zuper payment term. Terms are not imported as records of their own, so they are matched by the
  *  name Zuper answers ("Immediatly", "Monthly"), which is the name Tuper's seeded terms carry. */
@@ -1736,14 +1773,9 @@ export const ENTITIES: Record<string, Entity> = {
         if (error) throw error;
         ctx.extra.roles = new Map(((data ?? []) as { id: string; role_key: string }[]).map((x) => [x.role_key, x.id]));
       }
-      // Zuper lets people share an employee code ("CS", "Cleaner"); Tuper's are unique, so a code someone else here
-      // already has is left off, as the first import did.
-      let empCode = T(r.emp_code);
-      if (empCode) {
-        const me = mapGet(await ctxMap(ctx, "users"), r.user_uid);
-        const { data: holders } = await ctx.client.schema("jms").from("users").select("id").eq("tenant_id", ctx.tenantId).eq("emp_code", empCode).limit(2);
-        if (((holders ?? []) as { id: string }[]).some((u) => u.id !== me)) empCode = null;
-      }
+      // Zuper lets people share an employee code ("CS", "Cleaner"), and so does Tuper since 00203: the code is kept
+      // for everyone who has it (it used to be left off all but the first).
+      const empCode = T(r.emp_code);
       return {
         emp_code: empCode, first_name: T(r.first_name) ?? "User", last_name: T(r.last_name), designation: T(r.designation),
         role_id: mapGet(ctx.extra.roles, r.role?.role_key), home_phone: T(r.home_phone_number), mobile_phone: T(r.mobile_phone_number),
@@ -1816,7 +1848,7 @@ export const ENTITIES: Record<string, Entity> = {
         // The moments behind the dates, and the activation date, which is its own (GBG's starts 1 Jan, activated 10 Jan).
         ...sent(r, "start_date", "starts_at"), ...sent(r, "end_date", "ends_at"), ...sent(r, "activation_date", "activated_at"),
         // What the contract prints with, how it is billed and what it was sold as — each was left unlinked.
-        template_id: await documentTemplateId(ctx, r.template?.template_uid),
+        template_id: await documentTemplateId(ctx, r.template?.template_uid, r.template),
         ...(r.invoice_settings && typeof r.invoice_settings === "object" ? await contractInvoiceSettings(ctx, r.invoice_settings) : {}),
         ...(r.contract_package && typeof r.contract_package === "object" ? { package_id: await contractPackageId(ctx, r.contract_package) } : {}),
         ...sent(r, "job_settings", "job_auto_generate", (v) => (v && typeof v === "object" && "auto_generate" in v ? v.auto_generate === true : null)),
@@ -2023,7 +2055,7 @@ export const ENTITIES: Record<string, Entity> = {
         prefix: T(r.prefix), title: T(r.proposal_title), reference_no: T(r.reference_no),
         sold_by: mapGet(await ctxMap(ctx, "users"), (r.sold_by_user ?? r.sold_by)?.user_uid),
         tags: Array.isArray(r.tags) ? r.tags.map((t: any) => T(typeof t === "string" ? t : t?.tag_name ?? t?.name)).filter(Boolean) : [],
-        template_id: await documentTemplateId(ctx, r.template?.template_uid),
+        template_id: await documentTemplateId(ctx, r.template?.template_uid, r.template),
         description_html: T(r.estimate_description),
         deposit_amount: r.deposit?.total == null ? null : num0(r.deposit.total), deposit_status: T(r.deposit?.status),
         ...quoteState(r),
@@ -2065,8 +2097,13 @@ export const ENTITIES: Record<string, Entity> = {
         title: T(r.invoice_title), prefix: T(r.prefix), reference_no: T(r.reference_no),
         description: T(r.plain_text_description) ?? T(r.description),
         tags: Array.isArray(r.tags) ? r.tags.map((t: any) => T(typeof t === "string" ? t : t?.tag_name ?? t?.name)).filter(Boolean) : [],
-        template_id: await documentTemplateId(ctx, r.template?.template_uid),
+        template_id: await documentTemplateId(ctx, r.template?.template_uid, r.template),
         payment_term_id: await paymentTermId(ctx, r.payment_term),
+        // The moments behind its two dates, financing, how its discount is applied and its remarks (00202).
+        ...sent(r, "invoice_date", "invoice_at"), ...sent(r, "due_date", "due_at"),
+        ...sent(r, "financing", "financing_enabled", (v) => v?.is_enabled === true),
+        ...sent(r, "discount", "discount_setting", (v) => (v && typeof v === "object" ? v : null)),
+        ...sent(r, "remarks", "remarks", (v) => T(v)),
         ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
       };
     },
@@ -2081,6 +2118,7 @@ export const ENTITIES: Record<string, Entity> = {
       // The invoice's own files. `fetch` reads every invoice in full, so these come over on an import as well as on an event.
       await writeRecordFiles(ctx, "invoice", id, r);
       await writeDocumentNotes(ctx, "invoice", id, r);
+      await writeInvoiceStatusHistory(ctx, id, r.status_history);
     },
   },
 };
@@ -2149,6 +2187,25 @@ ENTITIES.customer_fields = zuperFieldPass("customer_fields", "customers", "custo
 ENTITIES.organization_fields = zuperFieldPass("organization_fields", "organizations", "organizations", "ORGANIZATION", {
   pages: mappedUids("organizations", "organization_uid"), uid: (r) => r.organization_uid, detail: (u) => `/api/organization/${u}`,
 });
+// A person's Zuper meta_data — burden rate, labour type, worker's comp code, default stock location, dispatch-board
+// view — which only the by-uid read carries (the list leaves it out) and nothing imported. Kept as Zuper sends it; the
+// burden rate and comp code also fill Tuper's own columns.
+ENTITIES.user_details = {
+  name: "user_details", schema: "jms", table: "users", mapEntity: "users", enrichOnly: true, concurrency: 4,
+  pages: mappedUids("users", "user_uid"),
+  uid: (r) => r.user_uid,
+  async transform(r, ctx) {
+    const d = (await zuperGet(ctx.cfg, `/api/user/${r.user_uid}`)).data ?? {};
+    if (!("meta_data" in d)) return {};
+    const m = d.meta_data && typeof d.meta_data === "object" ? d.meta_data : null;
+    return {
+      // An empty object where Zuper answers null (the column is NOT NULL); Tuper answers null for an empty one.
+      meta_data: m ?? {},
+      burden_rate: m?.burden_rate && typeof m.burden_rate === "object" && m.burden_rate.value != null ? num0(m.burden_rate.value) : null,
+      worker_comp_code: T(m?.worker_comp_code),
+    };
+  },
+};
 ENTITIES.user_fields = zuperFieldPass("user_fields", "users", "users", "USER", {
   pages: mappedUids("users", "user_uid"), uid: (r) => r.user_uid, detail: (u) => `/api/user/${u}`,
 });
@@ -2480,6 +2537,18 @@ export async function* jobsByMonth(cfg: SyncConfig): AsyncGenerator<any[]> {
     }
   }
 }
+// Every job's people (with the team each was assigned under, when, and whether they accepted) and its tags, from the
+// list, which carries both (owner OK 2026-09-21 to re-sync every job).
+ENTITIES.job_people = {
+  name: "job_people", schema: "jms", table: "jobs", mapEntity: "jobs", enrichOnly: true, concurrency: 8, deps: ["users", "teams"],
+  pages: (ctx) => jobsByMonth(ctx.cfg),
+  uid: (r) => r.job_uid,
+  async transform() { return {}; },
+  async afterWrite(ctx, id, r) {
+    if (Array.isArray(r.assigned_to)) await writeJobAssignments(ctx, id, r, false);
+    if (Array.isArray(r.job_tags)) await setEntityTags(ctx.client, ctx.tenantId, "JOB", id, r.job_tags.map((t: unknown) => T(t)).filter((t: string | null): t is string => Boolean(t)));
+  },
+};
 // A job's custom fields only, for every job (owner OK 2026-09-21): the list rows carry them, so this pages the list
 // by month and writes nothing on the job itself.
 ENTITIES.job_custom_fields = {
