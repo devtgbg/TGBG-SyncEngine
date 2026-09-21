@@ -729,7 +729,7 @@ async function writeJobHistory(ctx: Ctx, jobId: string, r: any, isNew: boolean):
   if (rows.length) { const { error } = await tbl().insert(rows); if (error) throw error; }
 }
 /** A document's Zuper line items → jms.line_items (products linked through the products map). */
-async function writeLineItems(ctx: Ctx, parentType: "QUOTE" | "INVOICE", parentId: string, items: any[] | undefined, isNew: boolean): Promise<void> {
+async function writeLineItems(ctx: Ctx, parentType: "QUOTE" | "INVOICE" | "CONTRACT", parentId: string, items: any[] | undefined, isNew: boolean): Promise<void> {
   const products = await ctxMap(ctx, "products");
   const locations = await ctxMap(ctx, "stock_locations");
   const tbl = () => ctx.client.schema("jms").from("line_items");
@@ -777,6 +777,143 @@ async function writeCustomFieldValues(ctx: Ctx, entityType: string, entityId: st
     if (error) throw error;
   }
 }
+// ── Zuper's custom fields, as Zuper answers them ── FIELD-PARITY (2026-09-20): Tuper answered `custom_fields: []`
+// for every customer, organization, user, asset and invoice, because nothing imported them — the Zoho CRM / Zoho Books
+// ids GBG's integration writes among them. These helpers are what the importers of those kinds use.
+
+/** Zuper's name for a kind of custom field → Tuper's jms.form_field_type. The inverse of the web app's
+ *  ZUPER_FIELD_TYPE (lib/api/shape.ts); a kind Zuper does not name is single-line text, as before. */
+const ZUPER_CUSTOM_FIELD_TYPES: Record<string, string> = {
+  SINGLE_LINE: "SINGLE_LINE_TEXT", MULTI_LINE: "MULTI_LINE_TEXT", NUMBER: "SINGLE_LINE_TEXT",
+  RADIO: "SINGLE_SELECTION", MULTI_ITEM: "MULTI_SELECTION", SINGLE_ITEM: "DROPDOWN",
+  IMAGE: "SINGLE_IMAGE", MULTI_IMAGE: "MULTI_IMAGE", HEADER: "SECTION_HEADER", SIGNATURE: "SIGNATURE",
+  DATE: "DATE", DATETIME: "DATE_TIME", TIME: "TIME", BARCODE: "BARCODE_SCAN", FILE: "UPLOAD", VIDEO: "VIDEO",
+};
+const jmsFieldType = (zuperType: unknown) => ZUPER_CUSTOM_FIELD_TYPES[String(zuperType ?? "").trim().toUpperCase()] ?? "SINGLE_LINE_TEXT";
+
+/**
+ * The key a field has inside Zuper's `custom_field_internal_object` — "asset_rental_number_1",
+ * "EMPLOYEE_Nickname_1", "INVOICE_Zoho_Books_Invoice_ID_1".
+ *
+ * A module prefix, the label as a key, and an occurrence number, written in three different cases depending on the
+ * module. Only the label part can be matched, and the number cannot be derived at all, so the key is paired to the
+ * field by its label and then kept exactly as Zuper sent it (on the definition, config.zuper_key).
+ */
+function zuperInternalKey(label: string, internal: Record<string, unknown> | undefined | null): string | null {
+  if (!internal || typeof internal !== "object") return null;
+  const want = snakeKey(label);
+  let best: string | null = null;
+  for (const key of Object.keys(internal)) {
+    const tail = snakeKey(key.replace(/_\d+$/, ""));
+    if (tail === want) return key;
+    if (tail.endsWith(`_${want}`) && (!best || key.length < best.length)) best = key;
+  }
+  return best;
+}
+
+/** Definitions for the labels Zuper uses on an entity: in Zuper's own kind, and carrying what Zuper says about the
+ *  field that Tuper's own columns cannot hold — the name it gives the kind, and its key inside
+ *  custom_field_internal_object. A definition that already exists keeps its kind and only gains those two. */
+async function ensureZuperFieldDefinitions(ctx: Ctx, entityType: string, fields: any[], internal?: Record<string, unknown> | null): Promise<void> {
+  const known: Set<string> = (ctx.extra[`zuperFieldLabels:${entityType}`] ??= new Set<string>());
+  const fresh = fields.filter((f) => !known.has(String(f.label).trim().toLowerCase()));
+  if (!fresh.length) return;
+  await once(ctx, `zuperFieldDefinitions:${entityType}:${fresh.map((f) => String(f.label).trim().toLowerCase()).sort().join("|")}`, async () => {
+    const { data: existing, error } = await ctx.client.schema("jms").from("custom_field_definitions")
+      .select("id, label, display_order, config").eq("tenant_id", ctx.tenantId).eq("entity_type", entityType);
+    if (error) throw error;
+    const defs = (existing ?? []) as { id: string; label: string; display_order: number | null; config: Record<string, unknown> | null }[];
+    const have = new Map(defs.map((d) => [d.label.trim().toLowerCase(), d]));
+    let order = Math.max(0, ...defs.map((d) => d.display_order ?? 0));
+    const added: Record<string, unknown>[] = [];
+    for (const f of fresh) {
+      const label = String(f.label).trim();
+      // Zuper's own key for the field inside custom_field_internal_object, and the name it gives the field's kind
+      // ("SINGLE_LINE", "FILE"), or null where it names none — which is a property of the field, not of the module:
+      // an asset's own 36 fields carry a type and the six that came from its customer carry none.
+      //
+      // Its `module_name` is NOT kept: measured over 300 assets, the same field carries module_name on about half
+      // the records and not on the other half (and the value is "PRODUCT" on an asset's and on a person's alike), so
+      // it says nothing about the field. Answering it from the definition would invent it for the records Zuper
+      // leaves it off, which is a difference of its own.
+      const kept: Record<string, unknown> = { zuper_type: T(f.type) };
+      const zuperKey = zuperInternalKey(label, internal);
+      if (zuperKey) kept.zuper_key = zuperKey;
+      const mine = have.get(label.toLowerCase());
+      if (!mine) {
+        added.push({
+          tenant_id: ctx.tenantId, entity_type: entityType, field_key: snakeKey(label), label,
+          field_type: jmsFieldType(f.type), display_order: ++order,
+          // Always present, even empty: one insert carries several definitions and they must all name the same
+          // columns, or the ones that left `config` out are sent as NULL and the whole write fails on NOT NULL.
+          config: kept,
+        });
+      } else if (Object.entries(kept).some(([k, v]) => (mine.config as Record<string, unknown> | null)?.[k] !== v)) {
+        const { error: keyErr } = await ctx.client.schema("jms").from("custom_field_definitions")
+          .update({ config: { ...(mine.config ?? {}), ...kept } }).eq("id", mine.id).eq("tenant_id", ctx.tenantId);
+        if (keyErr) throw keyErr;
+      }
+    }
+    if (added.length) {
+      const { error: insertError } = await ctx.client.schema("jms").from("custom_field_definitions")
+        .upsert(added, { onConflict: "tenant_id,entity_type,field_key", ignoreDuplicates: true });
+      if (insertError) throw insertError;
+      delete ctx.extra[`customFieldDefs:${entityType}`]; // writeCustomFieldValues reloads them
+    }
+    return null;
+  });
+  for (const f of fresh) known.add(String(f.label).trim().toLowerCase());
+}
+
+/** A record's custom fields as Zuper answers them → Tuper's definitions and values. A date Zuper sends as something
+ *  that is not a date is left out rather than failing the whole record on a typed column. */
+async function writeZuperCustomFields(ctx: Ctx, entityType: string, entityId: string, fields: unknown, internal?: unknown): Promise<void> {
+  const list = (Array.isArray(fields) ? fields : []).filter((f) => T(f?.label));
+  if (!list.length) return;
+  const asObject = internal && typeof internal === "object" ? internal as Record<string, unknown> : null;
+  await ensureZuperFieldDefinitions(ctx, entityType, list, asObject);
+  const key = `customFieldDefs:${entityType}`;
+  if (!ctx.extra[key]) {
+    const { data, error } = await ctx.client.schema("jms").from("custom_field_definitions").select("id, label, field_type")
+      .eq("tenant_id", ctx.tenantId).eq("entity_type", entityType).eq("is_active", true);
+    if (error) throw error;
+    ctx.extra[key] = new Map(((data ?? []) as { id: string; label: string; field_type: string }[]).map((d) => [d.label.trim().toLowerCase(), d]));
+  }
+  const defs: Map<string, { id: string; field_type: string }> = ctx.extra[key];
+  const rows: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  for (const f of list) {
+    const def = defs.get(String(f.label).trim().toLowerCase());
+    if (!def || seen.has(def.id)) continue;
+    seen.add(def.id);
+    const value = T(f.value);
+    // A date Zuper sends as something that is not a date keeps its text rather than failing the record on a typed column.
+    const dated = (def.field_type === "DATE" || def.field_type === "DATE_TIME") && value && !Number.isNaN(Date.parse(value));
+    // Every value column on every row, so the write is one uniform upsert and a value that changed kind is cleared.
+    rows.push({
+      tenant_id: ctx.tenantId, definition_id: def.id, entity_type: entityType, entity_id: entityId,
+      value_text: dated ? null : def.field_type === "MULTI_SELECTION" || def.field_type === "DATA_TABLE" ? null : value ?? "",
+      value_number: null, value_date: dated ? value : null, value_bool: null,
+      value_json: def.field_type === "MULTI_SELECTION" || def.field_type === "DATA_TABLE" ? (value ? [value] : []) : null,
+    });
+  }
+  // Zuper lists the fields the RECORD has, empty ones among them (a customer with one Zoho id answers one field, not
+  // the module's three), so an empty value is kept as "" — that is what says the record has the field at all.
+  if (rows.length) {
+    const { error } = await ctx.client.schema("jms").from("custom_field_values").upsert(rows, { onConflict: "definition_id,entity_id" });
+    if (error) throw error;
+  }
+}
+
+/** Who made the record, when the answer we were given carries one. Zuper's customer and user LISTS do not send
+ *  `created_by` at all (its detail reads do), so a list pass must never blank what a detail read filled. */
+async function createdByField(ctx: Ctx, r: any): Promise<Record<string, unknown>> {
+  const uid = T(r?.created_by?.user_uid);
+  if (!uid) return {};
+  const id = mapGet(await ctxMap(ctx, "users"), uid);
+  return id ? { created_by: id } : {};
+}
+
 /** A quote's or invoice's own billing and service contact and address → jms.addresses (parent QUOTE / INVOICE). */
 async function writeDocumentAddresses(ctx: Ctx, parentType: "QUOTE" | "INVOICE", parentId: string, r: any): Promise<void> {
   const rows = ([["BILLING", r.customer_billing_address], ["SERVICE", r.customer_service_address]] as const)
@@ -820,6 +957,24 @@ async function documentTemplateId(ctx: Ctx, templateUid: unknown): Promise<strin
     cache.set(uid, (data as { id: string } | null)?.id ?? null);
   }
   return cache.get(uid) ?? null;
+}
+/** Tuper's copy of a Zuper payment term. Terms are not imported as records of their own, so they are matched by the
+ *  name Zuper answers ("Immediatly", "Monthly"), which is the name Tuper's seeded terms carry. */
+async function paymentTermId(ctx: Ctx, term: unknown): Promise<string | null> {
+  const name = T((term as { payment_term_name?: unknown } | null)?.payment_term_name);
+  if (!name) return null;
+  const cache: Map<string, string | null> = (ctx.extra.paymentTermIds ??= new Map());
+  const key = name.trim().toLowerCase();
+  if (!cache.has(key)) {
+    const { data, error } = await ctx.client.schema("jms").from("payment_terms")
+      .select("id, name").eq("tenant_id", ctx.tenantId).eq("is_deleted", false);
+    if (error) throw error;
+    for (const row of (data ?? []) as { id: string; name: string }[]) {
+      cache.set(String(row.name ?? "").trim().toLowerCase(), row.id);
+    }
+    if (!cache.has(key)) cache.set(key, null);
+  }
+  return cache.get(key) ?? null;
 }
 /** Zuper's customer list has no organization, but jobs name it — fill it in on a customer that has none. */
 async function linkCustomerOrganization(ctx: Ctx, customer: any): Promise<void> {
@@ -1225,9 +1380,11 @@ export const ENTITIES: Record<string, Entity> = {
     name: "organizations", schema: "jms", table: "organizations", concurrency: 8,
     pages: (ctx) => zuperListPages(ctx.cfg, "/api/organization"),
     uid: (r) => r.organization_uid,
-    transform: async (r) => organizationFields(r),
+    transform: async (r, ctx) => ({ ...organizationFields(r), ...(await createdByField(ctx, r)) }),
     async afterWrite(ctx, id, r, isNew) {
       await writeAddresses(ctx, "ORGANIZATION", id, isNew, r.organization_address, r.organization_billing_address);
+      // The organization's Zoho CRM account id and its siblings, when this is a by-uid read: the list rows carry none.
+      await writeZuperCustomFields(ctx, "ORGANIZATION", id, r.custom_fields, r.custom_field_internal_object);
       // The organization's own files, when this is a by-uid read: the list rows the import pages through carry none.
       await writeRecordFiles(ctx, "organization", id, r);
     },
@@ -1236,9 +1393,11 @@ export const ENTITIES: Record<string, Entity> = {
     name: "customers", schema: "jms", table: "customers", concurrency: 8,
     pages: (ctx) => zuperListPages(ctx.cfg, "/api/customers"),
     uid: (r) => r.customer_uid,
-    transform: async (r) => ({ ...customerFields(r), no_of_jobs: num0(r.no_of_jobs) }),
+    transform: async (r, ctx) => ({ ...customerFields(r), no_of_jobs: num0(r.no_of_jobs), ...(await createdByField(ctx, r)) }),
     async afterWrite(ctx, id, r, isNew) {
       await writeAddresses(ctx, "CUSTOMER", id, isNew, r.customer_address, r.customer_billing_address);
+      // The customer's Zoho CRM / Zoho Books contact ids and its siblings — the list rows carry these.
+      await writeZuperCustomFields(ctx, "CUSTOMER", id, r.custom_fields, r.custom_field_internal_object);
       // The customer's own files, when this is a by-uid read: the list rows the import pages through carry none.
       await writeRecordFiles(ctx, "customer", id, r);
     },
@@ -1272,9 +1431,13 @@ export const ENTITIES: Record<string, Entity> = {
         role_id: mapGet(ctx.extra.roles, r.role?.role_key), home_phone: T(r.home_phone_number), mobile_phone: T(r.mobile_phone_number),
         work_phone: T(r.work_phone_number), external_login_id: T(r.external_login_id), hourly_labor_charge: N(r.hourly_labor_charge),
         licence_type: T(r.license_type), is_billable: r.is_billable !== false,
+        // Who added the person. Zuper's /api/user/all list leaves created_by out; its by-uid read carries it.
+        ...(await createdByField(ctx, r)),
       };
     },
     insert: provisionImportedUser,
+    // The person's own custom fields (GBG uses one, "Nickname") — again only on a by-uid read.
+    afterWrite: (ctx, id, r) => writeZuperCustomFields(ctx, "USER", id, r.custom_fields, r.custom_field_internal_object),
   },
   assets: {
     name: "assets", schema: "jms", table: "assets", deps: ["customers", "asset_categories"], concurrency: 8,
@@ -1298,12 +1461,18 @@ export const ENTITIES: Record<string, Entity> = {
         is_active: r.is_active !== false, is_deleted: r.is_deleted === true, ...createdAt(r),
       };
     },
-    // The asset's own files (asset_attachments), when this is a by-uid read: the filter list rows carry none.
-    afterWrite: (ctx, id, r) => writeRecordFiles(ctx, "asset", id, r).then(() => undefined),
+    async afterWrite(ctx, id, r) {
+      // The asset's 36 custom fields (Rental Number, battery and motor serial numbers, AMC …) — the filter list carries them.
+      await writeZuperCustomFields(ctx, "ASSET", id, r.custom_fields, r.custom_field_internal_object);
+      // The asset's own files (asset_attachments), when this is a by-uid read: the filter list rows carry none.
+      await writeRecordFiles(ctx, "asset", id, r);
+    },
   },
   contracts: {
-    name: "contracts", schema: "jms", table: "service_contracts", deps: ["customers", "organizations"],
-    fetch: (ctx) => zuperFilterAll(ctx.cfg, "/api/service_contract/filter"),
+    name: "contracts", schema: "jms", table: "service_contracts", deps: ["customers", "organizations", "products", "stock_locations"],
+    // Read in full: only GET /api/service_contract/{uid} carries the description, the two addresses and the line
+    // items. GBG has one contract, so this is one extra call.
+    fetch: (ctx) => withDetails(ctx.cfg, "/api/service_contract/filter", (r) => `/api/service_contract/${r.contract_uid}`),
     uid: (r) => r.contract_uid,
     async transform(r, ctx) {
       const start = dubaiDate(r.start_date) ?? dubaiDate(r.created_at) ?? new Date().toISOString().slice(0, 10);
@@ -1314,7 +1483,9 @@ export const ENTITIES: Record<string, Entity> = {
         // Zuper keeps the prefix, reference, term and sub-total apart from the number and the total (00108).
         prefix: T(r.prefix), reference_no: T(r.ref_no), term_months: num0(r.term_months) || null,
         sub_total: num0(r.contract_subtotal),
-        description: T(r.contract_description),
+        // Zuper's contract calls this `description` (with plain_text_description and markdown_description beside it);
+        // reading `contract_description` — which no contract answer has — left every imported contract with none.
+        description: T(r.plain_text_description) ?? T(r.description) ?? stripHtml(r.markdown_description),
         customer_id: await customerId(ctx, r.customer), organization_id: await organizationId(ctx, r.organization),
         start_date: start, end_date: end && end >= start ? end : null,
         approval_status: T(r.approval_status), await_approval_by: mapGet(await ctxMap(ctx, "users"), r.await_approval_by?.user_uid),
@@ -1324,13 +1495,20 @@ export const ENTITIES: Record<string, Entity> = {
         is_active: r.is_active !== false && r.is_expired !== true, is_deleted: r.is_deleted === true, ...createdAt(r),
       };
     },
-    // The contract's own files, when this is a by-uid read: the filter list rows carry none. Zuper's catalogue has no
-    // service_contract attachment event, so these arrive on any other contract change or on the backfill.
-    afterWrite: (ctx, id, r) => writeRecordFiles(ctx, "service_contract", id, r).then(() => undefined),
+    async afterWrite(ctx, id, r, isNew) {
+      // The contract is served at one address and billed at another, and covers a list of items — all three only on
+      // the by-uid read. Zuper calls the service one `customer_address`.
+      await writeAddresses(ctx, "CONTRACT", id, isNew, r.customer_address, r.billing_address);
+      if (Array.isArray(r.line_items)) await writeLineItems(ctx, "CONTRACT", id, r.line_items, isNew);
+      // The contract's own files, when this is a by-uid read: the filter list rows carry none. Zuper's catalogue has no
+      // service_contract attachment event, so these arrive on any other contract change or on the backfill.
+      await writeRecordFiles(ctx, "service_contract", id, r);
+    },
   },
   requests: {
-    name: "requests", schema: "jms", table: "requests", deps: ["customers", "organizations", "users"],
-    fetch: (ctx) => zuperFilterAll(ctx.cfg, "/api/request/filter"),
+    name: "requests", schema: "jms", table: "requests", deps: ["customers", "organizations", "users", "assets"],
+    // Read in full: only GET /api/request/{uid} carries the asset the request is about. GBG has eight requests.
+    fetch: (ctx) => withDetails(ctx.cfg, "/api/request/filter", (r) => `/api/request/${r.request_uid}`),
     uid: (r) => r.request_uid,
     async transform(r, ctx) {
       if (!ctx.extra.requestStatuses) {
@@ -1343,6 +1521,10 @@ export const ENTITIES: Record<string, Entity> = {
         request_number: String(r.request_id ?? r.request_uid),
         title: T(r.request_title) ?? "Request",
         description: T(r.plain_text_description) ?? stripHtml(r.request_description),
+        // Zuper's own rich description, so Tuper answers the request_description it answers rather than a rebuild of
+        // it from the plain text (00093 added the column; nothing filled it).
+        description_html: T(r.request_description),
+        asset_id: mapGet(await ctxMap(ctx, "assets"), r.asset?.asset_uid),
         customer_id: await customerId(ctx, r.customer), organization_id: await organizationId(ctx, r.organization),
         status_id: mapGet(ctx.extra.requestStatuses, REQUEST_STATUS_TYPES[String(r.request_status?.status_type ?? "")] ?? "NEW"),
         priority: JOB_PRIORITIES.has(priority) ? priority : "LOW",
@@ -1532,14 +1714,22 @@ export const ENTITIES: Record<string, Entity> = {
         sub_total: sub, total_discount: discount, total_tax: Math.max(0, r2(total - sub + discount)), total, amount_paid: num0(r.amount_paid),
         paid_date: status === "PAID" ? paidAt[paidAt.length - 1] ?? ts(r.updated_at) : null,
         tax_exempt: r.tax_exempt === true, created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
+        // Zuper's Invoice Details: its own title (which is not the description), prefix, reference, tags, the
+        // template it prints with and the payment term it is due on. None of these were being read, so every
+        // imported invoice answered null for them.
+        title: T(r.invoice_title), prefix: T(r.prefix), reference_no: T(r.reference_no),
+        description: T(r.plain_text_description) ?? T(r.description),
+        tags: Array.isArray(r.tags) ? r.tags.map((t: any) => T(typeof t === "string" ? t : t?.tag_name ?? t?.name)).filter(Boolean) : [],
+        template_id: await documentTemplateId(ctx, r.template?.template_uid),
+        payment_term_id: await paymentTermId(ctx, r.payment_term),
         is_deleted: r.is_deleted === true, ...createdAt(r),
       };
     },
     async afterWrite(ctx, id, r, isNew) {
       await writeLineItems(ctx, "INVOICE", id, r.line_items, isNew);
       await writeDocumentAddresses(ctx, "INVOICE", id, r);
-      await ensureCustomFieldDefinitions(ctx, "INVOICE", (r.custom_fields ?? []).map((f: any) => String(f?.label ?? "")));
-      await writeCustomFieldValues(ctx, "INVOICE", id, r.custom_fields);
+      // The invoice's Zoho Books invoice id and its siblings, with Zuper's own key for each (custom_field_internal_object).
+      await writeZuperCustomFields(ctx, "INVOICE", id, r.custom_fields, r.custom_field_internal_object);
       // The invoice's own files. `fetch` reads every invoice in full, so these come over on an import as well as on an event.
       await writeRecordFiles(ctx, "invoice", id, r);
     },
@@ -1572,6 +1762,117 @@ ENTITIES.jobs_oldest = {
       const missing = rows.filter((r) => !imported.has(r.job_uid));
       if (missing.length) yield missing;
     }
+  },
+};
+
+// ── Who made a record, and its custom fields ─────────────────────────────────────────────────────────────────
+// FIELD-PARITY (2026-09-20): Zuper answered `created_by` and the Zoho integration's custom fields on every sampled
+// customer, organization, user, asset and invoice, and Tuper answered null / []. Two causes, both fixed above — the
+// importers did not map them, and Zuper's LISTS carry only some of them (the customer and user lists carry neither
+// created_by nor custom fields; the organization list carries created_by but no custom fields; the asset and invoice
+// filter lists carry both). These passes fill what the import already behind us never saw. They only update records
+// already imported (enrichOnly) and write nothing but those two things, so re-running one is cheap and safe.
+const zuperFieldPass = (
+  name: string, table: string, mapEntity: string, entityType: string,
+  source: { pages: (ctx: Ctx) => AsyncGenerator<any[]>; uid: (r: any) => string; detail?: (uid: string) => string },
+): Entity => ({
+  name, schema: "jms", table, mapEntity, enrichOnly: true, deps: ["users"], concurrency: source.detail ? 6 : 8,
+  pages: source.pages,
+  uid: source.uid,
+  async transform(r, ctx) {
+    // A kind whose list carries neither is read one record at a time; one whose list carries them is not read twice.
+    if (source.detail) r._fields = (await zuperGet(ctx.cfg, source.detail(source.uid(r)))).data ?? {};
+    return createdByField(ctx, r._fields ?? r);
+  },
+  afterWrite(ctx, id, r) {
+    const d = r._fields ?? r;
+    return writeZuperCustomFields(ctx, entityType, id, d.custom_fields, d.custom_field_internal_object);
+  },
+});
+/** Every record of a kind Tuper has mapped to a Zuper uid, a hundred uids at a time. */
+const mappedUids = (entity: string, key: string) => async function* (ctx: Ctx): AsyncGenerator<any[]> {
+  const uids = [...(await ctxMap(ctx, entity)).keys()];
+  for (let i = 0; i < uids.length; i += 100) yield uids.slice(i, i + 100).map((uid) => ({ [key]: uid }));
+};
+ENTITIES.customer_fields = zuperFieldPass("customer_fields", "customers", "customers", "CUSTOMER", {
+  pages: mappedUids("customers", "customer_uid"), uid: (r) => r.customer_uid, detail: (u) => `/api/customers/${u}`,
+});
+ENTITIES.organization_fields = zuperFieldPass("organization_fields", "organizations", "organizations", "ORGANIZATION", {
+  pages: mappedUids("organizations", "organization_uid"), uid: (r) => r.organization_uid, detail: (u) => `/api/organization/${u}`,
+});
+ENTITIES.user_fields = zuperFieldPass("user_fields", "users", "users", "USER", {
+  pages: mappedUids("users", "user_uid"), uid: (r) => r.user_uid, detail: (u) => `/api/user/${u}`,
+});
+ENTITIES.asset_fields = zuperFieldPass("asset_fields", "assets", "assets", "ASSET", {
+  pages: (ctx) => zuperFilterPages(ctx.cfg, "/api/assets/filter"), uid: (r) => r.asset_uid,
+});
+ENTITIES.invoice_fields = zuperFieldPass("invoice_fields", "invoices", "invoices", "INVOICE", {
+  pages: (ctx) => zuperFilterPages(ctx.cfg, "/api/invoice/filter"), uid: (r) => r.invoice_uid,
+});
+
+// ── What only a record's own read carries ──
+// POST /api/assets/filter and GET /api/customers page quickly but answer a SHORTER record than the by-uid read does.
+// The import was built on those lists, so the columns below were never written at all — not stale, never filled:
+//   · an asset's billing address, useful life, purchase and residual price, picture, barcode, additional info,
+//     whether the customer owns it, its parts, who it is assigned to and its secondary customers;
+//   · a customer's notification preferences (call / sms / email).
+// Each pass re-reads every record Tuper has mapped and writes only those columns, so it can be re-run at any time and
+// never touches what the list pass is responsible for.
+
+ENTITIES.asset_details = {
+  name: "asset_details", schema: "jms", table: "assets", mapEntity: "assets", enrichOnly: true,
+  deps: ["customers", "users", "teams", "products", "stock_locations"], concurrency: 6,
+  pages: mappedUids("assets", "asset_uid"),
+  uid: (r) => r.asset_uid,
+  async transform(r, ctx) {
+    const d = (await zuperGet(ctx.cfg, `/api/assets/${r.asset_uid}`)).data ?? {};
+    r._detail = d;
+    const [customers, users, teams, products, locations] = await Promise.all([
+      ctxMap(ctx, "customers"), ctxMap(ctx, "users"), ctxMap(ctx, "teams"), ctxMap(ctx, "products"), ctxMap(ctx, "stock_locations"),
+    ]);
+    const life = d.useful_life && typeof d.useful_life === "object" ? d.useful_life : null;
+    const lifeType = T(life?.type)?.toUpperCase();
+    // Zuper's asset_location is on the list too; the detail is the newer copy, so it is refreshed here as well.
+    const location = d.asset_location && typeof d.asset_location === "object" ? d.asset_location : null;
+    const billing = d.billing_address && typeof d.billing_address === "object" ? d.billing_address : null;
+    return {
+      ...(location ? { asset_location: location } : {}),
+      billing_address: billing,
+      useful_life_type: lifeType === "MONTHS" || lifeType === "YEARS" || lifeType === "DAYS" ? lifeType : null,
+      useful_life_value: life?.value == null ? null : num0(life.value),
+      purchase_price: N(d.purchase_price), residual_price: N(d.residual_price),
+      asset_image: T(d.asset_image), asset_barcode: T(d.asset_barcode), additional_info: T(d.additional_info),
+      // Null until now, which made the record answer whatever its customer link implied rather than what Zuper says.
+      owned_by_customer: d.owned_by_customer === true,
+      product_id: mapGet(products, d.asset_product?.product_uid),
+      location_id: mapGet(locations, d.location?.location_uid),
+      asset_parts: ((d.asset_parts ?? []) as any[]).map((p) => ({
+        product_id: mapGet(products, p?.product_id?.product_uid ?? p?.product_uid),
+        quantity: num0(p?.quantity) || 1,
+        serial_nos: ((p?.serial_nos ?? []) as unknown[]).map((s) => String(s)).filter(Boolean),
+      })).filter((p) => p.product_id),
+      assignees: ((d.assigned_to ?? []) as any[]).map((a) => ({
+        user_id: mapGet(users, a?.user?.user_uid), team_id: mapGet(teams, a?.team?.team_uid),
+      })).filter((a) => a.user_id || a.team_id),
+      secondary_customer_ids: [...new Set(((d.secondary_customers ?? []) as any[])
+        .map((c) => mapGet(customers, c?.customer_uid)).filter((x): x is string => Boolean(x)))],
+    };
+  },
+  // The detail read is the only one that carries the asset's files; the filter list rows carry none.
+  afterWrite: (ctx, id, r) => writeRecordFiles(ctx, "asset", id, r._detail ?? r).then(() => undefined),
+};
+
+ENTITIES.customer_details = {
+  name: "customer_details", schema: "jms", table: "customers", mapEntity: "customers", enrichOnly: true,
+  concurrency: 6,
+  pages: mappedUids("customers", "customer_uid"),
+  uid: (r) => r.customer_uid,
+  async transform(r, ctx) {
+    const d = (await zuperGet(ctx.cfg, `/api/customers/${r.customer_uid}`)).data ?? {};
+    const n = d.customer_notifications;
+    // Only what the list cannot say. A customer whose detail carries no preferences is left as it is.
+    if (!n || typeof n !== "object") return {};
+    return { notifications: { email: n.email !== false, sms: n.sms === true, call: n.call === true } };
   },
 };
 
@@ -1835,18 +2136,36 @@ ENTITIES.inactive_users = {
 };
 
 // Time off: Zuper's types and every request (GET /api/timesheet/request/timeoff_type, /api/timesheets/request/timeoff —
-// the whole list in one reply). Dates are the company's calendar days, so a part-day request keeps its day (Tuper's
-// requests are whole days). Nothing is sent for approval: each keeps Zuper's outcome.
+// the whole list in one reply). start_date / end_date are the company's calendar days, so a part-day request keeps its
+// day; Zuper's own two instants are kept beside them (00141), so a request answers the window it was actually asked
+// for rather than the whole day. Zuper attributes a request to TWO people — `requested_by` is whose leave it is and
+// `created_by_user` is whoever raised it (at GBG a manager, on 646 of 651 requests) — and Tuper keeps both:
+// user_id and created_by. Nothing is sent for approval: each keeps Zuper's outcome and its approver's remarks.
+/** Zuper's allowed reasons (00141's check constraint); anything else is left unset rather than refused. */
+const TIMEOFF_REASONS = new Set(["OFF", "VACATION", "SICK", "PARENTAL LEAVE", "UNPAID", "OTHERS", "CUSTOM"]);
+/** An exempt day, as Zuper writes it: the last second of that day in UTC with no zone marker ("2026-08-25 19:59:59"). */
+const exemptDay = (v: any): string | null => {
+  const s = String(v ?? "").trim();
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  return dubaiDate(/([zZ]|[+-]\d{2}:?\d{2})$/.test(s) ? s : `${s.replace(" ", "T")}Z`);
+};
 ENTITIES.timeoff_types = {
-  name: "timeoff_types", schema: "jms", table: "timeoff_types",
+  name: "timeoff_types", schema: "jms", table: "timeoff_types", deps: ["users"],
   fetch: (ctx) => zuperGet(ctx.cfg, "/api/timesheet/request/timeoff_type").then((j) => j.data ?? []),
   uid: (r) => r.timeoff_request_type_uid,
-  async transform(r) {
-    return { name: T(r.name) ?? "Time Off", is_paid: !/UNPAID/i.test(String(r.type ?? "")), is_active: r.is_deleted !== true, ...createdAt(r) };
+  async transform(r, ctx) {
+    return {
+      name: T(r.name) ?? "Time Off", is_paid: !/UNPAID/i.test(String(r.type ?? "")), is_active: r.is_deleted !== true,
+      no_of_days_per_year: Math.max(0, Math.round(num0(r.no_of_days_per_year))),
+      display_order: r.display_order == null || r.display_order === "" ? null : Math.round(Number(r.display_order)),
+      created_by: mapGet(await ctxMap(ctx, "users"), r.created_by_user?.user_uid),
+      ...createdAt(r),
+    };
   },
 };
 ENTITIES.timeoff_requests = {
-  name: "timeoff_requests", schema: "jms", table: "timeoff_requests", deps: ["users", "timeoff_types"], concurrency: 8,
+  name: "timeoff_requests", schema: "jms", table: "timeoff_requests", deps: ["users", "teams", "timeoff_types"], concurrency: 8,
   fetch: (ctx) => zuperGet(ctx.cfg, "/api/timesheets/request/timeoff").then((j) => j.data ?? []),
   uid: (r) => r.request_uid,
   async transform(r, ctx) {
@@ -1858,11 +2177,24 @@ ENTITIES.timeoff_requests = {
     const end = dubaiDate(r.request_to);
     const status = String(r.approval_status ?? "").toUpperCase();
     const typeUid = r.timeoff_request_type?.timeoff_request_type_uid ?? r.timeoff_request_type_uid;
+    const reason = T(r.request_reason)?.toUpperCase().replace(/_/g, " ");
+    const remarks = T(r.request_remarks);
+    // Zuper's two instants, kept only when they run the right way round (00141's check).
+    const from = ts(r.request_from), to = ts(r.request_to);
+    const ordered = from && to && Date.parse(to) >= Date.parse(from);
     return {
       user_id: userId, type_id: mapGet(await ctxMap(ctx, "timeoff_types"), typeUid),
       start_date: start, end_date: end && end >= start ? end : start,
-      reason: T([T(r.request_reason), T(r.request_remarks)].filter(Boolean).join(" — ")),
+      request_from: ordered ? from : null, request_to: ordered ? to : null,
+      all_day: r.all_day !== false,
+      request_reason: reason && TIMEOFF_REASONS.has(reason) ? reason : null,
+      request_remarks: remarks, reason: remarks,
       approval_status: status === "APPROVED" ? "APPROVED" : /REJECT|DECLIN/.test(status) ? "REJECTED" : "PENDING",
+      approval_remarks: T(r.approval_remarks),
+      no_of_days: Number.isFinite(Number(r.no_of_days)) ? Number(r.no_of_days) : null,
+      exempt_dates: [...new Set(((Array.isArray(r.exempt_dates) ? r.exempt_dates : []) as any[]).map(exemptDay).filter((d): d is string => Boolean(d)))],
+      team_id: mapGet(await ctxMap(ctx, "teams"), r.requested_by_team?.team_uid),
+      created_by: mapGet(users, r.created_by_user?.user_uid),
       approved_by: mapGet(users, r.approved_by_user?.user_uid), approved_at: ts(r.approved_at), ...createdAt(r),
     };
   },

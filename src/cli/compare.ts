@@ -401,6 +401,8 @@ const KNOWN_CAUSE: { kind?: string; path: RegExp; why: string }[] = [
     why: "an embedded copy of a user record. Tuper answers its own row's timestamps — the users were created when Zuper's were imported — and has no login history or Zuper-hosted profile picture. Who the user IS is compared as normal, and does disagree where it says so." },
   { kind: "users", path: /^(created_at|last_login_at|profile_picture)$/,
     why: "Tuper's users were created at the import (2026-09-11) with no password and no invite (owner decision), so their created_at is the import, they have never signed in, and their picture is not Zuper's S3 copy." },
+  { kind: "timeoff_requests", path: /^timeoff_request_type\.updated_at$/,
+    why: "the time-off type embedded in the request. Zuper's own type list (GET /api/timesheet/request/timeoff_type, the only place the types are imported from) does not answer updated_at, so there is nothing to mirror and Tuper answers when its own type row last changed — the sync's clock, not Zuper's." },
 ];
 const knownCause = (kind: string, path: string): string | undefined =>
   KNOWN_CAUSE.find((k) => (!k.kind || k.kind === kind) && k.path.test(path))?.why;
