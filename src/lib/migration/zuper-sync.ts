@@ -634,6 +634,14 @@ async function writeJobTeams(ctx: Ctx, jobId: string, r: any, isNew: boolean): P
   }
 }
 /** Zuper job tags → jms.taggables (only when Zuper has some, so tags added in Tuper aren't wiped). */
+/** A customer's tags (GBG's are its Zoho contact id, "Zoho_Contacts_…"), replaced by Zuper's list — only when the
+ *  answer carries the key, so a partial row never clears them. */
+async function writeCustomerTags(ctx: Ctx, customerId: string, r: any): Promise<void> {
+  if (!r || typeof r !== "object" || !Array.isArray(r.customer_tags)) return;
+  const names = r.customer_tags.map((t: unknown) => T(typeof t === "string" ? t : (t as any)?.tag_name ?? (t as any)?.name))
+    .filter((t: string | null): t is string => Boolean(t));
+  await setEntityTags(ctx.client, ctx.tenantId, "CUSTOMER", customerId, names);
+}
 async function writeJobTags(ctx: Ctx, jobId: string, tags: unknown): Promise<void> {
   const names = Array.isArray(tags) ? tags.map((t) => T(t)).filter((t): t is string => Boolean(t)) : [];
   if (names.length) await setEntityTags(ctx.client, ctx.tenantId, "JOB", jobId, names);
@@ -1708,6 +1716,8 @@ export const ENTITIES: Record<string, Entity> = {
       await writeZuperCustomFields(ctx, "CUSTOMER", id, r.custom_fields, r.custom_field_internal_object, r.created_at);
       // The customer's own files, when this is a by-uid read: the list rows the import pages through carry none.
       await writeRecordFiles(ctx, "customer", id, r);
+      // Its tags, which the list and the detail both carry and nothing imported (FIELD-PARITY 2026-09-21).
+      await writeCustomerTags(ctx, id, r);
     },
   },
   // Active staff only (owner decision) — accounts with no password and no invite.
@@ -2238,8 +2248,9 @@ ENTITIES.customer_details = {
     const d = r._detail ?? {};
     // The customer's favourite technicians (Zuper's favorited_users), replaced as a whole.
     if (Array.isArray(d.favorited_users)) await writeFavoriteTechnicians(ctx, id, d.favorited_users);
-    // Its own files, which only the detail carries.
+    // Its own files, which only the detail carries, and its tags.
     if (d.customer_uid) await writeRecordFiles(ctx, "customer", id, d);
+    await writeCustomerTags(ctx, id, d);
   },
 };
 
@@ -2477,6 +2488,14 @@ ENTITIES.job_custom_fields = {
   uid: (r) => r.job_uid,
   async transform() { return {}; },
   afterWrite: (ctx, id, r) => writeZuperCustomFields(ctx, "JOB", id, r.custom_fields, r.custom_field_internal_object, r.created_at),
+};
+// Every customer's tags, from Zuper's customer list (which carries them), writing nothing else.
+ENTITIES.customer_tags = {
+  name: "customer_tags", schema: "jms", table: "customers", mapEntity: "customers", enrichOnly: true, concurrency: 8,
+  pages: (ctx) => zuperListPages(ctx.cfg, "/api/customers"),
+  uid: (r) => r.customer_uid,
+  async transform() { return {}; },
+  afterWrite: (ctx, id, r) => writeCustomerTags(ctx, id, r),
 };
 // Zuper's customer categories (Residential, Rental, Commercial … for GBG). Tuper's own of the same name are kept.
 ENTITIES.customer_categories = {
