@@ -17,8 +17,10 @@ export function isTagEntity(v: string): v is TagEntity {
   return (TAG_ENTITIES as readonly string[]).includes(v);
 }
 
-/** jms.tags has CHECK (char_length(name) <= 25) — trim to it rather than letting the insert fail. */
-const MAX_TAG = 25;
+/** jms.tags has CHECK (char_length(name) <= 100) since 00200 — trim to it rather than letting the insert fail. It was
+ *  25, the most Zuper's screens take as typed; tags written through Zuper's API run longer (GBG's Zoho contact ids are
+ *  33), and cutting them at 25 merged thousands of distinct ids into one tag. */
+const MAX_TAG = 100;
 
 /** Trim, drop blanks, cap length, and de-duplicate case-insensitively (keeping first spelling). */
 export function normalizeTagNames(names: readonly string[]): string[] {
