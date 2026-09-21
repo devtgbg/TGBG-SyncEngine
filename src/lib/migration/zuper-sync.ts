@@ -1149,6 +1149,63 @@ async function writeDocumentNotes(ctx: Ctx, entityType: "quote" | "invoice", ent
     }
   }
 }
+/** Zuper's kinds of request status, as jms.status_type holds them (OPEN since 00198). */
+const REQUEST_STATUS_KIND = (t: unknown): string => {
+  const k = String(t ?? "").toUpperCase();
+  return ["OPEN", "NEW", "ON_HOLD", "COMPLETED", "CLOSED", "CANCELED"].includes(k) ? k : "OTHER";
+};
+/**
+ * Tuper's copy of a Zuper request status, by its uid. The list pass (request_statuses) brings over Zuper's current
+ * ones; a status a request names that the list no longer has — GBG's "On Hold", since deleted — is made on sight,
+ * inactive, so no picker offers it.
+ */
+async function requestStatusId(ctx: Ctx, st: any): Promise<string | null> {
+  const uid = T(st?.status_uid);
+  if (!uid) return null;
+  const map = await ctxMap(ctx, "request_statuses");
+  if (map.has(uid)) return map.get(uid)!;
+  return once(ctx, `request_status:${uid}`, async () => {
+    const tbl = () => ctx.client.schema("jms").from("request_statuses");
+    const name = T(st.status_name) ?? "Status";
+    const { data: found, error } = await tbl().select("id").eq("tenant_id", ctx.tenantId).eq("name", name).limit(1);
+    if (error) throw error;
+    let id = ((found ?? []) as { id: string }[])[0]?.id;
+    if (!id) {
+      const made = await tbl().insert({
+        tenant_id: ctx.tenantId, name, status_type: REQUEST_STATUS_KIND(st.status_type), color: T(st.status_color),
+        description: T(st.status_description), display_order: 99, is_active: false,
+      }).select("id").single();
+      if (made.error) throw made.error;
+      id = (made.data as { id: string }).id;
+    }
+    await setMap(ctx, "request_statuses", uid, id);
+    return id;
+  });
+}
+/**
+ * A request's Zuper status_history → jms.request_status_history, replacing what is there: Zuper is the record of a
+ * request's timeline, as it is of a job's, and the row the status trigger adds when the sync moves the status is
+ * one of the rows replaced. Nothing is touched when Zuper sent no history.
+ */
+async function writeRequestStatusHistory(ctx: Ctx, requestId: string, history: any[] | undefined): Promise<void> {
+  if (!Array.isArray(history) || !history.length) return;
+  const users = await ctxMap(ctx, "users");
+  const rows: Record<string, unknown>[] = [];
+  let prev: string | null = null;
+  for (const h of [...history].sort((a, b) => String(a?.created_at ?? "").localeCompare(String(b?.created_at ?? "")))) {
+    const to = await requestStatusId(ctx, h);
+    if (!to || !h?.created_at) continue;
+    rows.push({
+      tenant_id: ctx.tenantId, request_id: requestId, from_status_id: prev, to_status_id: to, remarks: T(h.remarks),
+      changed_by: mapGet(users, h.done_by?.user_uid), changed_at: String(h.created_at), status_color: T(h.status_color),
+    });
+    prev = to;
+  }
+  const tbl = () => ctx.client.schema("jms").from("request_status_history");
+  const { error: delErr } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("request_id", requestId);
+  if (delErr) throw delErr;
+  if (rows.length) { const { error } = await tbl().insert(rows); if (error) throw error; }
+}
 /** Tuper's copy of a Zuper document template (00082 imported them, keyed by source_uid). */
 async function documentTemplateId(ctx: Ctx, templateUid: unknown): Promise<string | null> {
   const uid = T(templateUid);
@@ -1203,7 +1260,6 @@ const JOB_PRIORITIES = new Set(["LOW", "MEDIUM", "HIGH", "URGENT"]);
 // Zuper's customer feedback ratings — the same five as jms.feedback_rating.
 const FEEDBACK_RATINGS = new Set(["VERY_HAPPY", "HAPPY", "NEUTRAL", "UNHAPPY", "VERY_UNHAPPY"]);
 // Zuper request status types → jms.request_statuses.status_type (Tuper has no "Canceled" request status).
-const REQUEST_STATUS_TYPES: Record<string, string> = { OPEN: "NEW", NEW: "NEW", ON_HOLD: "ON_HOLD", CONVERTED: "COMPLETED", COMPLETED: "COMPLETED", CLOSED: "CLOSED", CANCELED: "CLOSED" };
 const QUOTE_STATUSES: Record<string, string> = { DRAFT: "DRAFT", AWAIT_RESPONSE: "SENT", SENT: "SENT", APPROVED: "ACCEPTED", ACCEPTED: "ACCEPTED", DECLINED: "DECLINED", REJECTED: "DECLINED", EXPIRED: "EXPIRED", ARCHIVED: "ARCHIVED", CANCELED: "CANCELED", CONVERTED: "CONVERTED" };
 const INVOICE_STATUSES: Record<string, string> = { DRAFT: "DRAFT", AWAIT_PAYMENT: "SENT", SENT: "SENT", PARTIALLY_PAID: "PARTIALLY_PAID", PAID: "PAID", OVERDUE: "OVERDUE", ARCHIVED: "ARCHIVED", CANCELED: "CANCELED", VOID: "CANCELED" };
 
@@ -1729,11 +1785,6 @@ export const ENTITIES: Record<string, Entity> = {
     fetch: (ctx) => withDetails(ctx.cfg, "/api/request/filter", (r) => `/api/request/${r.request_uid}`),
     uid: (r) => r.request_uid,
     async transform(r, ctx) {
-      if (!ctx.extra.requestStatuses) {
-        const { data, error } = await ctx.client.schema("jms").from("request_statuses").select("id, status_type").eq("tenant_id", ctx.tenantId).order("display_order", { ascending: false });
-        if (error) throw error;
-        ctx.extra.requestStatuses = new Map(((data ?? []) as { id: string; status_type: string }[]).map((x) => [x.status_type, x.id])); // lowest display_order wins
-      }
       const priority = String(r.request_priority ?? "").toUpperCase();
       // The source record behind the name the request keeps (00197).
       if (r.request_source && typeof r.request_source === "object") await requestSource(ctx, r.request_source);
@@ -1746,7 +1797,10 @@ export const ENTITIES: Record<string, Entity> = {
         description_html: T(r.request_description),
         asset_id: mapGet(await ctxMap(ctx, "assets"), r.asset?.asset_uid),
         customer_id: await customerId(ctx, r.customer), organization_id: await organizationId(ctx, r.organization),
-        status_id: mapGet(ctx.extra.requestStatuses, REQUEST_STATUS_TYPES[String(r.request_status?.status_type ?? "")] ?? "NEW"),
+        // Zuper's own status (owner decision 2026-09-21, 00198), and the request's copy of its colour: Zuper answers
+        // the colour the status had when the request entered it (#3498db on GBG's older Open requests).
+        ...(r.request_status && typeof r.request_status === "object"
+          ? { status_id: await requestStatusId(ctx, r.request_status), status_color: T(r.request_status.status_color) } : {}),
         priority: JOB_PRIORITIES.has(priority) ? priority : "LOW",
         assigned_to: mapGet(await ctxMap(ctx, "users"), r.assigned_to?.[0]?.user?.user_uid),
         due_date: ts(r.request_due_date), preferred_date_1: ts(r.request_preferred_date1?.start_time), preferred_date_2: ts(r.request_preferred_date2?.start_time),
@@ -1758,7 +1812,10 @@ export const ENTITIES: Record<string, Entity> = {
         ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
       };
     },
-    afterWrite: (ctx, id, r, isNew) => writeAddresses(ctx, "REQUEST", id, isNew, r.service_address, r.billing_address),
+    async afterWrite(ctx, id, r, isNew) {
+      await writeAddresses(ctx, "REQUEST", id, isNew, r.service_address, r.billing_address);
+      await writeRequestStatusHistory(ctx, id, r.status_history);
+    },
   },
   // Every job (owner decision), a page at a time. The list payload carries no description — only
   // GET /api/jobs/{uid} does — so descriptions are left untouched here (and not blanked on re-runs).
@@ -2310,6 +2367,18 @@ ENTITIES.request_sources = {
       created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
       ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
       ...(r.updated_at ? { updated_at: String(r.updated_at) } : {}),
+    };
+  },
+};
+// Zuper's request statuses (Open, Booked, Canceled for GBG), in its order, with their colour and description.
+ENTITIES.request_statuses = {
+  name: "request_statuses", schema: "jms", table: "request_statuses",
+  fetch: (ctx) => zuperGet(ctx.cfg, "/api/request/status").then((j) => ((j.data ?? []) as any[]).map((x, i) => ({ ...x, _order: i + 1 }))),
+  uid: (r) => r.status_uid,
+  async transform(r) {
+    return {
+      name: T(r.status_name) ?? "Status", status_type: REQUEST_STATUS_KIND(r.status_type), color: T(r.status_color),
+      description: T(r.status_description), display_order: r._order, is_active: r.is_deleted !== true,
     };
   },
 };
