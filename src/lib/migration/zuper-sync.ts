@@ -490,14 +490,19 @@ export function customerFields(r: any): Record<string, unknown> {
     accounts: { tax: null, ltv: num0(acc.ltv), receivables: num0(acc.receivables), credits: num0(acc.credits) },
     is_portal_enabled: r.is_portal_enabled === true, has_card_on_file: r.has_card_on_file === true, tax_exempt: r.tax?.tax_exempt === true,
     has_sla: r.has_sla === true, do_not_service: r.do_not_service === true,
-    is_active: r.is_active !== false, is_deleted: r.is_deleted === true, ...createdAt(r),
+    is_active: r.is_active !== false,
+    // Only when Zuper says. `is_deleted: r.is_deleted === true` read a MISSING key as "not deleted", and Zuper's list of
+    // deleted customers (filter.is_deleted=true) sends rows without the key — so feeding one of those rows back
+    // un-deleted a customer Zuper had deleted. It happened once, on 2026-09-21, and was put back by hand.
+    ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
+    ...createdAt(r),
   };
 }
 function organizationFields(r: any): Record<string, unknown> {
   return {
     name: T(r.organization_name) ?? "Organization", email: T(r.organization_email),
     description: T(r.plain_text_description) ?? stripHtml(r.organization_description), plain_text_description: T(r.plain_text_description),
-    tax_exempt: r.tax?.tax_exempt === true, is_active: r.is_active !== false, is_deleted: r.is_deleted === true, ...createdAt(r),
+    tax_exempt: r.tax?.tax_exempt === true, is_active: r.is_active !== false, ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
   };
 }
 /** The jms customer for an embedded Zuper customer — created on the spot when the customer list lacks
@@ -1259,7 +1264,7 @@ export const ENTITIES: Record<string, Entity> = {
         timezone: T(r.team_timezone),
         is_dispatchable: r.is_dispatchable === true,
         is_active: r.is_active !== false,
-        is_deleted: r.is_deleted === true,
+        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
         ...createdAt(r),
       };
@@ -1295,7 +1300,7 @@ export const ENTITIES: Record<string, Entity> = {
         organization_id: mapGet(await ctxMap(ctx, "organizations"), r.organization?.organization_uid),
         project_manager_id: mapGet(users, r.project_manager?.user_uid),
         is_active: r.is_active !== false,
-        is_deleted: r.is_deleted === true,
+        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
         created_by: mapGet(users, r.created_by?.user_uid),
         ...createdAt(r),
       };
@@ -1319,7 +1324,7 @@ export const ENTITIES: Record<string, Entity> = {
         reference_number: T(r.reference_number),
         remarks: S(r.remarks),
         total_price: N(r.total_price),
-        is_deleted: r.is_deleted === true,
+        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
         ...createdAt(r),
       };
@@ -1368,7 +1373,7 @@ export const ENTITIES: Record<string, Entity> = {
         tax_exempt: r.tax?.tax_exempt === true,
         pricelist_uid: T(r.pricelist && typeof r.pricelist === "object" ? r.pricelist.pricelist_uid : r.pricelist),
         is_active: r.is_active !== false,
-        is_deleted: r.is_deleted === true,
+        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
         ...createdAt(r),
       };
@@ -1460,7 +1465,7 @@ export const ENTITIES: Record<string, Entity> = {
         organization_id: await organizationId(ctx, r.organization),
         parent_asset_id: mapGet(await ctxMap(ctx, "assets"), r.parent_asset?.asset_uid),
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
-        is_active: r.is_active !== false, is_deleted: r.is_deleted === true, ...createdAt(r),
+        is_active: r.is_active !== false, ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
       };
     },
     async afterWrite(ctx, id, r) {
@@ -1494,7 +1499,7 @@ export const ENTITIES: Record<string, Entity> = {
         assigned_to: mapGet(await ctxMap(ctx, "users"), r.assigned_to?.[0]?.user?.user_uid ?? r.assigned_to?.user_uid),
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
         total: num0(r.contract_total),
-        is_active: r.is_active !== false && r.is_expired !== true, is_deleted: r.is_deleted === true, ...createdAt(r),
+        is_active: r.is_active !== false && r.is_expired !== true, ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
       };
     },
     async afterWrite(ctx, id, r, isNew) {
@@ -1533,7 +1538,7 @@ export const ENTITIES: Record<string, Entity> = {
         assigned_to: mapGet(await ctxMap(ctx, "users"), r.assigned_to?.[0]?.user?.user_uid),
         due_date: ts(r.request_due_date), preferred_date_1: ts(r.request_preferred_date1?.start_time), preferred_date_2: ts(r.request_preferred_date2?.start_time),
         request_source: T(r.request_source?.request_source_name),
-        is_deleted: r.is_deleted === true, ...createdAt(r),
+        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
       };
     },
     afterWrite: (ctx, id, r, isNew) => writeAddresses(ctx, "REQUEST", id, isNew, r.service_address, r.billing_address),
@@ -1580,7 +1585,7 @@ export const ENTITIES: Record<string, Entity> = {
         service_territory_id: await territoryId(ctx, r.service_territory),
         service_address: zAddress(r.customer_address), billing_address: zAddress(r.customer_billing_address),
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
-        is_deleted: r.is_deleted === true, ...createdAt(r),
+        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
       };
     },
     async afterWrite(ctx, id, r, isNew) {
@@ -1685,7 +1690,7 @@ export const ENTITIES: Record<string, Entity> = {
         template_id: await documentTemplateId(ctx, r.template?.template_uid),
         description_html: T(r.estimate_description),
         deposit_amount: r.deposit?.total == null ? null : num0(r.deposit.total), deposit_status: T(r.deposit?.status),
-        is_deleted: r.is_deleted === true, ...createdAt(r),
+        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
       };
     },
     async afterWrite(ctx, id, r, isNew) {
@@ -1724,7 +1729,7 @@ export const ENTITIES: Record<string, Entity> = {
         tags: Array.isArray(r.tags) ? r.tags.map((t: any) => T(typeof t === "string" ? t : t?.tag_name ?? t?.name)).filter(Boolean) : [],
         template_id: await documentTemplateId(ctx, r.template?.template_uid),
         payment_term_id: await paymentTermId(ctx, r.payment_term),
-        is_deleted: r.is_deleted === true, ...createdAt(r),
+        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
       };
     },
     async afterWrite(ctx, id, r, isNew) {
@@ -1950,7 +1955,7 @@ ENTITIES.user_shifts = {
       label, starts_at: String(r.start_date_time), ends_at: String(r.end_date_time),
       remarks: T(r.shift_remarks), is_approved: r.is_approved !== false, approval_remarks: T(r.approval_remarks),
       approved_by: mapGet(users, r.approval_by_user?.user_uid), approved_at: ts(r.approved_at),
-      is_active: r.is_active !== false, is_deleted: r.is_deleted === true,
+      is_active: r.is_active !== false, ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
       created_by: mapGet(users, r.created_by_user?.user_uid), ...createdAt(r),
     };
   },
@@ -2119,7 +2124,7 @@ ENTITIES.product_transactions = {
       remarks: T(r.remarks), serial_nos: ((r.serial_nos ?? []) as unknown[]).map(String),
       module_name: T(r.module_name), module_ref: T(r.module_uid),
       // A voided movement stays for the audit trail and drops out of the API's list (00145).
-      is_deleted: r.is_deleted === true,
+      ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
       created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid), ...createdAt(r),
     };
   },
@@ -2269,7 +2274,7 @@ ENTITIES.timesheet_locations = {
       latitude: point ? lat : null, longitude: point ? lng : null,
       address: r.address == null ? null : typeof r.address === "object" ? JSON.stringify(r.address) : T(r.address),
       radius: Number.isFinite(radius) && radius > 0 ? radius : 100,   // the table's own default
-      is_deleted: r.is_deleted === true || r.is_deleted === 1,
+      ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true || r.is_deleted === 1 } : {}),
       created_by: mapGet(await ctxMap(ctx, "users"), r.created_by_user?.user_uid ?? r.created_by?.user_uid),
       ...createdAt(r),
     };
@@ -2721,7 +2726,7 @@ ENTITIES.notes = {
       body: (html ? T(richTextToPlain(html)) : T(raw)) ?? "", body_html: html || null,
       visibility: r.is_private === true ? "ONLY_ME" : r.visible_to_fe === false ? "BACKOFFICE_ONLY" : r.visibility === "PUBLIC" || r.visible_to_customer === true ? "PUBLIC" : "INTERNAL",
       is_pinned: r.is_pinned === true, notify: false,
-      is_deleted: r.is_deleted === true, deleted_at: r.is_deleted === true ? ts(r.updated_at) : null,
+      ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true, deleted_at: r.is_deleted === true ? ts(r.updated_at) : null } : {}),
       edited_at: r.is_edited === true ? ts(r.updated_at) : null,
       zuper_uid: r.note_uid, ...createdAt(r), ...(r.updated_at ? { updated_at: String(r.updated_at) } : {}),
     };
