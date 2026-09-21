@@ -42,7 +42,7 @@ async function mapOf(entity: string): Promise<Map<string, string>> {
   const out = new Map<string, string>();
   for (let page = 0; ; page++) {
     const { data } = await client.schema("jms").from("zuper_sync_map")
-      .select("zuper_uid, jms_id").eq("tenant_id", tenantId).eq("entity", entity).range(page * 1000, page * 1000 + 999);
+      .select("zuper_uid, jms_id").eq("tenant_id", tenantId).eq("entity", entity).order("zuper_uid").range(page * 1000, page * 1000 + 999);
     const rows = (data ?? []) as any[];
     for (const r of rows) out.set(r.zuper_uid, r.jms_id);
     if (rows.length < 1000) break;

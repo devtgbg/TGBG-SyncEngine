@@ -44,7 +44,7 @@ async function alreadyAsked(): Promise<Set<string>> {
   for (let page = 0; ; page++) {
     const { data } = await client.schema("jms").from("zuper_sync_map")
       .select("zuper_uid").eq("tenant_id", tenantId).eq("entity", "job_chat_asked")
-      .range(page * 1000, page * 1000 + 999);
+      .order("zuper_uid").range(page * 1000, page * 1000 + 999);   // ordered: an unordered page may skip rows
     const rows = (data ?? []) as any[];
     for (const r of rows) asked.add(r.zuper_uid);
     if (rows.length < 1000) break;
@@ -56,7 +56,7 @@ const users = new Map<string, string>();
 {
   for (let page = 0; ; page++) {
     const { data } = await client.schema("jms").from("zuper_sync_map")
-      .select("zuper_uid, jms_id").eq("tenant_id", tenantId).eq("entity", "users").range(page * 1000, page * 1000 + 999);
+      .select("zuper_uid, jms_id").eq("tenant_id", tenantId).eq("entity", "users").order("zuper_uid").range(page * 1000, page * 1000 + 999);
     const rows = (data ?? []) as any[];
     for (const r of rows) users.set(r.zuper_uid, r.jms_id);
     if (rows.length < 1000) break;

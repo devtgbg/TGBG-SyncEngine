@@ -17,6 +17,8 @@
  *                   the import maps it and compared with our row, field by field.
  *   newest first    notes: the first pages of Zuper's list, for notes Tuper lacks.
  *   by window       punches and time off (collections.ts).
+ *   oldest first    stock movements: Zuper lists them oldest first, so a pass reads
+ *                   the end of the list and a `full` pass reads every page.
  *
  * The small lists (a page or two each) and notes, punches and time off run on
  * every pass. Organizations, assets, products and customers are ~100 list pages
@@ -199,12 +201,21 @@ export async function sweepRecords(o: SweepOpts): Promise<KindResult[]> {
   if (o.full) await run("customers", () => customers(cfg, o));
   await run("notes", () => notes(cfg, o));
   if (!o.dryRun) {
-    for (const c of ["timesheets", "timeoff_requests"] as const) {
+    // One list call each, as the two above. Timesheet approvals are deliberately not here: each one has to be read
+    // by uid for its history, so a sweep of them is a call per approval, which is not the shape this budget is for.
+    for (const c of ["timesheets", "timeoff_requests", "timeoff_availability", "timesheet_locations"] as const) {
       await run(c, async () => {
         const res = await syncCollection(c);
         return { kind: c, listed: res.listed, behind: 0, missing: 0, resynced: res.written, failed: res.failed, errors: res.errors };
       });
     }
+    // Stock movements. An ordinary pass reads the end of the list (two calls); a `full` pass reads every page — eight
+    // today — which is how a backlog is caught up rather than only the newest movements. Either way only the ones
+    // Tuper lacks, plus the newest handful, are written.
+    await run("product_transactions", async () => {
+      const res = await syncCollection("product_transactions", { full: o.full });
+      return { kind: "product_transactions", listed: res.listed, behind: 0, missing: 0, resynced: res.written, failed: res.failed, errors: res.errors };
+    });
   }
   return out;
 }

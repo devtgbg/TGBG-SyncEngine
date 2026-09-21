@@ -88,9 +88,9 @@ for (const [event, entity] of PREFIXES) {
 
 // A module that is present must still win, and nonsense must still be refused.
 ok("an explicit module gives the same answer", resolveRoute("JOB", "job.update")?.entity === "jobs");
-// Properties are their own Zuper module, not organizations — and have no importer.
+// Properties are their own Zuper module, not organizations: their own entity, read at GET /api/property/{uid}.
 const prop = resolveRoute("", "property.new");
-ok('"property.new" is skipped, not sent to organizations', prop?.entity !== "organizations" && !!prop?.skip);
+ok('"property.new" -> properties, not organizations', prop?.entity === "properties" && !prop?.skip);
 ok("an unknown event with no module is still refused", resolveRoute("", "nonsense.thing") === null);
 ok("an empty event with no module is refused", resolveRoute("", "") === null);
 

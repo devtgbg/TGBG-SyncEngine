@@ -24,7 +24,9 @@
     "sweep": "tsx src/cli/sweep.ts",
     "outbox": "tsx src/cli/outbox.ts",
     "check-push": "tsx src/cli/check-push.ts",
-    "compare": "tsx src/cli/compare.ts"
+    "compare": "tsx src/cli/compare.ts",
+    "compare:fields": "tsx src/cli/compare.ts --fields",
+    "record-files": "tsx src/cli/record-files.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

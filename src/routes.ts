@@ -23,6 +23,9 @@
  * WHY PROPERTY IS NOT ORGANIZATIONS. Zuper has both modules. This account has
  * 1,008 organizations and one property, and `GET /api/organization/{uid}` answers
  * 404 for a property uid — which is what an earlier mapping would have requested.
+ * A property is read at `GET /api/property/{uid}` and written by the `properties`
+ * entity (added 2026-09-21); until then all eleven PROPERTY events were skipped and
+ * the one property had never reached Tuper.
  *
  * The routing principle is unchanged: a webhook is a TRIGGER, not a payload. We
  * take the record's uid and re-read it from Zuper, the system of record. Most
@@ -70,7 +73,11 @@ const ENTITY_FETCH: Record<string, { mode: FetchMode; path?: (uid: string) => st
   customers: { mode: "detail", path: (u) => `/api/customers/${u}` },        // plural
   organizations: { mode: "detail", path: (u) => `/api/organization/${u}` }, // singular
   assets: { mode: "detail", path: (u) => `/api/assets/${u}` },              // plural
-  products: { mode: "detail", path: (u) => `/api/products/${u}` },          // plural
+  // SINGULAR. `/api/products/{uid}` is not a route Zuper has: it answers Express's HTML "Cannot GET /api/products/…",
+  // which surfaces as a JSON parse error, so every product event and every product the sweep found drifted failed.
+  // `/api/product/{uid}` answers the product (checked read-only 2026-09-21 against a mapped uid), and an unknown uid
+  // earns Zuper's own "Invalid Product UID" envelope. The LIST is /api/product/filter — also singular.
+  products: { mode: "detail", path: (u) => `/api/product/${u}` },           // singular
   contracts: { mode: "detail", path: (u) => `/api/service_contract/${u}` }, // singular
   users: { mode: "detail", path: (u) => `/api/user/${u}` },                 // singular
   estimates: { mode: "detail", path: (u) => `/api/estimate/${u}` },
@@ -82,6 +89,10 @@ const ENTITY_FETCH: Record<string, { mode: FetchMode; path?: (uid: string) => st
   // proves them, and a field that arrives differently shows up as a failed sync rather than a quietly wrong row.
   projects: { mode: "detail", path: (u) => `/api/projects/${u}` },          // plural
   purchase_orders: { mode: "detail", path: (u) => `/api/purchase_orders/${u}` },
+  // Singular, and proven read-only: an unknown uid earns Zuper's own "No Property found for given UID",
+  // where `/api/properties/{uid}` earns Express's HTML "Cannot GET". The by-uid read is the only one that
+  // carries the description, the price list and the files — the list leaves all three out.
+  properties: { mode: "detail", path: (u) => `/api/property/${u}` },        // singular
 
   // No read-by-uid exists. Changes are refused rather than guessed at; DELETIONS
   // still work for mapped records, because marking a row deleted needs no fetch.
@@ -91,6 +102,17 @@ const ENTITY_FETCH: Record<string, { mode: FetchMode; path?: (uid: string) => st
   timesheets: { mode: "collection" },
   timeoff_requests: { mode: "collection" },
   timeoff_types: { mode: "collection" },
+  // Zuper publishes GET /api/timesheet/approval/{uid} (the approval with its history and punches) and
+  // GET /api/timesheet/location/{uid} (the location's people), but a timesheet delivery names no record we could
+  // pass them — and reading the list whole is also the only way to see a record Zuper has removed. So these three
+  // re-read their list, and the approval's by-uid read is made per row inside that pass.
+  timesheet_locations: { mode: "collection" },
+  timesheet_approvals: { mode: "collection" },
+  timeoff_availability: { mode: "collection" },
+  // A stock movement has no read-by-uid either (GET /api/product/{transaction_uid} answers "Invalid Product UID"),
+  // and the delivery names the movement, not the part. Zuper lists them oldest first, so the newest are on the last
+  // page and an event re-reads the end of that list (collections.ts).
+  product_transactions: { mode: "collection" },
 };
 
 /** The by-uid path for an entity, or null when Zuper publishes none. */
@@ -130,10 +152,13 @@ export interface Route {
 }
 
 /** Lists Zuper only serves whole (see collections.ts). */
-export type Collection = "timesheets" | "timeoff_requests" | "timeoff_types";
+export type Collection =
+  | "timesheets" | "timeoff_requests" | "timeoff_types"
+  | "timesheet_locations" | "timesheet_approvals" | "timeoff_availability"
+  | "product_transactions";
 
 /** Records Tuper keeps notes on — the hosts the notes import understands. */
-export type NoteHost = "job" | "customer" | "request" | "asset";
+export type NoteHost = "job" | "customer" | "request" | "asset" | "project" | "purchase_order";
 
 interface EventRule {
   /** Recorded as not synced, with this reason. */
@@ -167,19 +192,32 @@ const DELETE: EventRule = { deletion: true };
 // catches new and edited notes; a deleted note is flagged by note_uid when the
 // delivery carries one, otherwise by its absence from that list (Zuper's list
 // omits deleted notes).
+//
+// The list takes a host filter per record kind, and `project` and `purchase_order` are two of them: given a uid of
+// neither shape, `GET /api/notes?filter.project=…` answers "Invalid Project UID" and `filter.purchase_order=…`
+// "Invalid Purchase Order UID", exactly as `filter.job=…` answers "The job UID sent is not valid" — while a filter
+// name Zuper does not know is ignored and the whole note list comes back. So both hosts are real (checked read-only
+// 2026-09-21), even though this account holds no project or purchase order to prove one end to end.
 const NOTE = (host: NoteHost): EventRule => ({ entity: "notes", uidFields: [`${host}_uid`], noteHost: host });
 const NOTE_DELETE = (host: NoteHost): EventRule => ({ ...NOTE(host), deletion: true });
 const NO_NOTES: EventRule = { skip: "Tuper keeps no notes on quotes, invoices or contracts" };
 const PUNCHES: EventRule = { entity: "timesheets", uidFields: [], collection: "timesheets" };
 const TIMEOFF: EventRule = { entity: "timeoff_requests", uidFields: [], collection: "timeoff_requests" };
 const TIMEOFF_TYPES: EventRule = { entity: "timeoff_types", uidFields: [], collection: "timeoff_types" };
+// Tuper grew tables for these on 2026-09-18 (migrations 00140, 00141), so they are no longer "not kept in Tuper".
+const LOCATIONS: EventRule = { entity: "timesheet_locations", uidFields: [], collection: "timesheet_locations" };
+const APPROVALS: EventRule = { entity: "timesheet_approvals", uidFields: [], collection: "timesheet_approvals" };
+const AVAILABILITY: EventRule = { entity: "timeoff_availability", uidFields: [], collection: "timeoff_availability" };
 const NOT_KEPT = (what: string): EventRule => ({ skip: `not kept in Tuper: ${what}` });
 const SHIFTS: EventRule = { skip: "shift planning is not used in Zuper here" };
-// Notes are read back per record kind, and the reader knows jobs, customers, requests and assets. Zuper holds no
-// projects or purchase orders on this account, so rather than guess at a path that has never answered, their note
-// events are recorded with this reason; the record itself still syncs.
-const NO_PROJECT_NOTES: EventRule = { skip: "notes on projects and purchase orders are not read back yet (none exist in Zuper)" };
-const ATTACHMENT: EventRule = { skip: "files attached to this kind of record are not synced (job files and note files are)" };
+// A file added to, renamed on, or removed from a customer, organization, asset, quote or invoice. Zuper publishes no
+// read-by-uid for a file and no list that says which record a file is on, but every one of these records carries its
+// own files in its by-uid read — so an attachment event is what every other event here is: re-read the record.
+// zuper-sync.ts's writeRecordFiles links what that read carries (Zuper's own link, never a copy — owner, 2026-09-18)
+// and marks the ones Zuper no longer lists deleted. NOT a `deletion` rule: that would mark the RECORD deleted, which
+// is exactly what check-wire-routes guards against for estimate.delete_attachment.
+const FILES: EventRule = {};
+const TRANSACTIONS: EventRule = { entity: "product_transactions", uidFields: [], collection: "product_transactions" };
 const NO_STATE: (what: string) => EventRule = (what) => ({ skip: `${what} changes nothing on the record` });
 
 /** The passes after `jobs` for every job change. */
@@ -257,9 +295,9 @@ const MODULES: Record<string, ModuleSpec> = {
       "customer.delete_note": ["Delete Note", NOTE_DELETE("customer")],
       "customer.add_card": ["New Customer Card", { skip: "payment cards are not synced" }],
       "customer.delete_card": ["Remove Customer Card", { skip: "payment cards are not synced" }],
-      "customer.new_attachment": ["New Customer Attachment", ATTACHMENT],
-      "customer.delete_attachment": ["Delete Customer Attachment", ATTACHMENT],
-      "customer.update_attachment": ["Update Customer Attachment", ATTACHMENT],
+      "customer.new_attachment": ["New Customer Attachment", FILES],
+      "customer.delete_attachment": ["Delete Customer Attachment", FILES],
+      "customer.update_attachment": ["Update Customer Attachment", FILES],
       "customer.bulk_action": ["Customer Bulk Action"],
     },
   },
@@ -275,39 +313,41 @@ const MODULES: Record<string, ModuleSpec> = {
       "organization.bulk_action": ["Organization Bulk Action"],
       "organization.assign_users": ["Assign Users"],
       "organization.unassign_users": ["Unassign Users"],
-      "organization.new_attachment": ["New Organization Attachment", ATTACHMENT],
-      "organization.update_attachment": ["Update Organization Attachment", ATTACHMENT],
-      "organization.delete_attachment": ["Delete Organization Attachment", ATTACHMENT],
+      "organization.new_attachment": ["New Organization Attachment", FILES],
+      "organization.update_attachment": ["Update Organization Attachment", FILES],
+      "organization.delete_attachment": ["Delete Organization Attachment", FILES],
       "import.organization": ["Import Organization", { skip: "a bulk import notice carries no single record" }],
     },
   },
 
   PROPERTY: {
     label: "Properties",
-    // A separate Zuper record, not an organization. No importer exists, and this
-    // account has exactly one property.
+    // A separate Zuper record, not an organization: `GET /api/property/{uid}`, never
+    // `/api/organization/{uid}`. `properties` writes the row, its address, its customers,
+    // who it is assigned to, its tags, its custom fields and its files — all of which the
+    // by-uid read carries, so every event here means "this property changed": re-read it.
     entity: "properties",
     uidFields: ["property_uid"],
-    skipAll: "properties have no importer (this account has one)",
     events: {
       "property.new": ["New Property"],
       "property.update": ["Update Property"],
       "property.activate": ["Property Activate"],
       "property.deactivate": ["Property Deactivate"],
-      "property.delete": ["Property Delete"],
+      "property.delete": ["Property Delete", DELETE],
       "property.bulk_action": ["Property Bulk Action"],
       "property.assign_users": ["Assign Users"],
       "property.unassign_users": ["Unassign Users"],
+      // The property's own files arrive on the full re-read. A removal is not synced, as on a job.
       "property.new_attachment": ["New Property Attachment"],
       "property.update_attachment": ["Update Property Attachment"],
-      "property.delete_attachment": ["Delete Property Attachment"],
+      "property.delete_attachment": ["Delete Property Attachment", { skip: "removing a property attachment is not synced" }],
     },
   },
 
   TIMESHEET: {
     label: "Timesheets",
-    // One Zuper module spanning punches, approvals, time off, shifts and GPS. None
-    // has a read-by-uid, so punches and time off re-read the recent part of their
+    // One Zuper module spanning punches, approvals, time off, shifts and GPS. A
+    // timesheet delivery names no record, so every event that syncs re-reads its
     // list (collections.ts); no uid is needed.
     entity: "timesheets",
     uidFields: [],
@@ -332,18 +372,21 @@ const MODULES: Record<string, ModuleSpec> = {
       "timesheet.new_timeoff_type": ["New Timeoff Type", TIMEOFF_TYPES],
       "timesheet.edit_timeoff_type": ["Edit Timeoff Type", TIMEOFF_TYPES],
       "timesheet.delete_timeoff_type": ["Delete Timeoff Type", TIMEOFF_TYPES],
-      "timesheet_approval.new": ["New Timesheet Approval", NOT_KEPT("timesheet approvals")],
-      "timesheet_approval.update": ["Update Timesheet Approval", NOT_KEPT("timesheet approvals")],
-      "timesheet_approval.delete": ["Delete Timesheet approval", NOT_KEPT("timesheet approvals")],
-      "timesheet_approval.status_update": ["Timesheet Approval Status Update", NOT_KEPT("timesheet approvals")],
-      "timesheet.new_location": ["Timesheet New Location", NOT_KEPT("timesheet locations")],
-      "timesheet.edit_location": ["Timesheet Edit Location", NOT_KEPT("timesheet locations")],
-      "timesheet.delete_location": ["Timesheet Delete Location", NOT_KEPT("timesheet locations")],
-      "timesheet.employee_location_create": ["New Timesheet Location", NOT_KEPT("timesheet locations")],
-      "timesheet.employee_location_delete": ["Delete Timesheet Location", NOT_KEPT("timesheet locations")],
-      "timesheet.new_timeoff_availability": ["New Timeoff Availability", NOT_KEPT("time off availability")],
-      "timesheet.edit_timeoff_availability": ["Edit Timeoff Availability", NOT_KEPT("time off availability")],
-      "timesheet.delete_timeoff_availability": ["Delete Timeoff Availability", NOT_KEPT("time off availability")],
+      // An approval's history and the punches it covers come only from its by-uid read, which the pass makes per row.
+      "timesheet_approval.new": ["New Timesheet Approval", APPROVALS],
+      "timesheet_approval.update": ["Update Timesheet Approval", APPROVALS],
+      // A deleted approval leaves Zuper's list; the pass marks the row it can no longer see deleted.
+      "timesheet_approval.delete": ["Delete Timesheet approval", APPROVALS],
+      "timesheet_approval.status_update": ["Timesheet Approval Status Update", APPROVALS],
+      "timesheet.new_location": ["Timesheet New Location", LOCATIONS],
+      "timesheet.edit_location": ["Timesheet Edit Location", LOCATIONS],
+      "timesheet.delete_location": ["Timesheet Delete Location", LOCATIONS],
+      // Assigning or unassigning a person: the pass replaces each location's people with Zuper's.
+      "timesheet.employee_location_create": ["New Timesheet Location", LOCATIONS],
+      "timesheet.employee_location_delete": ["Delete Timesheet Location", LOCATIONS],
+      "timesheet.new_timeoff_availability": ["New Timeoff Availability", AVAILABILITY],
+      "timesheet.edit_timeoff_availability": ["Edit Timeoff Availability", AVAILABILITY],
+      "timesheet.delete_timeoff_availability": ["Delete Timeoff Availability", AVAILABILITY],
       // No shift is scheduled in Zuper from Sep to Dec 2026 (checked 2026-09-17).
       "timesheet.user_shift_create": ["New User Shift", SHIFTS],
       "timesheet.user_shift_delete": ["Delete User Shift", SHIFTS],
@@ -365,10 +408,13 @@ const MODULES: Record<string, ModuleSpec> = {
       "product.location_update": ["Product Location Update", { skip: "product locations are only readable as a whole list" }],
       "product.location_delete": ["Product Location Delete", { skip: "product locations are only readable as a whole list" }],
       // "transcation" is Zuper's spelling, kept because it is what arrives.
-      "product.transcation_inward": ["Product Transaction Inward", { skip: "Zuper has no GET by transaction uid" }],
-      "product.transcation_outward": ["Product Transaction Outward", { skip: "Zuper has no GET by transaction uid" }],
-      "product.transcation_transfer": ["Product Transaction Transfer", { skip: "Zuper has no GET by transaction uid" }],
-      "product.consumption": ["Product Consumption", { skip: "Zuper has no GET by transaction uid" }],
+      // There is still no GET by transaction uid — but Zuper LISTS movements, which is the case collections.ts exists
+      // for: the event re-reads the end of that list. Stock in, stock out, a transfer between locations and a document
+      // consuming a part all land in jms.product_transactions.
+      "product.transcation_inward": ["Product Transaction Inward", TRANSACTIONS],
+      "product.transcation_outward": ["Product Transaction Outward", TRANSACTIONS],
+      "product.transcation_transfer": ["Product Transaction Transfer", TRANSACTIONS],
+      "product.consumption": ["Product Consumption", TRANSACTIONS],
       "product.update_stock": ["Update Product Stock"],
       "product.bulk_action": ["Product Bulk Action"],
     },
@@ -388,8 +434,8 @@ const MODULES: Record<string, ModuleSpec> = {
       "estimate.print": ["Print Quote", NO_STATE("printing")],
       "estimate.send": ["Send Quote"],
       "estimate.new_note": ["Quote New Note", NO_NOTES],
-      "estimate.new_attachment": ["Quote New Attachment", ATTACHMENT],
-      "estimate.delete_attachment": ["Quote Delete Attachment", ATTACHMENT],
+      "estimate.new_attachment": ["Quote New Attachment", FILES],
+      "estimate.delete_attachment": ["Quote Delete Attachment", FILES],
       "estimate.delete_note": ["Quote Delete Note", NO_NOTES],
       "estimate.delete": ["Quote Delete", DELETE],
       "estimate.bulk_action": ["Quote Bulk Action"],
@@ -410,8 +456,8 @@ const MODULES: Record<string, ModuleSpec> = {
       "invoice.print": ["Print Invoice", NO_STATE("printing")],
       "invoice.send": ["Send Invoice"],
       "invoice.new_note": ["Invoice New Note", NO_NOTES],
-      "invoice.new_attachment": ["Invoice Attachment", ATTACHMENT],
-      "invoice.delete_attachment": ["Invoice Delete Attachment", ATTACHMENT],
+      "invoice.new_attachment": ["Invoice Attachment", FILES],
+      "invoice.delete_attachment": ["Invoice Delete Attachment", FILES],
       "invoice.delete_note": ["Invoice Delete Note", NO_NOTES],
       "invoice.delete": ["Invoice Delete", DELETE],
       "invoice.bulk_action": ["Invoice Bulk Action"],
@@ -456,10 +502,10 @@ const MODULES: Record<string, ModuleSpec> = {
       "asset.delete": ["Asset Delete", DELETE],
       "asset.activate": ["Asset activate"],
       "asset.deactivate": ["Asset Deactivate"],
-      "asset.new_attachment": ["New Asset Attachment", ATTACHMENT],
+      "asset.new_attachment": ["New Asset Attachment", FILES],
       // "Aseet" is Zuper's typo in the display name; the keys are spelled correctly.
-      "asset.delete_attachment": ["Delete Aseet Attachment", ATTACHMENT],
-      "asset.update_attachment": ["Update Aseet Attachment", ATTACHMENT],
+      "asset.delete_attachment": ["Delete Aseet Attachment", FILES],
+      "asset.update_attachment": ["Update Aseet Attachment", FILES],
       "asset.bulk_action": ["Asset Bulk Action"],
       "asset.status_update": ["Asset Status Update"],
       "asset.history": ["Asset History"],
@@ -509,7 +555,7 @@ const MODULES: Record<string, ModuleSpec> = {
       "project.new_phase": ["New Project Phase"],
       "project.update_phase": ["Update Project Phase"],
       "project.delete_phase": ["Delete Project Phase"],
-      "project.update_note": ["Update Project Note", NO_PROJECT_NOTES],
+      "project.update_note": ["Update Project Note", NOTE("project")],
       "project.assign_users": ["Project Assign Users"],
       "project.unassign_users": ["Project Unassign Users"],
       "project.timelog": ["Project Timelog"],
@@ -528,7 +574,7 @@ const MODULES: Record<string, ModuleSpec> = {
       "purchase_order.delete": ["Purchase Order Delete", DELETE],
       "purchase_order.status_update": ["Purchase Order Status Update"],
       "purchase_order.send": ["Send Purchase Order", NO_STATE("sending a purchase order")],
-      "purchase_order.new_note": ["Purchase Order New Note", NO_PROJECT_NOTES],
+      "purchase_order.new_note": ["Purchase Order New Note", NOTE("purchase_order")],
     },
   },
   USER: {

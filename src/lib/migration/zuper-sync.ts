@@ -137,10 +137,24 @@ async function* zuperListPages(cfg: SyncConfig, path: string, pageSize = 100): A
 
 // ── Map + run helpers ──
 export type Ctx = { client: SupabaseClient; tenantId: string; cfg: SyncConfig; maps: Record<string, Map<string, string>>; extra: Record<string, any> };
+/**
+ * Every uid this sync has mapped for an entity.
+ *
+ * ORDERED, because the pages are LIMIT/OFFSET and Postgres promises nothing about the order of an unordered read: two
+ * pages of one query can return the same row and miss another. Without the order this returned 2,265 assets on two
+ * runs and 1,712 on the next four — 553 records read as "not imported" when every one of them was (2026-09-21). The
+ * map is what the importer uses to decide whether a record is new, so a short map means writing a second copy of a
+ * record Tuper already has.
+ *
+ * An error is not silently a short map either: the caller gets the failure rather than a map missing whatever the
+ * failed page held.
+ */
 export async function loadMap(client: SupabaseClient, tenantId: string, entity: string): Promise<Map<string, string>> {
   const m = new Map<string, string>();
   for (let from = 0; ; from += 1000) {
-    const { data } = await client.schema("jms").from("zuper_sync_map").select("zuper_uid, jms_id").eq("tenant_id", tenantId).eq("entity", entity).range(from, from + 999);
+    const { data, error } = await client.schema("jms").from("zuper_sync_map").select("zuper_uid, jms_id")
+      .eq("tenant_id", tenantId).eq("entity", entity).order("zuper_uid", { ascending: true }).range(from, from + 999);
+    if (error) throw error;
     for (const r of (data ?? []) as any[]) m.set(r.zuper_uid, r.jms_id);
     if (!data || data.length < 1000) break;
   }
@@ -384,6 +398,86 @@ async function writeAddresses(ctx: Ctx, parentType: string, parentId: string, is
   const rows = ([["SERVICE", zAddress(service)], ["BILLING", zAddress(billing)]] as const)
     .filter(([, a]) => a).map(([kind, a]) => ({ tenant_id: ctx.tenantId, parent_type: parentType, parent_id: parentId, address_kind: kind, ...(a as Record<string, unknown>) }));
   if (rows.length) { const { error } = await addresses().insert(rows); if (error) throw error; }
+}
+
+// ── Properties ──
+// Zuper sends a property's customers, its assignees and its tags WHOLE on the record, so each list is replaced
+// rather than merged — that is what makes `property.unassign_users`, a customer taken off a property, or a tag
+// removed reach Tuper at all. Only a key the record actually carries is replaced: the list at /api/property leaves
+// several of them out, and an absent key means "not told", not "empty".
+
+/** The customer uids on a property. Zuper wraps each one (`property_customers: [{ customer: {…} }]`). */
+function propertyCustomerUids(r: any): string[] {
+  const list: any[] = Array.isArray(r?.property_customers) ? r.property_customers : [];
+  const uids = list.map((c) => T(c?.customer?.customer_uid ?? c?.customer_uid)).filter((u): u is string => Boolean(u));
+  return [...new Set(uids)];
+}
+
+/** A property's customers → jms.property_customers. properties.customer_id keeps the first (migration 00125). */
+async function writePropertyCustomers(ctx: Ctx, propertyId: string, r: any): Promise<void> {
+  const customers = await ctxMap(ctx, "customers");
+  const ids = [...new Set(propertyCustomerUids(r).map((u) => mapGet(customers, u)).filter((id): id is string => Boolean(id)))];
+  const tbl = () => ctx.client.schema("jms").from("property_customers");
+  const { error: gone } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("property_id", propertyId);
+  if (gone) throw gone;
+  if (ids.length) {
+    const { error } = await tbl().insert(ids.map((customer_id) => ({ tenant_id: ctx.tenantId, property_id: propertyId, customer_id })));
+    if (error) throw error;
+  }
+}
+
+/** Who a property is assigned to → jms.property_assignees ({user, team} pairs; a pair naming neither is dropped,
+ *  and a person or team Tuper has never heard of is skipped rather than invented). */
+async function writePropertyAssignees(ctx: Ctx, propertyId: string, r: any): Promise<void> {
+  const users = await ctxMap(ctx, "users"), teams = await ctxMap(ctx, "teams");
+  const seen = new Set<string>();
+  const rows: Record<string, unknown>[] = [];
+  for (const a of (Array.isArray(r?.assigned_to) ? r.assigned_to : []) as any[]) {
+    const user_id = mapGet(users, a?.user?.user_uid ?? a?.user_uid);
+    const team_id = mapGet(teams, a?.team?.team_uid ?? a?.team_uid);
+    if (!user_id && !team_id) continue;                       // property_assignees_someone_ck
+    const key = `${user_id ?? ""}|${team_id ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push({ tenant_id: ctx.tenantId, property_id: propertyId, user_id, team_id });
+  }
+  const tbl = () => ctx.client.schema("jms").from("property_assignees");
+  const { error: gone } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("property_id", propertyId);
+  if (gone) throw gone;
+  if (rows.length) { const { error } = await tbl().insert(rows); if (error) throw error; }
+}
+
+/** Everything that hangs off one property: its address, its customers, its assignees, its tags, its custom-field
+ *  values and its files. The address goes to jms.addresses, which the property screens read first. */
+async function writePropertyParts(ctx: Ctx, id: string, r: any, isNew: boolean): Promise<void> {
+  await writeAddresses(ctx, "PROPERTY", id, isNew, r.property_address, null);
+  if ("property_customers" in r) await writePropertyCustomers(ctx, id, r);
+  if ("assigned_to" in r) await writePropertyAssignees(ctx, id, r);
+  if ("property_tags" in r) {
+    const names = (Array.isArray(r.property_tags) ? r.property_tags : [])
+      .map((t: any) => T(typeof t === "string" ? t : t?.tag_name ?? t?.name))
+      .filter((n: string | null): n is string => Boolean(n));
+    await setEntityTags(ctx.client, ctx.tenantId, "PROPERTY", id, names);
+  }
+  if (Array.isArray(r.custom_fields) && r.custom_fields.length) {
+    await ensureCustomFieldDefinitions(ctx, "PROPERTY", r.custom_fields.map((f: any) => String(f?.label ?? "")));
+    await writeCustomFieldValues(ctx, "PROPERTY", id, r.custom_fields);
+  }
+  // Only when Zuper sent some: the files map is the big one (361k rows), and there is nothing to match without them.
+  if (Array.isArray(r.attachments) && r.attachments.length) await writeZuperFiles(ctx, { type: "property", id }, r.attachments);
+}
+
+/** A property whose parent was imported after it — resolved once every property of the run has an id. */
+async function linkParentProperties(ctx: Ctx, rows: any[]): Promise<void> {
+  const map = await ctxMap(ctx, "properties");
+  for (const r of rows) {
+    const parentUid = T(r?.parent_property?.property_uid);
+    const id = mapGet(map, r?.property_uid), parentId = parentUid ? mapGet(map, parentUid) : null;
+    if (!id || !parentId) continue;
+    const { error } = await ctx.client.schema("jms").from("properties")
+      .update({ parent_property_id: parentId }).eq("id", id).eq("tenant_id", ctx.tenantId).is("parent_property_id", null);
+    if (error) throw error;
+  }
 }
 
 export function customerFields(r: any): Record<string, unknown> {
@@ -1075,20 +1169,79 @@ export const ENTITIES: Record<string, Entity> = {
     },
   },
 
+  // A property as its own Zuper record. PROPERTY is a module of its own — `GET /api/organization/{uid}` answers 404
+  // for a property uid — and until now none of its eleven events reached Tuper at all: GBG's one property had never
+  // arrived. Zuper serves a property at `GET /api/property/{uid}` (an unknown uid earns its own "No Property found
+  // for given UID", where `/api/properties/{uid}` earns Express's HTML 404, so the singular is the real path).
+  //
+  // The LIST leaves out the description, the price list and the files — only the by-uid read carries them — so each
+  // listed property is read in full rather than written from the list row.
+  properties: {
+    name: "properties", schema: "jms", table: "properties", deps: ["users", "customers", "organizations", "teams"],
+    async fetch(ctx) {
+      const out: any[] = [];
+      for await (const page of zuperListPages(ctx.cfg, "/api/property")) {
+        for (const p of page) {
+          const uid = T(p?.property_uid);
+          out.push(uid ? { ...p, ...((await zuperGet(ctx.cfg, `/api/property/${uid}`)).data ?? {}) } : p);
+        }
+      }
+      return out;
+    },
+    uid: (r) => r.property_uid,
+    async transform(r, ctx) {
+      // A parent Zuper names but Tuper has not imported yet leaves the link as it is rather than clearing it;
+      // afterAll ties up what a full run could not resolve in order.
+      const parentUid = T(r.parent_property?.property_uid);
+      const parentId = parentUid ? mapGet(await ctxMap(ctx, "properties"), parentUid) : null;
+      return {
+        name: T(r.property_name) ?? "Property",
+        description: T(r.property_description),
+        plain_text_description: T(r.plain_text_description) ?? stripHtml(r.property_description),
+        markdown_description: T(r.markdown_description),
+        image_url: T(r.property_image),
+        // jms.addresses holds the address; this is the copy the list screens read (org-property.ts syncPropertyAddress).
+        property_address: zAddress(r.property_address),
+        time_zone: T(r.property_timezone),
+        customer_id: mapGet(await ctxMap(ctx, "customers"), propertyCustomerUids(r)[0]),
+        organization_id: mapGet(await ctxMap(ctx, "organizations"), r.property_organization?.organization_uid),
+        ...(parentUid && !parentId ? {} : { parent_property_id: parentId }),
+        // Zuper's tax.tax_group names a tax group of its own, and nothing maps those to jms.tax_groups (a wrong id
+        // would break the foreign key), so only the exemption itself comes over.
+        tax_exempt: r.tax?.tax_exempt === true,
+        pricelist_uid: T(r.pricelist && typeof r.pricelist === "object" ? r.pricelist.pricelist_uid : r.pricelist),
+        is_active: r.is_active !== false,
+        is_deleted: r.is_deleted === true,
+        created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
+        ...createdAt(r),
+      };
+    },
+    afterWrite: (ctx, id, r, isNew) => writePropertyParts(ctx, id, r, isNew),
+    afterAll: (ctx, rows) => linkParentProperties(ctx, rows),
+  },
+
   // ── History ──
   organizations: {
     name: "organizations", schema: "jms", table: "organizations", concurrency: 8,
     pages: (ctx) => zuperListPages(ctx.cfg, "/api/organization"),
     uid: (r) => r.organization_uid,
     transform: async (r) => organizationFields(r),
-    afterWrite: (ctx, id, r, isNew) => writeAddresses(ctx, "ORGANIZATION", id, isNew, r.organization_address, r.organization_billing_address),
+    async afterWrite(ctx, id, r, isNew) {
+      await writeAddresses(ctx, "ORGANIZATION", id, isNew, r.organization_address, r.organization_billing_address);
+      // The organization's own files, when this is a by-uid read: the list rows the import pages through carry none.
+      await writeRecordFiles(ctx, "organization", id, r);
+    },
   },
   customers: {
     name: "customers", schema: "jms", table: "customers", concurrency: 8,
     pages: (ctx) => zuperListPages(ctx.cfg, "/api/customers"),
     uid: (r) => r.customer_uid,
     transform: async (r) => ({ ...customerFields(r), no_of_jobs: num0(r.no_of_jobs) }),
-    afterWrite: (ctx, id, r, isNew) => writeAddresses(ctx, "CUSTOMER", id, isNew, r.customer_address, r.customer_billing_address),
+    async afterWrite(ctx, id, r, isNew) {
+      await writeAddresses(ctx, "CUSTOMER", id, isNew, r.customer_address, r.customer_billing_address);
+      // The customer's own files, when this is a by-uid read: the list rows the import pages through carry none.
+      await writeRecordFiles(ctx, "customer", id, r);
+    },
   },
   // Active staff only (owner decision) — accounts with no password and no invite.
   users: {
@@ -1145,6 +1298,8 @@ export const ENTITIES: Record<string, Entity> = {
         is_active: r.is_active !== false, is_deleted: r.is_deleted === true, ...createdAt(r),
       };
     },
+    // The asset's own files (asset_attachments), when this is a by-uid read: the filter list rows carry none.
+    afterWrite: (ctx, id, r) => writeRecordFiles(ctx, "asset", id, r).then(() => undefined),
   },
   contracts: {
     name: "contracts", schema: "jms", table: "service_contracts", deps: ["customers", "organizations"],
@@ -1169,6 +1324,9 @@ export const ENTITIES: Record<string, Entity> = {
         is_active: r.is_active !== false && r.is_expired !== true, is_deleted: r.is_deleted === true, ...createdAt(r),
       };
     },
+    // The contract's own files, when this is a by-uid read: the filter list rows carry none. Zuper's catalogue has no
+    // service_contract attachment event, so these arrive on any other contract change or on the backfill.
+    afterWrite: (ctx, id, r) => writeRecordFiles(ctx, "service_contract", id, r).then(() => undefined),
   },
   requests: {
     name: "requests", schema: "jms", table: "requests", deps: ["customers", "organizations", "users"],
@@ -1352,6 +1510,8 @@ export const ENTITIES: Record<string, Entity> = {
       await writeQuoteStatusHistory(ctx, id, r.status_history);
       await ensureCustomFieldDefinitions(ctx, "QUOTE", (r.custom_fields ?? []).map((f: any) => String(f?.label ?? "")));
       await writeCustomFieldValues(ctx, "QUOTE", id, r.custom_fields);
+      // The quote's own files. `fetch` reads every quote in full, so these come over on an import as well as on an event.
+      await writeRecordFiles(ctx, "quote", id, r);
     },
   },
   invoices: {
@@ -1380,6 +1540,8 @@ export const ENTITIES: Record<string, Entity> = {
       await writeDocumentAddresses(ctx, "INVOICE", id, r);
       await ensureCustomFieldDefinitions(ctx, "INVOICE", (r.custom_fields ?? []).map((f: any) => String(f?.label ?? "")));
       await writeCustomFieldValues(ctx, "INVOICE", id, r.custom_fields);
+      // The invoice's own files. `fetch` reads every invoice in full, so these come over on an import as well as on an event.
+      await writeRecordFiles(ctx, "invoice", id, r);
     },
   },
 };
@@ -1399,7 +1561,8 @@ ENTITIES.jobs_oldest = {
     const newestFirst = new Set<string>();
     for (let from = 0; ; from += 1000) {
       const { data, error } = await ctx.client.schema("jms").from("zuper_sync_map").select("zuper_uid")
-        .eq("tenant_id", ctx.tenantId).eq("entity", "jobs").lt("synced_at", cutoff).range(from, from + 999);
+        // Ordered: an unordered paged read can skip rows, which here would re-sync jobs that were already done.
+        .eq("tenant_id", ctx.tenantId).eq("entity", "jobs").lt("synced_at", cutoff).order("zuper_uid").range(from, from + 999);
       if (error) throw error;
       for (const m of (data ?? []) as { zuper_uid: string }[]) newestFirst.add(m.zuper_uid);
       if (!data || data.length < 1000) break;
@@ -1611,21 +1774,45 @@ ENTITIES.stock_locations = {
 };
 // INWARD, TRANSFER, CONSUMED … with where from and to, the quantity before, remarks and the document behind them.
 // Most of GBG's are 2023 transfers Zuper made when locations were deleted.
+
+/** The movements Tuper keeps (lib/list-contract/inventory.ts STOCK_ACTIONS). */
+const STOCK_ACTIONS = new Set(["INWARD", "OUTWARD", "TRANSFER", "ADJUSTMENT", "CONSUMED"]);
+/**
+ * Which movement this is.
+ *
+ * Zuper sends two fields and only one of them is the movement: `type` is INWARD / TRANSFER / CONSUMED, while
+ * `transaction_type` is the family — TRANSACTION for the first two, CONSUMPTION for the last. Falling back to the
+ * family wrote "TRANSACTION" or "CONSUMPTION" into txn_type, which is not a movement Tuper knows. A movement that
+ * names a document (module_name INVOICE, JOB …) is a consumption, and inventory.ts reads it that way.
+ */
+const stockAction = (r: any): string => {
+  const t = String(r?.type ?? "").trim().toUpperCase();
+  if (STOCK_ACTIONS.has(t)) return t;
+  if (/CONSUM/.test(String(r?.transaction_type ?? "").toUpperCase()) || T(r?.module_name)) return "CONSUMED";
+  return "TRANSFER";   // what every movement of GBG's is, and what this wrote before there was anything else to say
+};
+
 ENTITIES.product_transactions = {
   name: "product_transactions", schema: "jms", table: "product_transactions", deps: ["products", "users", "stock_locations"], concurrency: 8,
   pages: (ctx) => zuperListPages(ctx.cfg, "/api/product/transaction", 100),
   uid: (r) => r.transaction_uid,
   async transform(r, ctx) {
-    const productId = mapGet(await ctxMap(ctx, "products"), r.product?.product_uid);
-    if (!productId) return null;
+    const productUid = T(r.product?.product_uid);
+    const productId = mapGet(await ctxMap(ctx, "products"), productUid);
+    // jms.product_transactions.product_id is NOT NULL: a movement has to hang off a part. Zuper keeps movements of
+    // parts it has since deleted — `GET /api/product/{uid}` answers "Invalid Product UID" for them and its own product
+    // list leaves them out — so those cannot come over. Said plainly, because it is the reason a run reports failures.
+    if (!productId) throw new Error(`stock movement ${r.transaction_uid}: its part ${productUid ?? "(none named)"} (${T(r.product?.product_name) ?? "unnamed"}) is not in Zuper's product list`);
     return {
       product_id: productId,
       location_id: r.from_location ? await stockLocationId(ctx, r.from_location, false) : null,
       to_location_id: r.to_location ? await stockLocationId(ctx, r.to_location, false) : null,
-      txn_type: T(r.type) ?? T(r.transaction_type) ?? "TRANSFER",
+      txn_type: stockAction(r),
       quantity: num0(r.quantity), old_quantity: N(r.old_quantity), unit_cost: N(r.purchase_price),
       remarks: T(r.remarks), serial_nos: ((r.serial_nos ?? []) as unknown[]).map(String),
       module_name: T(r.module_name), module_ref: T(r.module_uid),
+      // A voided movement stays for the audit trail and drops out of the API's list (00145).
+      is_deleted: r.is_deleted === true,
       created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid), ...createdAt(r),
     };
   },
@@ -1681,6 +1868,215 @@ ENTITIES.timeoff_requests = {
   },
 };
 
+// ── Timesheet locations ── Zuper's named places with a geofence (a point and a radius in metres) and the people
+// assigned to each. GET /api/timesheet/location is the paged list; GET /api/timesheet/location/{uid} answers that
+// location's people ("employee locations"), which the list row does not always carry. GBG's Zuper holds none today
+// (read-only, 2026-09-21: total_records 0), so the fields below are the ones Zuper's own location object names —
+// the same ones Tuper answers with (apps/JMS/web/src/lib/api/timesheets-shape.ts, shapeLocation). The first
+// location made in Zuper is what proves them; because only mapped fields are written, a surprise shows up as a
+// failed sync in the log rather than a row full of nulls.
+/** Zuper's timesheet locations, page by page. `maxPages` bounds a catch-up; it is a short list. */
+export async function* zuperTimesheetLocations(cfg: SyncConfig, maxPages = 20): AsyncGenerator<any[]> {
+  let seen = 0;
+  for (let page = 1; page <= maxPages; page++) {
+    const j = await zuperGet(cfg, `/api/timesheet/location?page=${page}&count=100`);
+    const rows: any[] = j?.data ?? [];
+    if (!rows.length) return;
+    seen += rows.length;
+    yield rows;
+    const total = Number(j?.total_records);
+    if (Number.isFinite(total) && seen >= total) return;
+    if (rows.length < 100) return;
+  }
+}
+/** The people assigned to a location. Replaced, not merged, so someone taken off in Zuper is taken off here —
+ *  but only when Zuper actually said who they are; silence leaves the assignments alone. */
+async function writeLocationUsers(ctx: Ctx, locationId: string, row: any): Promise<void> {
+  const r = row?.location ?? row;
+  const named = (v: any) => (Array.isArray(v) ? v : null);
+  let people = named(r?.users) ?? named(r?.user_uids) ?? named(r?.employees) ?? named(r?.assigned_users) ?? named(r?.employee_locations);
+  if (!people && r?.location_uid) {
+    const d = (await zuperGet(ctx.cfg, `/api/timesheet/location/${r.location_uid}`))?.data;
+    people = named(d) ?? named(d?.users) ?? named(d?.employees) ?? named(d?.employee_locations);
+  }
+  if (!people) return;
+  const users = await ctxMap(ctx, "users");
+  const seen = new Set<string>();
+  const rows: { tenant_id: string; location_id: string; user_id: string }[] = [];
+  for (const p of people) {
+    const id = mapGet(users, typeof p === "string" ? p : p?.user_uid ?? p?.user?.user_uid);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    rows.push({ tenant_id: ctx.tenantId, location_id: locationId, user_id: id });
+  }
+  const table = () => ctx.client.schema("jms").from("timesheet_location_users");
+  const { error: gone } = await table().delete().eq("tenant_id", ctx.tenantId).eq("location_id", locationId);
+  if (gone) throw gone;
+  if (rows.length) { const { error } = await table().insert(rows); if (error) throw error; }
+}
+ENTITIES.timesheet_locations = {
+  name: "timesheet_locations", schema: "jms", table: "timesheet_locations", deps: ["users"],
+  pages: (ctx) => zuperTimesheetLocations(ctx.cfg),
+  uid: (row) => (row.location ?? row).location_uid,
+  async transform(row, ctx) {
+    const r = row.location ?? row;
+    // Zuper writes a point either as latitude/longitude or as geo_cordinates [lat, lng] (its spelling); 0,0 is unset,
+    // and the table takes both halves or neither.
+    const geo: any[] = Array.isArray(r.geo_cordinates) ? r.geo_cordinates : Array.isArray(r.geo_coordinates) ? r.geo_coordinates : [];
+    const lat = N(geo.length === 2 ? geo[0] : r.latitude), lng = N(geo.length === 2 ? geo[1] : r.longitude);
+    const point = lat != null && lng != null && Number.isFinite(lat) && Number.isFinite(lng) && (lat !== 0 || lng !== 0);
+    const radius = Math.round(Number(r.radius));
+    return {
+      location_name: T(r.location_name) ?? T(r.name) ?? "Location",
+      latitude: point ? lat : null, longitude: point ? lng : null,
+      address: r.address == null ? null : typeof r.address === "object" ? JSON.stringify(r.address) : T(r.address),
+      radius: Number.isFinite(radius) && radius > 0 ? radius : 100,   // the table's own default
+      is_deleted: r.is_deleted === true || r.is_deleted === 1,
+      created_by: mapGet(await ctxMap(ctx, "users"), r.created_by_user?.user_uid ?? r.created_by?.user_uid),
+      ...createdAt(r),
+    };
+  },
+  afterWrite: (ctx, id, r) => writeLocationUsers(ctx, id, r),
+};
+
+// ── Timesheet approvals ── a person's timesheets over a period sent for approval. GET /api/timesheet/approval
+// (page + count required, newest first) lists them under data.approvals; GET /api/timesheet/approval/{uid} wraps the
+// same record under data.timesheet_approval and adds what only it carries: approval_history, the punches the period
+// covers (timesheets) and approval_hierarchy. So the list is paged for the uids and each one is then read in full —
+// both shapes reach the same transform. GBG's Zuper holds one (AWAIT_APPROVAL, one history line, no punches).
+/** Every approval, each already read in full. */
+export async function* zuperTimesheetApprovals(cfg: SyncConfig, maxPages = 20): AsyncGenerator<any[]> {
+  for (let page = 1; page <= maxPages; page++) {
+    const j = await zuperGet(cfg, `/api/timesheet/approval?page=${page}&count=100`);
+    const list: any[] = j?.data?.approvals ?? [];
+    if (!list.length) return;
+    const full: any[] = [];
+    await inChunks(list, 4, async (a) => {
+      const uid = a?.timesheet_approval_uid;
+      // The list row alone is still the record; only its history and punches are missing. A detail that fails must
+      // not lose the approval, so the row stands in for it.
+      const detail = uid ? await zuperGet(cfg, `/api/timesheet/approval/${uid}`).then((d) => d?.data ?? null).catch(() => null) : null;
+      full.push(detail?.timesheet_approval ? detail : a);
+    });
+    yield full;
+    const total = Number(j?.data?.total_pages);
+    if (Number.isFinite(total) && page >= total) return;
+    if (list.length < 100) return;
+  }
+}
+/** The approval's history, as Zuper holds it. Matched on status + instant, so re-reading an approval does not churn
+ *  the ids Tuper answers with; a line Zuper no longer has goes. Only the by-uid read carries history at all. */
+async function writeApprovalHistory(ctx: Ctx, approvalId: string, row: any): Promise<void> {
+  const lines: any[] | null = Array.isArray(row?.approval_history) ? row.approval_history : null;
+  if (!lines) return;
+  const users = await ctxMap(ctx, "users");
+  const key = (status: string, at: unknown) => `${status}|${at ? Date.parse(String(at)) : ""}`;
+  const want = new Map<string, Record<string, unknown>>();
+  for (const h of lines) {
+    const status = T(h?.status);
+    if (!status) continue;
+    const at = ts(h.created_at);
+    want.set(key(status, at), {
+      tenant_id: ctx.tenantId, approval_id: approvalId, status,
+      remarks: T(h.remarks), approval_by: mapGet(users, h.approval_by_user?.user_uid),
+      ...(at ? { created_at: at } : {}),
+    });
+  }
+  const table = () => ctx.client.schema("jms").from("timesheet_approval_history");
+  const { data, error } = await table().select("id, status, remarks, approval_by, created_at")
+    .eq("tenant_id", ctx.tenantId).eq("approval_id", approvalId);
+  if (error) throw error;
+  const gone: string[] = [];
+  for (const h of (data ?? []) as any[]) {
+    const k = key(String(h.status), h.created_at);
+    const w = want.get(k);
+    if (!w) { gone.push(h.id); continue; }
+    want.delete(k);
+    if (h.remarks !== w.remarks || h.approval_by !== w.approval_by) {
+      const { error: up } = await table().update({ remarks: w.remarks, approval_by: w.approval_by }).eq("id", h.id).eq("tenant_id", ctx.tenantId);
+      if (up) throw up;
+    }
+  }
+  if (gone.length) { const { error: rm } = await table().delete().eq("tenant_id", ctx.tenantId).in("id", gone); if (rm) throw rm; }
+  if (want.size) { const { error: add } = await table().insert([...want.values()]); if (add) throw add; }
+}
+/** The punches the approval covers (jms.timesheets.approval_id). Only punches already imported can be linked. */
+async function writeApprovalPunches(ctx: Ctx, approvalId: string, row: any): Promise<void> {
+  const punches: any[] | null = Array.isArray(row?.timesheets) ? row.timesheets : null;
+  if (!punches) return;
+  const ids: string[] = [];
+  if (punches.length) {
+    const map = await ctxMap(ctx, "timesheets");
+    for (const p of punches) {
+      const id = mapGet(map, p?.employee_timesheet_uid);
+      if (id && !ids.includes(id)) ids.push(id);
+    }
+  }
+  const table = () => ctx.client.schema("jms").from("timesheets");
+  const { data, error } = await table().select("id").eq("tenant_id", ctx.tenantId).eq("approval_id", approvalId);
+  if (error) throw error;
+  const keep = new Set(ids);
+  const drop = ((data ?? []) as { id: string }[]).map((p) => p.id).filter((id) => !keep.has(id));
+  if (drop.length) { const { error: off } = await table().update({ approval_id: null }).eq("tenant_id", ctx.tenantId).in("id", drop); if (off) throw off; }
+  if (ids.length) { const { error: on } = await table().update({ approval_id: approvalId }).eq("tenant_id", ctx.tenantId).in("id", ids); if (on) throw on; }
+}
+ENTITIES.timesheet_approvals = {
+  name: "timesheet_approvals", schema: "jms", table: "timesheet_approvals", deps: ["users", "teams"], concurrency: 4,
+  pages: (ctx) => zuperTimesheetApprovals(ctx.cfg),
+  uid: (row) => (row.timesheet_approval ?? row).timesheet_approval_uid,
+  async transform(row, ctx) {
+    const a = row.timesheet_approval ?? row;          // flat from the list, wrapped from the by-uid read
+    const users = await ctxMap(ctx, "users");
+    const userId = mapGet(users, a.user_details?.user_uid);
+    if (!userId) throw new Error(`timesheet approval ${a.timesheet_approval_uid}: ${a.user_details ? "the person isn't imported" : "no person"}`);
+    const from = ts(a.from_date), to = ts(a.to_date);
+    if (!from) throw new Error(`timesheet approval ${a.timesheet_approval_uid}: no period`);
+    const status = String(a.current_status ?? "").toUpperCase();
+    // Zuper's approval object carries no approved_at; its history line does, so a decided approval takes the instant
+    // of its last decision. A list row has no history, and then the column is left as it is.
+    const decided = (Array.isArray(row?.approval_history) ? row.approval_history : [])
+      .filter((h: any) => /^(APPROVED|REJECTED)$/.test(String(h?.status ?? "").toUpperCase()))
+      .map((h: any) => ts(h.created_at)).filter(Boolean).sort();
+    const decidedAt = ts(a.approved_at) ?? decided[decided.length - 1] ?? null;
+    return {
+      user_id: userId, team_id: mapGet(await ctxMap(ctx, "teams"), a.team?.team_uid),
+      from_date: from, to_date: to && Date.parse(to) >= Date.parse(from) ? to : from,
+      total_shift_mins: Math.round(num0(a.total_shift_mins)), total_break_mins: Math.round(num0(a.total_break_mins)),
+      total_logged_mins: Math.round(num0(a.total_logged_mins)), total_timeoff_mins: Math.round(num0(a.total_timeoff_mins)),
+      total_overtime_mins: Math.round(num0(a.total_overtime_mins)), total_distance: r2(num0(a.total_distance)),
+      remarks: T(a.remarks),
+      current_status: status === "APPROVED" ? "APPROVED" : /REJECT|DECLIN/.test(status) ? "REJECTED" : "AWAIT_APPROVAL",
+      await_approval_by: mapGet(users, a.await_approval_by_user?.user_uid),
+      approved_by: mapGet(users, a.approved_by_user?.user_uid),
+      ...(decidedAt ? { approved_at: decidedAt } : {}),
+      is_deleted: a.is_deleted === true, created_by: mapGet(users, a.created_by_user?.user_uid), ...createdAt(a),
+    };
+  },
+  async afterWrite(ctx, id, r) {
+    await writeApprovalHistory(ctx, id, r);
+    await writeApprovalPunches(ctx, id, r);
+  },
+};
+
+// ── Time off availability ── each person's remaining days of one type in one year. GET
+// /api/timesheets/request/timeoff_availability answers the whole list in one reply (GBG: 55 rows, all 2026, 30
+// people, 4 types; Zuper lets a balance go below zero and one is -3). No read-by-uid and no paging.
+ENTITIES.timeoff_availability = {
+  name: "timeoff_availability", schema: "jms", table: "timeoff_availability", deps: ["users", "timeoff_types"], concurrency: 8,
+  fetch: (ctx) => zuperGet(ctx.cfg, "/api/timesheets/request/timeoff_availability").then((j) => j.data ?? []),
+  uid: (r) => r.timeoff_availability_uid,
+  async transform(r, ctx) {
+    const userId = mapGet(await ctxMap(ctx, "users"), r.user?.user_uid);
+    if (!userId) throw new Error(`time off balance ${r.timeoff_availability_uid}: ${r.user ? "the person isn't imported" : "no person"}`);
+    const typeUid = r.timeoff_request_type?.timeoff_request_type_uid ?? r.timeoff_request_type_uid;
+    const typeId = mapGet(await ctxMap(ctx, "timeoff_types"), typeUid);
+    if (!typeId) throw new Error(`time off balance ${r.timeoff_availability_uid}: ${typeUid ? "the time off type isn't imported" : "no time off type"}`);
+    const year = Number(r.year);
+    if (!Number.isInteger(year) || year < 2000 || year > 2100) throw new Error(`time off balance ${r.timeoff_availability_uid}: no year`);
+    return { user_id: userId, type_id: typeId, year, remaining_days: r2(num0(r.remaining_days)), ...createdAt(r) };
+  },
+};
+
 const MIME_BY_EXT: Record<string, string> = {
   jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", heic: "image/heic", heif: "image/heif", bmp: "image/bmp",
   mp4: "video/mp4", mov: "video/quicktime", m4v: "video/x-m4v", "3gp": "video/3gpp", webm: "video/webm", avi: "video/x-msvideo",
@@ -1693,6 +2089,8 @@ function zuperMime(name: string | null, url: string, kind: unknown): string {
   const ext = (/\.([a-z0-9]{2,5})$/i.exec(name ?? "") ?? /\.([a-z0-9]{2,5})(?:\?|$)/i.exec(url))?.[1]?.toLowerCase();
   if (ext && MIME_BY_EXT[ext]) return MIME_BY_EXT[ext];
   const k = String(kind ?? "").toUpperCase();
+  // Some of Zuper's file lists send the type itself ("image/png") rather than its broad kind; take it as it comes.
+  if (/^[a-z]+\/[a-z0-9.+-]+$/i.test(String(kind ?? ""))) return String(kind).toLowerCase();
   return k === "IMAGE" ? "image/jpeg" : k === "VIDEO" ? "video/mp4" : k === "AUDIO" ? "audio/mpeg" : "application/octet-stream";
 }
 /** Zuper files (a note's, a job's) → jms.attachments rows that keep Zuper's public link (00105) until the bytes are
@@ -1744,6 +2142,107 @@ async function writeZuperFiles(ctx: Ctx, host: { type: string; id: string }, fil
     for (const l of links) map.set(l.zuper_uid, l.jms_id);
   }
   return slots.map((s) => ("id" in s ? s.id : idByUrl.get(s.url))).filter((x): x is string => !!x);
+}
+
+// ── Files on records other than jobs (2026-09-21) ──
+//
+// Zuper's thirteen attachment events on customers, organizations, assets, quotes and invoices reached nothing: a file
+// added to any of them never came over. There is no read-by-uid for a file and no list that names a file's record —
+// `GET /api/attachments` pages every file in the account with no parent on it — but every one of these records carries
+// its own files in its by-uid read, exactly as a job does. So an attachment event is what every other event here is:
+// re-read the record, and link what it carries.
+//
+// LINK, DON'T COPY (owner, 2026-09-18): the row keeps Zuper's own S3 link in source_url and Tuper serves from it. That
+// is writeZuperFiles' behaviour and nothing here changes it — no bytes are fetched.
+//
+// Zuper spells a file two ways, and both were seen on this account: a job's and `GET /api/attachments` use
+// attachment / attachment_path + attachment_name, while a quote's and an asset's use url + file_name. Both carry
+// attachment_uid. They are normalised to the first shape so one writer serves all of them, and so a file's own
+// uploader and date reach the row (each file is written on its own — one record holds a handful).
+//
+// A REMOVAL IS MIRRORED, which a job's is not. The by-uid read is the record's whole file list in one answer, so a
+// file we hold from Zuper that the list no longer has was removed there. Only rows this sync brought over can go:
+// entity_type/entity_id of this record, a source_url (Tuper's own uploads have none, they have a storage path),
+// and no note_id (a note's files belong to the note). The delete is soft — Tuper's Gallery can restore it — and an
+// improbable number at once is reported rather than acted on, the same refusal collections.ts makes.
+
+/** The records whose files Tuper keeps, by the entity_type jms.attachments files them under
+ *  (lib/list-contract/attachments.ts): where the record is read, and where that read puts its files. */
+export const FILE_RECORDS = {
+  customer: { entity: "customers", uidField: "customer_uid", detail: (u: string) => `/api/customers/${u}`, files: (r: any) => r.attachments },
+  organization: { entity: "organizations", uidField: "organization_uid", detail: (u: string) => `/api/organization/${u}`, files: (r: any) => r.attachments },
+  asset: { entity: "assets", uidField: "asset_uid", detail: (u: string) => `/api/assets/${u}`, files: (r: any) => r.asset_attachments ?? r.attachments },
+  quote: { entity: "estimates", uidField: "estimate_uid", detail: (u: string) => `/api/estimate/${u}`, files: (r: any) => r.attachments },
+  invoice: { entity: "invoices", uidField: "invoice_uid", detail: (u: string) => `/api/invoice/${u}`, files: (r: any) => r.attachments },
+  service_contract: { entity: "contracts", uidField: "contract_uid", detail: (u: string) => `/api/service_contract/${u}`, files: (r: any) => r.attachments },
+} as const;
+export type FileRecord = keyof typeof FILE_RECORDS;
+
+/** More files gone from one record's list than this means the answer is wrong, not the record: say so, remove none. */
+const MAX_FILES_REMOVED_AT_ONCE = 20;
+
+/** Zuper's two file shapes → the one writeZuperFiles reads. */
+const zuperFile = (a: any) => ({
+  attachment: T(a?.attachment ?? a?.attachment_path ?? a?.url),
+  attachment_uid: a?.attachment_uid ?? a?._id,
+  attachment_name: T(a?.attachment_name ?? a?.file_name),
+  attachment_size: a?.attachment_size,
+  attachment_description: a?.attachment_description,
+  attachment_type: a?.attachment_type ?? a?.type_of_attachment ?? a?.mime_type,
+  is_deleted: a?.is_deleted === true,
+});
+
+/**
+ * One record's own files → jms.attachments, and the ones Zuper no longer lists marked deleted.
+ *
+ * `r` is the record as its by-uid read returns it. A LIST row carries no files array at all, so this does nothing for
+ * one — which is what keeps the bulk imports (customers, organizations, assets and contracts are written from list
+ * rows) from reading an absent list as "every file was removed".
+ */
+export async function writeRecordFiles(ctx: Ctx, kind: FileRecord, id: string, r: any): Promise<{ linked: number; removed: number; note: string | null }> {
+  const listed = FILE_RECORDS[kind].files(r ?? {});
+  if (!Array.isArray(listed)) return { linked: 0, removed: 0, note: null };   // not a by-uid read — say nothing about this record's files
+  // Each file is written on its own, so it keeps its own uploader and date — which means Zuper's record travels
+  // beside the normalised one. writeZuperFiles only drops a repeated link within a single call, so the same link
+  // twice on one record is dropped here instead.
+  const seen = new Set<string>();
+  const files: { url: string; file: ReturnType<typeof zuperFile>; from: any }[] = [];
+  for (const from of listed) {
+    const file = zuperFile(from);
+    if (!file.attachment || !/^https:\/\//.test(file.attachment) || seen.has(file.attachment)) continue;
+    seen.add(file.attachment);
+    files.push({ url: file.attachment, file, from: from ?? {} });
+  }
+
+  let linked = 0;
+  for (const { file, from } of files) {
+    if (file.is_deleted) continue;
+    const ids = await writeZuperFiles(ctx, { type: kind, id }, [file], {
+      uploaded_by: mapGet(await ctxMap(ctx, "users"), from.created_by?.user_uid),
+      created_at: ts(from.created_at),
+    });
+    linked += ids.length;
+  }
+
+  const current = new Set(files.filter((f) => !f.file.is_deleted).map((f) => f.url));
+  const { data: held, error } = await ctx.client.schema("jms").from("attachments").select("id, source_url")
+    .eq("tenant_id", ctx.tenantId).eq("entity_type", kind).eq("entity_id", id)
+    .eq("is_deleted", false).is("note_id", null).not("source_url", "is", null);
+  if (error) throw error;
+  const gone = ((held ?? []) as { id: string; source_url: string }[]).filter((h) => !current.has(h.source_url));
+  if (!gone.length) return { linked, removed: 0, note: null };
+  if (gone.length > MAX_FILES_REMOVED_AT_ONCE) {
+    // Said out loud, not only returned: an event's afterWrite has nowhere to put the answer, and a refusal to remove
+    // files is exactly the thing someone should see in the log.
+    const note = `${gone.length} files of ${kind} ${id} are missing from Zuper's answer — too many to act on, none removed`;
+    console.warn(`[zupersync] ${note}`);
+    return { linked, removed: 0, note };
+  }
+  const { error: delErr } = await ctx.client.schema("jms").from("attachments")
+    .update({ is_deleted: true, deleted_at: new Date().toISOString() })
+    .eq("tenant_id", ctx.tenantId).eq("is_deleted", false).in("id", gone.map((g) => g.id));
+  if (delErr) throw delErr;
+  return { linked, removed: gone.length, note: null };
 }
 
 // ── Checklist answers (2026-09-15) ── each status change in a job's Zuper timeline carries the answers to that status's
@@ -1861,13 +2360,17 @@ async function writeChecklistResponse(ctx: Ctx, jobId: string, statusId: string,
 // audiences map onto Tuper's four: private → Only Me, hidden from field staff → Back office only, else Public or
 // Internal. Nobody is notified. A note by someone Tuper doesn't have (a customer, say) has no author.
 ENTITIES.notes = {
-  name: "notes", schema: "jms", table: "entity_comments", deps: ["jobs", "requests", "assets", "customers", "users", "files"], concurrency: 16,
+  name: "notes", schema: "jms", table: "entity_comments", deps: ["jobs", "requests", "assets", "customers", "projects", "purchase_orders", "users", "files"], concurrency: 16,
   pages: (ctx) => zuperListPages(ctx.cfg, "/api/notes", 100),
   uid: (r) => r.note_uid,
   async transform(r, ctx) {
-    const hosts: [string, string, unknown][] = [["job", "jobs", r.job?.job_uid], ["request", "requests", r.request?.request_uid], ["asset", "assets", r.asset?.asset_uid], ["customer", "customers", r.customer?.customer_uid]];
-    const hit = hosts.find(([, , uid]) => uid);
-    if (!hit) throw new Error(`note ${r.note_uid}: no job, request, asset or customer`);
+    const hosts: [string, string, unknown][] = [["job", "jobs", r.job?.job_uid], ["request", "requests", r.request?.request_uid], ["asset", "assets", r.asset?.asset_uid], ["customer", "customers", r.customer?.customer_uid], ["project", "projects", r.project?.project_uid], ["purchase_order", "purchase_orders", r.purchase_order?.purchase_order_uid]];
+    // A note event names the record the note is on, and the reader (processor.ts syncHostNotes) passes that record
+    // through with the note: one read back from a record's own list belongs to that record whatever field Zuper puts
+    // inside the note. Only the whole-list pass has to read the host out of the note itself.
+    const named = r._note_host ? hosts.find(([type]) => type === r._note_host.type) : undefined;
+    const hit: [string, string, unknown] | undefined = named ? [named[0], named[1], r._note_host.uid] : hosts.find(([, , uid]) => uid);
+    if (!hit) throw new Error(`note ${r.note_uid}: no job, request, asset, customer, project or purchase order`);
     const hostId = mapGet(await ctxMap(ctx, hit[1]), hit[2]);
     if (!hostId) throw new Error(`note ${r.note_uid}: its ${hit[0]} ${String(hit[2])} isn't imported`);
     const raw = String(r.note ?? "");
@@ -2163,10 +2666,13 @@ export async function runSync(client: SupabaseClient, tenantId: string, order: s
 export async function retireLegacyCustomers(client: SupabaseClient, tenantId: string): Promise<{ legacy: number; retired: number; keptInUse: number }> {
   const imported = new Set((await loadMap(client, tenantId, "customers")).values());
   if (imported.size === 0) throw new Error("import Zuper customers before retiring the legacy ones");
+  // Every scan below is ordered. A paged read without an order may return one row twice and another not at all, and
+  // this set decides which customers are still referenced: a page that comes back short makes a customer that IS in
+  // use look unused, and this function retires it.
   const inUse = new Set<string>();
   for (const table of ["jobs", "requests", "quotes", "invoices", "assets", "service_contracts"]) {
     for (let from = 0; ; from += 1000) {
-      const { data, error } = await client.schema("jms").from(table).select("customer_id").eq("tenant_id", tenantId).eq("is_deleted", false).not("customer_id", "is", null).range(from, from + 999);
+      const { data, error } = await client.schema("jms").from(table).select("customer_id").eq("tenant_id", tenantId).eq("is_deleted", false).not("customer_id", "is", null).order("customer_id").range(from, from + 999);
       if (error) throw error;
       for (const r of (data ?? []) as { customer_id: string }[]) inUse.add(r.customer_id);
       if (!data || data.length < 1000) break;

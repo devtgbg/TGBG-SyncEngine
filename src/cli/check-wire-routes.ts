@@ -38,6 +38,7 @@ const MUST_DELETE: Record<string, string> = {
   "user.delete": "users",
   "request.delete": "requests",
   "team.delete": "teams",
+  "property.delete": "properties",
   "project.delete": "projects",
   "purchase_order.delete": "purchase_orders",
   "job.delete_note": "notes",
@@ -51,6 +52,9 @@ const NOTE_EVENTS: Record<string, string> = {
   "customer.new_note": "customer", "customer.update_note": "customer", "customer.delete_note": "customer",
   "asset.new_note": "asset", "asset.update_note": "asset", "asset.delete_note": "asset",
   "request.new_note": "request",
+  // Zuper's note list takes a `project` and a `purchase_order` filter as it takes a `job` one; neither has been
+  // seen end to end, because this account holds no record of either kind.
+  "project.update_note": "project", "purchase_order.new_note": "purchase_order",
 };
 
 const problems: string[] = [];
@@ -123,11 +127,21 @@ for (const [m, events] of Object.entries(fixture.modules)) {
   }
 }
 
-// 4. The mistake this rewrite fixed: a property is not an organization.
+// 4. The mistake this rewrite fixed: a property is not an organization. It is its own record, read at
+// GET /api/property/{uid} and written by the `properties` entity — and a property uid 404s at /api/organization.
+const PROPERTY_SKIPS = new Set(["property.delete_attachment"]);
 for (const [key] of fixture.modules.PROPERTY ?? []) {
   const r = resolveRoute("", key);
   if (r?.entity === "organizations") problems.push(`${key}: sent to organizations — a property uid 404s there`);
-  if (!r?.skip) problems.push(`${key}: properties have no importer, so this must be skipped`);
+  if (r?.entity !== "properties") problems.push(`${key}: expected the properties entity, got ${r?.entity ?? "none"}`);
+  if (r?.uidFields.join() !== "property_uid") problems.push(`${key}: expected property_uid, got ${r?.uidFields.join() ?? "none"}`);
+  if (PROPERTY_SKIPS.has(key)) {
+    if (!r?.skip) problems.push(`${key}: must stay skipped`);
+  } else if (r?.skip) {
+    problems.push(`${key}: unexpectedly skipped (${r.skip})`);
+  } else if (!r?.deletion && r?.fetch !== "detail") {
+    problems.push(`${key}: expected a by-uid re-read of the property, got ${r?.fetch ?? "none"}`);
+  }
 }
 
 // 5. Events Zuper adds later: a known module re-reads the record; the rest are refused.
@@ -141,6 +155,15 @@ const COLLECTIONS: Record<string, string> = {
   "timesheet.reject_timeoff": "timeoff_requests", "timesheet.update_timeoff": "timeoff_requests",
   "timesheet.new_timeoff_type": "timeoff_types", "timesheet.edit_timeoff_type": "timeoff_types",
   "timesheet.delete_timeoff_type": "timeoff_types",
+  // Tuper's tables for these arrived on 2026-09-18 (migrations 00140, 00141). Their deletions re-read the list too:
+  // the list is read whole, so a record that is no longer in it is the only sign that Zuper removed it.
+  "timesheet.new_location": "timesheet_locations", "timesheet.edit_location": "timesheet_locations",
+  "timesheet.delete_location": "timesheet_locations",
+  "timesheet.employee_location_create": "timesheet_locations", "timesheet.employee_location_delete": "timesheet_locations",
+  "timesheet_approval.new": "timesheet_approvals", "timesheet_approval.update": "timesheet_approvals",
+  "timesheet_approval.delete": "timesheet_approvals", "timesheet_approval.status_update": "timesheet_approvals",
+  "timesheet.new_timeoff_availability": "timeoff_availability", "timesheet.edit_timeoff_availability": "timeoff_availability",
+  "timesheet.delete_timeoff_availability": "timeoff_availability",
 };
 for (const [key] of fixture.modules.TIMESHEET ?? []) {
   const r = resolveRoute("", key);
@@ -163,12 +186,12 @@ const future: [string, string | null, boolean][] = [
   ["job.some_new_event", "jobs", true],
   ["organization.some_new_event", "organizations", true],
   ["customer.some_new_event", "customers", true],
+  ["property.some_new_event", "properties", true],
 ];
 for (const [key, entity, inferred] of future) {
   const r = resolveRoute("", key);
   if (r?.entity !== entity || r?.inferred !== inferred || r?.skip) problems.push(`${key}: expected an inferred re-read of ${entity}`);
 }
-if (!resolveRoute("", "property.some_new_event")?.skip) problems.push("an unknown property event must be skipped");
 if (resolveRoute("", "measurement.some_new_event") !== null) problems.push("an unknown measurement event must not become a job re-sync");
 if (resolveRoute("", "nonsense.thing") !== null) problems.push("an unknown prefix must be refused");
 

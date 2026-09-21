@@ -123,6 +123,9 @@ async function setMap(ctx: Ctx, entity: string, uid: string, jmsId: string): Pro
   );
 }
 
+/** Tables that keep is_deleted but no deleted_at, so nothing may stamp one on them. */
+const NO_DELETED_AT = new Set(["timesheet_locations", "timesheet_approvals"]);
+
 /** zuper-sync.ts:1764 — records whose number a Tuper-made record may already hold. */
 const NUMBERED: Record<string, { kind: "job" | "contract" | "product" | "request"; column: string }> = {
   jobs: { kind: "job", column: "work_order_number" },
@@ -209,8 +212,13 @@ async function writeOne(entityName: string, uid: string, opts: SyncOneOpts): Pro
   // Transforms write is_deleted but not deleted_at, while markDeleted stamps both.
   // Without this a recovered record (estimate.recover, asset.recover, user.recover)
   // would come back live yet still carry the date it was deleted. Only when the
-  // transform itself wrote is_deleted: every table that has it has deleted_at too.
-  if ((payload as any).is_deleted === false && !("deleted_at" in payload)) (payload as any).deleted_at = null;
+  // transform itself wrote is_deleted, and only where the table has the column:
+  // jms.timesheet_locations and jms.timesheet_approvals (00140) keep is_deleted and
+  // no deleted_at, and writing one there is refused outright (PGRST204), which would
+  // fail every timesheet location and approval webhook.
+  if ((payload as any).is_deleted === false && !("deleted_at" in payload) && !NO_DELETED_AT.has(e.table)) {
+    (payload as any).deleted_at = null;
+  }
 
   let id = map.get(rowUid) ?? null;
   const isNew = !id;
@@ -355,6 +363,11 @@ const NOTE_HOSTS: Record<NoteHost, { mapEntity: string }> = {
   customer: { mapEntity: "customers" },
   request: { mapEntity: "requests" },
   asset: { mapEntity: "assets" },
+  // `filter.project` and `filter.purchase_order` are filters Zuper's note list knows — each validates the uid and
+  // names itself when it is wrong, where an invented filter name is ignored and the whole list comes back (checked
+  // read-only 2026-09-21). This account holds no project or purchase order, so neither has been seen end to end.
+  project: { mapEntity: "projects" },
+  purchase_order: { mapEntity: "purchase_orders" },
 };
 
 export interface NoteSyncResult extends SyncOneResult {
@@ -416,7 +429,10 @@ export async function syncHostNotes(
       const last = synced.get(uid);
       const changed = !last || (note.updated_at && new Date(note.updated_at).getTime() > new Date(last).getTime());
       if (!changed && uid !== opts.noteUid) continue;
-      await syncOne("notes", uid, { raw: note, client, tenantId });
+      // The host travels with the note. It was read from that record's own list, so it belongs to that record
+      // whatever field Zuper puts inside the note — which is what lets a host we have never seen a note from
+      // (a project, a purchase order) be filed correctly the first time.
+      await syncOne("notes", uid, { raw: { ...note, _note_host: { type: host, uid: hostUid } }, client, tenantId });
       written++;
     }
 

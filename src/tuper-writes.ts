@@ -85,6 +85,8 @@ export function labelOf(entity: string, raw: unknown): string | null {
     case "customers":
       return join(r.customer_first_name, r.customer_last_name) || s(r.customer_company_name) || null;
     case "organizations": return s(r.organization_name) || null;
+    // The default below would look for "propertie_name" — so properties say their own name.
+    case "properties": return s(r.property_name) || null;
     case "users": return join(r.first_name, r.last_name) || s(r.email) || null;
     case "assets": return join(r.asset_name, r.asset_code ? `(${s(r.asset_code)})` : "") || null;
     case "products": return s(r.product_name) || null;
