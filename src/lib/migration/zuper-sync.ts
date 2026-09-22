@@ -709,7 +709,7 @@ async function assetCategoryId(ctx: Ctx, c: any): Promise<string | null> {
  *  already in Tuper with the same email is linked, not duplicated. */
 /** `inactive` (Zuper's inactive staff, imported 2026-09-15 so their records keep their names): the sign-in is blocked,
  *  core.users is inactive, and jms.users is marked removed, so no picker or list offers them. */
-async function provisionImportedUser(ctx: Ctx, payload: Record<string, unknown>, r: any, opts: { inactive?: boolean } = {}): Promise<string> {
+async function provisionImportedUser(ctx: Ctx, payload: Record<string, unknown>, r: any, opts: { inactive?: boolean; deleted?: boolean } = {}): Promise<string> {
   const email = String(r.email).trim().toLowerCase();
   if (!ctx.extra.coreUsers) {
     const { data, error } = await ctx.client.schema("core").from("users").select("id, email").eq("tenant_id", ctx.tenantId);
@@ -725,16 +725,19 @@ async function provisionImportedUser(ctx: Ctx, payload: Record<string, unknown>,
     if (profile) return id; // keep their existing Tuper profile
   } else {
     const { data: created, error } = await ctx.client.auth.admin.createUser({
-      email, email_confirm: true, user_metadata: { full_name: fullName, imported_from: "zuper" }, ...(opts.inactive ? { ban_duration: "876000h" } : {}),
+      email, email_confirm: true, user_metadata: { full_name: fullName, imported_from: "zuper" }, ...(opts.inactive || opts.deleted ? { ban_duration: "876000h" } : {}),
     });
     if (error || !created?.user) throw new Error(`login for ${email}: ${error?.message ?? "not created"}`);
     id = created.user.id;
-    const { error: coreErr } = await ctx.client.schema("core").from("users").insert({ id, tenant_id: ctx.tenantId, full_name: fullName, email, phone: payload.mobile_phone ?? null, is_active: !opts.inactive, zuper_user_id: r.user_uid });
+    const { error: coreErr } = await ctx.client.schema("core").from("users").insert({ id, tenant_id: ctx.tenantId, full_name: fullName, email, phone: payload.mobile_phone ?? null, is_active: !(opts.inactive || opts.deleted), zuper_user_id: r.user_uid });
     if (coreErr) { await ctx.client.auth.admin.deleteUser(id).catch(() => {}); throw coreErr; }
   }
   const users = () => ctx.client.schema("jms").from("users");
   // Removed only for being inactive (Tuper 00222): Tuper's API still lists them, as Zuper does.
-  const gone = opts.inactive ? { is_deleted: true, deleted_at: new Date().toISOString(), removed_as_inactive: true } : {};
+  // Removed only for being inactive (Tuper 00222): Tuper's API still lists them, as Zuper does. A deleted one (below)
+  // is deleted in Tuper too.
+  const gone = opts.deleted ? { is_deleted: true, deleted_at: new Date().toISOString(), removed_as_inactive: false }
+    : opts.inactive ? { is_deleted: true, deleted_at: new Date().toISOString(), removed_as_inactive: true } : {};
   let ins = await users().insert({ ...payload, ...gone, id, tenant_id: ctx.tenantId });
   if (ins.error?.code === "23505" && payload.emp_code) ins = await users().insert({ ...payload, ...gone, emp_code: null, id, tenant_id: ctx.tenantId }); // emp code taken
   if (ins.error) {
@@ -2898,6 +2901,35 @@ ENTITIES.inactive_users = {
     }
   },
   insert: (ctx, payload, r) => provisionImportedUser(ctx, payload, r, { inactive: true }),
+};
+
+// People Zuper's records name who are in none of its user lists — a deleted account (Mike Murray's first, which made
+// 111 of GBG's parts) that /api/user/all leaves out even with filter.is_deleted=true. Read by uid from the records that
+// name them (parts, customers, jobs … as ZUPER_REFERENCED_FROM lists, default the parts list) and imported deleted,
+// with no sign-in, so the records answer their maker (2026-09-22).
+ENTITIES.referenced_users = {
+  ...ENTITIES.users, name: "referenced_users", mapEntity: "users",
+  async *pages(ctx) {
+    const known = await ctxMap(ctx, "users");
+    const want = new Set<string>();
+    const sources = (process.env.ZUPER_REFERENCED_FROM ?? "/api/product").split(",").map((x) => x.trim()).filter(Boolean);
+    const collect = (v: any, depth = 0) => {
+      if (!v || typeof v !== "object" || depth > 3) return;
+      if (Array.isArray(v)) { for (const x of v) collect(x, depth); return; }
+      for (const [k, x] of Object.entries(v)) {
+        if (k === "user_uid" && typeof x === "string" && !known.has(x)) want.add(x);
+        else if (x && typeof x === "object") collect(x, depth + 1);
+      }
+    };
+    for (const src of sources) for await (const page of zuperListPages(ctx.cfg, src)) collect(page);
+    const found: any[] = [];
+    for (const uid of want) {
+      const u = (await zuperGet(ctx.cfg, `/api/user/${uid}`)).data;
+      if (u?.user_uid && T(u.email) && !/TUPER/i.test(`${u.first_name ?? ""} ${u.last_name ?? ""} ${u.emp_code ?? ""}`)) found.push(u);
+    }
+    if (found.length) yield found;
+  },
+  insert: (ctx, payload, r) => provisionImportedUser(ctx, payload, r, r.is_deleted === true ? { deleted: true } : { inactive: r.is_active === false }),
 };
 
 // Time off: Zuper's types and every request (GET /api/timesheet/request/timeoff_type, /api/timesheets/request/timeoff —
