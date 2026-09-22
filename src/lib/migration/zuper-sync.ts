@@ -777,7 +777,8 @@ async function writeJobAssignments(ctx: Ctx, jobId: string, r: any, isNew: boole
   if (rows.length) { const { error } = await tbl().insert(rows); if (error) throw error; }
 }
 /** "#AA7942" as Zuper sends it, or null when it isn't a six-digit colour (the status's own colour is used then). */
-export const hexColor = (v: unknown): string | null => (typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v.trim()) ? v.trim().toLowerCase() : null);
+// As Zuper holds it ("#02B875"): its answers keep the case, and CSS doesn't care.
+export const hexColor = (v: unknown): string | null => (typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v.trim()) ? v.trim() : null);
 /** Zuper's status timeline → jms.job_status_history, oldest first, each row's from = the previous to. */
 /** A text exactly as Zuper holds it (not trimmed, "" kept); null when it sent none. */
 const asTyped = (v: unknown): string | null => (typeof v === "string" ? v : null);
@@ -2139,6 +2140,20 @@ export const ENTITIES: Record<string, Entity> = {
         is_recurring: d.is_recurrence === true,
         // Zuper's own last change, so this write keeps it (Tuper 00220).
         ...(d.updated_at ? { updated_at: String(d.updated_at) } : {}),
+        // The job's own fields as Zuper has them now — its schedule above all. Six jobs Zuper moved on 2026-09-15 kept
+        // their old times in Tuper (the events were missed), and this is the pass that reads every job.
+        ...(T(d.job_title) ? { title: T(d.job_title) } : {}),
+        ...("job_priority" in d ? { priority: JOB_PRIORITIES.has(String(d.job_priority ?? "").toUpperCase()) ? String(d.job_priority).toUpperCase() : "LOW" } : {}),
+        ...("scheduled_start_time" in d ? {
+          scheduled_start_time: ts(d.scheduled_start_time), scheduled_end_time: ts(d.scheduled_end_time),
+          // jobs_end_or_due_ck: a job needs an end or a due date.
+          due_date: ts(d.due_date) ?? (ts(d.scheduled_end_time) ? null : ts(d.scheduled_start_time) ?? ts(d.created_at) ?? new Date().toISOString()),
+        } : {}),
+        ...("actual_start_time" in d ? { actual_start_time: ts(d.actual_start_time), actual_end_time: ts(d.actual_end_time) } : {}),
+        ...("all_day_schedule" in d ? { all_day_schedule: d.all_day_schedule === true } : {}),
+        ...("delayed_job" in d ? { is_delayed: d.delayed_job === true } : {}),
+        ...("customer_address" in d ? { service_address: zAddress(d.customer_address) } : {}),
+        ...("customer_billing_address" in d ? { billing_address: zAddress(d.customer_billing_address) } : {}),
         job_skills: ((d.skills ?? []) as any[]).map((s) => T(s?.skill_name)).filter(Boolean),
         // Its tags as the job's own column holds them and Zuper's own duration figure (00204), as job_people writes them
         // from the list: one pass over every job brings both.
@@ -3755,7 +3770,19 @@ ENTITIES.job_timelogs = {
         if (u) byJob.set(u, [...(byJob.get(u) ?? []), s]);
       }
     }
-    const jobs = [...byJob.entries()].map(([job_uid, summaries]) => ({ job_uid, _summaries: summaries }));
+    let jobs = [...byJob.entries()].map(([job_uid, summaries]) => ({ job_uid, _summaries: summaries }));
+    // ZUPER_ONLY_MISSING resumes a stopped pass: jobs that already have their punches are left out.
+    if (process.env.ZUPER_ONLY_MISSING) {
+      const done = new Set<string>();
+      for (let from = 0; ; from += 1000) {
+        const { data, error } = await ctx.client.schema("jms").from("job_timelog_punches").select("job_id").eq("tenant_id", ctx.tenantId).order("job_id").range(from, from + 999);
+        if (error) throw error;
+        for (const r of (data ?? []) as { job_id: string }[]) done.add(r.job_id);
+        if (!data || data.length < 1000) break;
+      }
+      const jobMap = await ctxMap(ctx, "jobs");
+      jobs = jobs.filter((j) => !done.has(jobMap.get(j.job_uid) ?? ""));
+    }
     for (let i = 0; i < jobs.length; i += 100) yield jobs.slice(i, i + 100);
   },
   uid: (r) => r.job_uid,
