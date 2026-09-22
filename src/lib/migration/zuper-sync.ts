@@ -619,27 +619,16 @@ async function territoryId(ctx: Ctx, st: any): Promise<string | null> {
     return (res.data as { id: string }).id;
   });
 }
-/** The job's teams (jms.job_team_assignments) and each assignee's team membership (jms.team_members) —
- *  Zuper assigns a user through a team, which is how its report prints "Name (Team)". */
+/** The job's teams (jms.job_team_assignments). Each assignee's team rides on the assignment itself (Tuper 00201,
+ *  writeJobAssignments) — which is how Zuper's report prints "Name (Team)". This no longer adds the assignee to that
+ *  team: a job years old put people who have since left a team, and staff since deleted, back on today's teams
+ *  (JGE Techs answered 21 members where Zuper has 18, 2026-09-22). A team's members are Zuper's team record's. */
 async function writeJobTeams(ctx: Ctx, jobId: string, r: any, isNew: boolean): Promise<void> {
   const teamIds = new Set<string>();
   for (const a of r.assigned_to_team ?? []) { const id = await teamId(ctx, a.team); if (id) teamIds.add(id); }
   const tbl = () => ctx.client.schema("jms").from("job_team_assignments");
   if (!isNew) { const { error } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("job_id", jobId); if (error) throw error; }
   if (teamIds.size) { const { error } = await tbl().insert([...teamIds].map((team_id) => ({ tenant_id: ctx.tenantId, job_id: jobId, team_id }))); if (error) throw error; }
-  const members: Set<string> = await (ctx.extra.memberships ??= (async () => {
-    const { data, error } = await ctx.client.schema("jms").from("team_members").select("team_id, user_id").eq("tenant_id", ctx.tenantId);
-    if (error) throw error;
-    return new Set(((data ?? []) as { team_id: string; user_id: string }[]).map((m) => `${m.team_id}:${m.user_id}`));
-  })());
-  const users = await ctxMap(ctx, "users");
-  for (const a of r.assigned_to ?? []) {
-    const userId = mapGet(users, a.user?.user_uid), tId = await teamId(ctx, a.team);
-    if (!userId || !tId || members.has(`${tId}:${userId}`)) continue;
-    members.add(`${tId}:${userId}`);
-    const { error } = await ctx.client.schema("jms").from("team_members").insert({ tenant_id: ctx.tenantId, team_id: tId, user_id: userId });
-    if (error && error.code !== "23505") throw error;
-  }
 }
 /** Zuper job tags → jms.taggables (only when Zuper has some, so tags added in Tuper aren't wiped). */
 /** A customer's tags (GBG's are its Zoho contact id, "Zoho_Contacts_…"), replaced by Zuper's list — only when the
@@ -1606,8 +1595,13 @@ export const ENTITIES: Record<string, Entity> = {
         product_type, service_type: r.service_type ? String(r.service_type).toUpperCase() === "HOURLY" ? "HOURLY" : "FIXED" : null,
         unit_price: N(r.price) ?? 0, unit_cost: N(r.purchase_price), is_available: r.is_available !== false, is_billable: r.is_billable !== false,
         category_id: r.product_category?.category_uid ? catMap.get(r.product_category.category_uid) ?? null : null,
-        brand: T(r.brand), specification: T(r.specification), uom: custom("unit"), reorder_level: N(custom("reorder level")),
+        // Zuper's own uom, as it holds it ("" kept, none where it has none) — not the "Unit" custom field, which
+        // disagrees on 76 of 2,074 parts (Tuper 00207).
+        brand: T(r.brand), specification: T(r.specification), uom: typeof r.uom === "string" ? r.uom : null, reorder_level: N(custom("reorder level")),
         track_quantity: r.track_quantity !== false, quantity: num0(r.quantity), min_quantity: num0(r.min_quantity),
+        // Zuper's markdown copy and its stored low-stock flag (00207); null where it sends none.
+        markdown_description: typeof r.markdown_description === "string" ? r.markdown_description : null,
+        low_stock: typeof r.low_stock === "boolean" ? r.low_stock : null,
         barcode: T(r.product_barcode), image_url: T(r.product_image), is_tax_exempt: r.tax?.tax_exempt === true,
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid), ...createdAt(r),
       };
@@ -1638,7 +1632,12 @@ export const ENTITIES: Record<string, Entity> = {
         ...createdAt(r),
       };
     },
-    afterWrite: (ctx, id, r) => writeTeamMembers(ctx, id, r),
+    // The members as the team's own read has them: Zuper's list leaves out some (7 people across 6 teams, 2026-09-22).
+    async afterWrite(ctx, id, r) {
+      const uid = (r.team ?? r).team_uid;
+      const one = uid ? (await zuperGet(ctx.cfg, `/api/team/${uid}`)).data : null;
+      await writeTeamMembers(ctx, id, Array.isArray(one?.users) ? { users: one.users } : r);
+    },
   },
 
   // Projects and purchase orders. GBG's Zuper holds none of either today, so these map the record Zuper documents
@@ -2015,7 +2014,8 @@ export const ENTITIES: Record<string, Entity> = {
     name: "job_details", schema: "jms", table: "jobs", mapEntity: "jobs", enrichOnly: true,
     deps: ["customers", "organizations", "users", "assets", "teams", "service_territories"], concurrency: 6,
     async *pages(ctx) {
-      const uids = [...(await ctxMap(ctx, "jobs")).keys()];
+      // ZUPER_SKIP resumes a stopped pass: the first N jobs (in the map's order) are left out.
+      const uids = [...(await ctxMap(ctx, "jobs")).keys()].slice(Math.max(0, Number(process.env.ZUPER_SKIP ?? 0) || 0));
       for (let i = 0; i < uids.length; i += 100) yield uids.slice(i, i + 100).map((job_uid) => ({ job_uid }));
     },
     uid: (r) => r.job_uid,
@@ -3639,7 +3639,8 @@ export async function syncEntity(ctx: Ctx, name: string): Promise<{ fetched: num
         }
       }
     };
-    const n = e.concurrency ?? 1;
+    // ZUPER_SYNC_CONCURRENCY runs a long pass wider than its default (records side by side).
+    const n = Number(process.env.ZUPER_SYNC_CONCURRENCY) || e.concurrency || 1;
     let rows: any[] = [];
     if (e.pages) {
       let page = 0;
