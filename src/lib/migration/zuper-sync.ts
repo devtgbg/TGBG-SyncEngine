@@ -865,6 +865,18 @@ async function writeLineItems(ctx: Ctx, parentType: "QUOTE" | "INVOICE" | "CONTR
 }
 /** Zuper custom field values → jms.custom_field_values, matched to Tuper's definitions by label.
  *  Definitions load once per run; a label Tuper has no definition for is left out. */
+/**
+ * How Zuper gave a custom field value (Tuper 00226): its keys in order and the details beside the value — type,
+ * hide_to_fe, hide_field, read_only, module_name, ref_uid, group_name, group_uid, _id — which vary value by value. The
+ * value and its meta_data go in their own columns.
+ */
+function fieldShape(f: any): Record<string, unknown> {
+  const out: Record<string, unknown> = { keys: Object.keys(f ?? {}) };
+  for (const k of ["type", "hide_to_fe", "hide_field", "read_only", "module_name", "ref_uid", "group_name", "group_uid", "_id"]) {
+    if (f && k in f) out[k] = f[k];
+  }
+  return out;
+}
 async function writeCustomFieldValues(ctx: Ctx, entityType: string, entityId: string, fields: any[] | undefined): Promise<void> {
   if (!fields?.length) return;
   const key = `customFieldDefs:${entityType}`;
@@ -877,12 +889,17 @@ async function writeCustomFieldValues(ctx: Ctx, entityType: string, entityId: st
   const rows: Record<string, unknown>[] = [];
   for (const f of fields) {
     const def = defs.get(String(f.label ?? "").trim().toLowerCase());
+    if (!def) continue;
     const value = T(f.value);
-    if (!def || !value) continue;
-    // Same typed columns as custom-fields.ts valueColumn().
-    const column = def.field_type === "DATE" || def.field_type === "DATE_TIME" ? { value_date: value }
-      : def.field_type === "MULTI_SELECTION" || def.field_type === "DATA_TABLE" ? { value_json: [value] } : { value_text: value };
-    rows.push({ tenant_id: ctx.tenantId, definition_id: def.id, entity_type: entityType, entity_id: entityId, ...column });
+    // Same typed columns as custom-fields.ts valueColumn(), every column on every row so the upsert is uniform. An
+    // empty value is kept as "": Zuper lists the fields the record has, empty ones among them.
+    const dated = (def.field_type === "DATE" || def.field_type === "DATE_TIME") && value && !Number.isNaN(Date.parse(value));
+    const multi = def.field_type === "MULTI_SELECTION" || def.field_type === "DATA_TABLE";
+    rows.push({
+      tenant_id: ctx.tenantId, definition_id: def.id, entity_type: entityType, entity_id: entityId,
+      value_text: dated || multi ? null : value ?? "", value_date: dated ? value : null, value_json: multi ? (value ? [value] : []) : null,
+      shape: fieldShape(f), meta_data: f && typeof f === "object" && "meta_data" in f ? f.meta_data : null,
+    });
   }
   if (rows.length) {
     const { error } = await ctx.client.schema("jms").from("custom_field_values").upsert(rows, { onConflict: "definition_id,entity_id" });
@@ -1026,6 +1043,8 @@ async function writeZuperCustomFields(ctx: Ctx, entityType: string, entityId: st
       value_text: dated ? null : def.field_type === "MULTI_SELECTION" || def.field_type === "DATA_TABLE" ? null : value ?? "",
       value_number: null, value_date: dated ? value : null, value_bool: null,
       value_json: def.field_type === "MULTI_SELECTION" || def.field_type === "DATA_TABLE" ? (value ? [value] : []) : null,
+      // How Zuper gave the value, and its meta_data (Tuper 00226).
+      shape: fieldShape(f), meta_data: f && typeof f === "object" && "meta_data" in f ? f.meta_data : null,
     });
   }
   // Zuper lists the fields the RECORD has, empty ones among them (a customer with one Zoho id answers one field, not
@@ -2676,15 +2695,8 @@ async function writeProductStockAndFields(ctx: Ctx, productId: string, r: any): 
   const fields = (r.custom_fields ?? []) as any[];
   if (fields.length) {
     await ensureCustomFieldDefinitions(ctx, "PRODUCT", fields.map((f) => String(f?.label ?? "")));
+    // Zuper lists a product's own fields, empty ones too ("Reorder Level ---"): the writer keeps an empty one as "".
     await writeCustomFieldValues(ctx, "PRODUCT", productId, fields);
-    // Zuper lists a product's own fields, empty ones too ("Reorder Level ---"), so an empty one is kept as "".
-    const defs: Map<string, { id: string }> | undefined = ctx.extra["customFieldDefs:PRODUCT"];
-    const empty = [...new Set(fields.filter((f) => !T(f?.value)).map((f) => defs?.get(String(f?.label ?? "").trim().toLowerCase())?.id).filter((id): id is string => Boolean(id)))];
-    if (empty.length) {
-      const { error } = await ctx.client.schema("jms").from("custom_field_values")
-        .upsert(empty.map((definition_id) => ({ tenant_id: ctx.tenantId, definition_id, entity_type: "PRODUCT", entity_id: productId, value_text: "" })), { onConflict: "definition_id,entity_id" });
-      if (error) throw error;
-    }
   }
 }
 
