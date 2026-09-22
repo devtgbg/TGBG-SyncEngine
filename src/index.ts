@@ -18,10 +18,13 @@ import { migrate, storeReachable } from "./store.js";
 import { tuperReceiver } from "./receiver-tuper.js";
 import { admin } from "./admin.js";
 import { receiver } from "./receiver.js";
-import { startReplay } from "./reconcile.js";
-import { pushState, startPusher } from "./pusher.js";
-import { startSweep } from "./sweep.js";
+import { replayRunning, startReplay, stopReplay } from "./reconcile.js";
+import { pushState, pusherRunning, startPusher } from "./pusher.js";
+import { startSweep, stopSweep, sweepRunning } from "./sweep.js";
 import { flush as flushApiLog, startApiLogPurge } from "./api-log.js";
+import { startSettings } from "./settings.js";
+import { startCommands } from "./commands.js";
+import { startConnections } from "./connections.js";
 
 const app = express();
 
@@ -74,8 +77,9 @@ app.get("/health", async (_req, res) => {
     tuper,
     store: own,
     webhookSecretConfigured: secretConfigured(),
-    // Whether changes made in Tuper reach Zuper, and for which kinds of record. Names only,
-    // no secrets: this is the one fact about a deployment nobody should have to guess.
+    // Which way it syncs, as the dashboard's Settings last set it. Names only, no secrets: this is the one fact
+    // about a deployment nobody should have to guess.
+    inbound: config.inbound,
     push: pushState(),
     at: new Date().toISOString(),
   });
@@ -106,16 +110,23 @@ app.listen(config.port, () => {
         : "[zupersync] ZUPER_WEBHOOK_SECRET is not set — deliveries will be captured but marked unverified",
     );
   }
-  // Retry what was received but never finished. Without this a delivery that
-  // failed once is simply lost, and the tables quietly drift from Zuper.
-  startReplay();
-  // Re-read jobs Zuper changed recently whose webhook never arrived (Zuper gives
-  // up after its retries). Each run is capped, and ticks never overlap.
-  startSweep();
-  // Changes made in Tuper, towards Zuper. Dry run unless PUSH_MODE=live.
-  startPusher();
+  // The settings decide what runs (src/settings.ts): read now, applied, and followed every few seconds, so a switch on
+  // the dashboard reaches the engine without a restart.
+  void startSettings({
+    reconcile: (s) => {
+      // Retry what was received but never finished, so a delivery that failed once is not simply lost.
+      if (s.inbound && s.replay) startReplay(); else stopReplay();
+      // Re-read what Zuper changed recently whose webhook never arrived (Zuper gives up after its retries).
+      if (s.inbound && s.sweep.enabled) startSweep(); else stopSweep();
+      // Changes made in Tuper, towards Zuper: off, planned only, or live for the kinds chosen.
+      startPusher();
+    },
+  }, () => ({ replay: replayRunning(), sweep: sweepRunning(), pusher: pusherRunning() }));
   // Old API call bodies and rows go on a timer (src/api-log.ts).
   startApiLogPurge();
+  // Buttons on the dashboard (src/commands.ts), and what connects the two systems (src/connections.ts).
+  startCommands();
+  startConnections();
 });
 
 // A deploy stops the container with SIGTERM. The API calls recorded in the last second are still in memory: write them

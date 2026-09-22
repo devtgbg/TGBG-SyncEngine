@@ -6,7 +6,11 @@
  * Nothing on this page sends anything.
  */
 
-import { pushTotals, pushesPage, serviceState, type Push, type ServiceState } from "@/lib/db";
+import Link from "next/link";
+import { pushTotals, pushesPage, type Push } from "@/lib/db";
+import { engine, getSettings, latestBy, recentCommands, type Command } from "@/lib/control";
+import type { Settings } from "@/lib/engine";
+import { CommandButton } from "../controls";
 import { Pager, Pinned, readPaging } from "../pager";
 
 export const dynamic = "force-dynamic";
@@ -105,25 +109,23 @@ function Requests({ p }: { p: Push }) {
   );
 }
 
-/** Whether anything on this page will be acted on, from the running service itself. */
-function Mode({ state }: { state: ServiceState | null }) {
-  if (!state?.push) return <p className="pinned">Could not ask the service whether pushing is on. Its <code>/health</code> says.</p>;
-  const { mode, sentToZuper, plannedOnly } = state.push;
-  if (mode === "off") {
+/** Whether anything on this page will be acted on: the push mode the engine reports it has applied. */
+function Mode({ s }: { s: Settings | null }) {
+  if (!s) return <p className="pinned">The engine has not reported its settings yet.</p>;
+  if (s.push.mode === "off") {
     return (
       <p className="pinned hold">
-        <strong>Pushing to Zuper is on hold</strong> (PUSH_MODE=off). Changes made in Tuper are queued here; nothing is planned
-        and nothing is sent. Zuper stays as it is, and its next webhook for a record puts Zuper&apos;s values back in Tuper.
+        <strong>Pushing to Zuper is off.</strong> Changes made in Tuper are recorded on Webhooks, not queued here, and nothing is sent.
+        Zuper stays as it is. <Link href="/settings">Settings</Link>
       </p>
     );
   }
-  if (mode === "dry-run" || !sentToZuper.length) {
-    return <p className="pinned">Dry run: each change is planned and the requests are shown here. Nothing is sent to Zuper.</p>;
+  if (s.push.mode === "dry-run") {
+    return <p className="pinned">Plan only: each change is planned against Zuper&apos;s record and the requests are shown here. Nothing is sent. <Link href="/settings">Settings</Link></p>;
   }
   return (
     <p className="pinned live-mode">
-      <strong>Live</strong> for {sentToZuper.join(", ")}: those changes are sent to Zuper.
-      {plannedOnly.length ? ` Planned only, never sent: ${plannedOnly.join(", ")}.` : ""}
+      <strong>Live</strong> for {s.push.entities.join(", ") || "nothing"}: those changes are sent to Zuper. <Link href="/settings">Settings</Link>
     </p>
   );
 }
@@ -135,15 +137,18 @@ export default async function Pushes({ searchParams }: { searchParams: Promise<{
   let rows: Push[] = [];
   let matching = 0;
   let totals: Record<string, number> = {};
-  let state: ServiceState | null = null;
+  let applied: Settings | null = null;
+  let latest: Record<string, Command> = {};
   let error: string | null = null;
   try {
-    const [list, all, s] = await Promise.all([
+    const [list, all, eng, row, cmds] = await Promise.all([
       pushesPage({ limit: paging.size, offset: paging.offset, upto: paging.upto, status: status || undefined }),
       pushTotals(),
-      serviceState(),
+      engine(),
+      getSettings().catch(() => null),
+      recentCommands(20),
     ]);
-    rows = list.rows; matching = list.total; totals = all; state = s;
+    rows = list.rows; matching = list.total; totals = all; applied = eng?.applied ?? row?.data ?? null; latest = latestBy(cmds);
   } catch (err) {
     const e = err as { message?: string };
     error = e?.message ?? String(err);
@@ -168,7 +173,12 @@ export default async function Pushes({ searchParams }: { searchParams: Promise<{
         <p className="error">Could not read the queue: {error}</p>
       ) : (
         <>
-          <Mode state={state} />
+          <Mode s={applied} />
+          {(totals.queued ?? 0) + (totals.planned ?? 0) + (totals.failed ?? 0) ? (
+            <CommandButton command="discard-unsent" label="Discard unsent changes" tone="danger" latest={latest["discard-unsent"]}
+              hint={`${(totals.queued ?? 0) + (totals.planned ?? 0) + (totals.failed ?? 0)} queued, planned or failed — removed from the queue, never sent`}
+              confirm="Discard every change from Tuper that has not been sent to Zuper? They are removed from the queue and never sent." />
+          ) : null}
 
           <section className="tiles">
             <div className={`tile ${totals.queued ? "warn" : ""}`}><strong>{(totals.queued ?? 0).toLocaleString()}</strong><span>queued</span></div>
@@ -208,7 +218,7 @@ export default async function Pushes({ searchParams }: { searchParams: Promise<{
                             <span className="mono" title={p.cause_title ?? undefined}>{record}</span>
                             <span className="note">
                               {KIND[p.entity] ?? p.entity}
-                              {p.event_id ? <> · <a href={`/?open=${p.event_id}`}>{p.cause_event ?? "webhook"}</a></> : null}
+                              {p.event_id ? <> · <a href={`/webhooks?open=${p.event_id}`}>{p.cause_event ?? "webhook"}</a></> : null}
                             </span>
                           </span>
                         </td>

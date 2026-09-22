@@ -19,18 +19,22 @@
 
 import { config, errorText } from "./config.js";
 import { processPending } from "./processor.js";
+import { report } from "./settings.js";
 
 let timer: NodeJS.Timeout | null = null;
 let running = false;
 
 async function tick(): Promise<void> {
   if (running) return; // a previous batch is still going
+  // The settings can switch it off between ticks: Zuper → Tuper off, or replay off.
+  if (!config.inbound || !config.reconcile.enabled) return;
   running = true;
   try {
     const r = await processPending(config.reconcile.replayBatch);
     // Silent when there is nothing to do, so the log stays readable.
     if (r.attempted > 0) {
       console.log(`[zupersync] replay: ${r.attempted} attempted, ${r.ok} applied, ${r.failed} still failing`);
+      report("replay", r);
     }
   } catch (err) {
     console.warn("[zupersync] replay failed:", errorText(err));
@@ -39,9 +43,13 @@ async function tick(): Promise<void> {
   }
 }
 
+export const replayRunning = () => timer !== null;
+
+/** Start the replay loop. Safe to call again: a running loop is left as it is. */
 export function startReplay(): void {
+  if (timer) return;
   if (!config.reconcile.enabled) {
-    console.log("[zupersync] replay disabled (RECONCILE_ENABLED=false) — failed deliveries will not be retried");
+    console.log("[zupersync] replay disabled — failed deliveries will not be retried");
     return;
   }
   const seconds = config.reconcile.replaySeconds;
@@ -55,6 +63,6 @@ export function startReplay(): void {
 }
 
 export function stopReplay(): void {
-  if (timer) clearInterval(timer);
+  if (timer) { clearInterval(timer); console.log("[zupersync] replay stopped"); }
   timer = null;
 }

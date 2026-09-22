@@ -90,6 +90,16 @@ export const config = {
 
   tenantId: optional("DEFAULT_TENANT_ID", "00000000-0000-0000-0000-000000000001"),
 
+  /**
+   * Zuper → Tuper. Off: Zuper's deliveries are still stored and acknowledged, and applied once it is on again (the
+   * replay picks them up); the replay and the sweep stop with it.
+   *
+   * This and the push, replay, sweep and call-log values below are the first settings only. From then on the
+   * dashboard's Settings page decides them (sync.settings, applied by src/settings.ts without a restart), and
+   * src/settings.ts is the one thing that writes them into this object after boot.
+   */
+  inbound: optional("SYNC_INBOUND", "on") !== "off",
+
   zuper: {
     apiUrl: zuperBase(optional("ZUPER_API_URL", "https://eks-ap-south-1.zuperpro.com")),
     apiKey: required("ZUPER_API_KEY"),

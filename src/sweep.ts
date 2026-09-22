@@ -60,6 +60,7 @@
 
 import { config, errorText } from "./config.js";
 import { withCause } from "./api-log.js";
+import { report } from "./settings.js";
 import { tuper as db } from "./tuper-client.js";
 import { getSyncConfig, zuperGet } from "./lib/migration/zuper-sync.js";
 import { syncRecord } from "./processor.js";
@@ -197,30 +198,57 @@ let timer: NodeJS.Timeout | null = null;
 let running = false;
 let lastFull = 0;
 
+/** The minutes the running timer was started with, so a change of interval restarts it. */
+let timerMinutes = 0;
+
+const pass = async () => {
+  const r = await sweepJobs();
+  if (r.drifted || r.unmapped || r.failed) {
+    console.log(`[zupersync] sweep: ${r.inWindow} in window, ${r.drifted} drifted, ${r.unmapped} unmapped, ${r.resynced} resynced, ${r.failed} failed${r.stoppedEarly ? " (capped)" : ""}`);
+  }
+  // The first pass after a start is a full one, then every fullEveryMinutes.
+  const full = Date.now() - lastFull >= config.sweep.fullEveryMinutes * 60_000;
+  const others = await sweepOtherRecords({ full });
+  if (full) lastFull = Date.now();
+  // Punches and time off are rewritten every pass; only gaps and failures are news.
+  const news = others.filter((k) => k.behind || k.missing || k.failed);
+  if (news.length) {
+    console.log(`[zupersync] sweep${full ? " (full)" : ""}: ` + news.map((k) =>
+      `${k.kind} ${k.missing} missing, ${k.behind} behind, ${k.resynced} synced${k.failed ? `, ${k.failed} failed (${k.errors[0] ?? ""})` : ""}`).join("; "));
+  }
+  report("sweep", {
+    full, jobsInWindow: r.inWindow, jobsDrifted: r.drifted, jobsMissing: r.unmapped, resynced: r.resynced + others.reduce((n, k) => n + k.resynced, 0),
+    failed: r.failed + others.reduce((n, k) => n + k.failed, 0),
+    kinds: others.map((k) => ({ kind: k.kind, missing: k.missing, behind: k.behind, synced: k.resynced, failed: k.failed })),
+  });
+};
+
+/** One sweep pass now, unless one is running or Zuper → Tuper is off. Says which. */
+export async function sweepNow(): Promise<string> {
+  if (!config.inbound) return "not run: Zuper → Tuper is off";
+  if (running) return "not run: a sweep is already running";
+  running = true;
+  try {
+    await withCause({ origin: "sweep" }, pass);
+    return "sweep finished";
+  } finally {
+    running = false;
+  }
+}
+
+export const sweepRunning = () => timer !== null;
+
+/** Start the sweep timer, or restart it when its interval changed. Safe to call again. */
 export function startSweep(): void {
+  if (timer && timerMinutes === config.sweep.everyMinutes) return;
+  if (timer) stopSweep();
   if (!config.sweep.enabled) {
     console.log("[zupersync] window sweep disabled — a delivery Zuper abandons after its retries will be lost");
     return;
   }
-  const everyMs = config.sweep.everyMinutes * 60_000;
-  const pass = async () => {
-    const r = await sweepJobs();
-    if (r.drifted || r.unmapped || r.failed) {
-      console.log(`[zupersync] sweep: ${r.inWindow} in window, ${r.drifted} drifted, ${r.unmapped} unmapped, ${r.resynced} resynced, ${r.failed} failed${r.stoppedEarly ? " (capped)" : ""}`);
-    }
-    // The first pass after a start is a full one, then every fullEveryMinutes.
-    const full = Date.now() - lastFull >= config.sweep.fullEveryMinutes * 60_000;
-    const others = await sweepOtherRecords({ full });
-    if (full) lastFull = Date.now();
-    // Punches and time off are rewritten every pass; only gaps and failures are news.
-    const news = others.filter((k) => k.behind || k.missing || k.failed);
-    if (news.length) {
-      console.log(`[zupersync] sweep${full ? " (full)" : ""}: ` + news.map((k) =>
-        `${k.kind} ${k.missing} missing, ${k.behind} behind, ${k.resynced} synced${k.failed ? `, ${k.failed} failed (${k.errors[0] ?? ""})` : ""}`).join("; "));
-    }
-  };
+  timerMinutes = config.sweep.everyMinutes;
   timer = setInterval(async () => {
-    if (running) return; // never overlap; a slow sweep must not stack
+    if (running || !config.inbound || !config.sweep.enabled) return; // never overlap; a slow sweep must not stack
     running = true;
     try {
       // Every call the pass makes is recorded as the sweep's (src/api-log.ts).
@@ -230,12 +258,12 @@ export function startSweep(): void {
     } finally {
       running = false;
     }
-  }, everyMs);
+  }, timerMinutes * 60_000);
   timer.unref?.();
   console.log(`[zupersync] window sweep every ${config.sweep.everyMinutes}m over the last ${config.sweep.minutesBack}m (≤${config.sweep.perMinute} req/min)`);
 }
 
 export function stopSweep(): void {
-  if (timer) clearInterval(timer);
+  if (timer) { clearInterval(timer); console.log("[zupersync] window sweep stopped"); }
   timer = null;
 }

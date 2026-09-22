@@ -31,7 +31,10 @@ export function LiveRefresh() {
   const seen = useRef<string | null>(null);
 
   useEffect(() => {
-    const view = pathname.startsWith("/pushes") ? "pushes" : pathname.startsWith("/calls") ? "calls" : pathname.startsWith("/tuper") ? "writes" : "deliveries";
+    // Each page asks about what it shows.
+    const view = pathname.startsWith("/pushes") ? "pushes" : pathname.startsWith("/calls") ? "calls" : pathname.startsWith("/tuper") ? "writes"
+      : pathname.startsWith("/webhooks") ? "deliveries" : pathname.startsWith("/settings") ? "settings"
+      : pathname.startsWith("/connections") ? "connections" : "overview";
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let lastFull = Date.now();

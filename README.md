@@ -14,10 +14,10 @@ HTTPS, and keeps its own working state in its own Postgres.
                            │
                            ▼
                   its own store (sync.*)
-      deliveries · API call log · push queue · config · runs
-                           │
-                           ▼
-                  the log dashboard (read-only)
+      deliveries · API call log · push queue · settings · runs
+                           │  ▲
+                           ▼  │ settings, commands
+                  the dashboard (the engine's console)
 ```
 
 Tuper (JMS) holds no Zuper or migration code; it reads its own tables like any
@@ -191,12 +191,32 @@ real traffic.
 
 ## The dashboard
 
-`dashboard/` is a read-only Next.js app on `:3021`. It reads **only the service's
-own store** — the same `DATABASE_URL` — and nothing of Tuper's: no Supabase, no
-`jms`. Every session it opens is `default_transaction_read_only`, so it cannot
-write even over the service's credentials. Four pages:
+`dashboard/` is a Next.js app on `:3021`, the engine's console. It reads **only the
+service's own store** — the same `DATABASE_URL` — and nothing of Tuper's: no
+Supabase, no `jms`. Every session it opens is `default_transaction_read_only`. It
+writes two things, each in its own explicit `READ WRITE` transaction: a new version
+of the settings, and a request for the engine to do something. It never calls the
+service, Zuper or Tuper; the engine picks both up from the store.
 
-- **Webhooks** (`/`) — every delivery from Zuper *and* from Tuper, filtered by
+**Engine**
+
+- **Overview** (`/`) — which way data is moving and whether the engine is alive
+  (its heartbeat, every 5 seconds), each direction's last hour, what needs
+  attention with the button that deals with it (replay failed deliveries, discard
+  unsent changes, register missing webhooks), webhooks per hour over the last day,
+  and the safety nets — replay, sweep, the connection check — with their last run.
+- **Connections** (`/connections`) — the webhooks registered in Zuper and in Tuper,
+  checked against what the engine routes, and the **API map**: for each kind of
+  record, the Zuper events that trigger it, the Zuper API calls its writes made and
+  the Tuper tables they wrote, from the last day's traffic; then Tuper's events and
+  the Zuper requests each would become, and every endpoint's calls, failures and
+  median time. The registrations are read from both systems every 30 minutes, or on
+  **Check now**.
+- **Settings** (`/settings`) — see *Settings and commands* below.
+
+**Activity**
+
+- **Webhooks** (`/webhooks`) — every delivery from Zuper *and* from Tuper, filtered by
   source and by outcome: accepted or refused, applied (Zuper) or queued for Zuper
   (Tuper), not synced (a deliberate skip) or failed, and why. Who made the change
   — name, email, role, designation, employee code, user uid — comes from the
@@ -236,9 +256,9 @@ write even over the service's credentials. Four pages:
   the delivery that caused it.
 - **To Zuper** (`/pushes`) — every change made in Tuper and queued for Zuper: the
   record, what changed, who changed it, the delivery that queued it, the Zuper
-  requests planned for it and what is not pushed and why. The page asks the
-  service's `/health` whether pushing is on and says so at the top; while it is
-  off, nothing on this page will happen.
+  requests planned for it and what is not pushed and why. The top says the mode
+  the engine has applied; while it is off, nothing on this page will happen, and
+  **Discard unsent changes** clears what is left.
 
 All pages stay current on their own. The open page asks `/api/pulse` every 3
 seconds for a fingerprint of the newest rows (ids and state columns only, no
@@ -258,6 +278,40 @@ Locally (`next dev`) it is open.
 rights); `NEXT_STANDALONE=0 next build` skips it for a local check. The Docker
 build is unaffected.
 
+### Settings and commands
+
+The engine's switches live in `sync.settings`, one versioned document per tenant:
+
+| | |
+|---|---|
+| Zuper → Tuper | apply Zuper's webhooks. Off stores each one, answers 200 and applies nothing — no replay, no sweep — until it is on again; replay then works through what was held |
+| Tuper → Zuper | `off`, `plan only` (`dry-run`) or `live`, the kinds sent live (jobs, customers), deletes, who wins a conflict, the oldest change still sent. While off, Tuper's webhooks are recorded and nothing is queued |
+| Replay, sweep | on or off, and how often the sweep runs |
+| API call log | recording, and how long bodies and rows are kept |
+
+The four presets on the page — two-way, one way either way, paused — set the two
+directions; Tuper → Zuper always starts at *plan only*, and going live asks first.
+A save is a new version, refused if someone saved in between (the form says so and
+keeps the edits). The engine reads the document every 5 seconds, applies it to the
+running process — timers start and stop, nothing restarts — and writes back the
+version it applied, so the page says *applied*, *waiting* or *the engine is not
+reporting*. Every version is kept in `sync.settings_history` with who saved it
+(the sign-in name). The first version is made from the environment the first time
+the engine starts on an empty table; after that the environment no longer decides
+these.
+
+Buttons that ask the engine to act write a row to `sync.commands`; the engine
+claims it within 5 seconds, runs one at a time, and writes the outcome back to the
+row, which the page shows. A request not picked up in 10 minutes expires.
+
+| Command | What the engine does |
+|---|---|
+| `replay-failed` | resets the attempts of failed Zuper deliveries so replay processes them again (they are re-run, not relabelled) |
+| `discard-unsent` | deletes the queued, planned and failed rows in the push queue; sent ones stay |
+| `sweep-now` | one sweep pass, now |
+| `refresh-connections` | reads both systems' webhook registrations again |
+| `register-zuper-webhooks` | creates the Zuper webhooks the engine routes and Zuper lacks, pointed at `PUBLIC_URL` with the header secret |
+
 ## Deployment
 
 Two deployables, two Coolify applications from this one repository, and the
@@ -271,8 +325,9 @@ push to `main` auto-deploys both applications.
 
 The service's `/health` returns 503 when Tuper's API or the store is unreachable,
 reporting each separately, so it says what matters rather than merely that the
-process is alive. It also reports the push state (`push.mode`, `sentToZuper`,
-`plannedOnly`), so the state of a deployment is never a guess.
+process is alive. It also reports the settings it is running with (`inbound`,
+`push.mode`, `sentToZuper`, `plannedOnly`), so the state of a deployment is never a
+guess.
 
 ### The service's environment
 
@@ -293,18 +348,25 @@ Three more are *not* enforced, and fail quietly rather than loudly — set them:
 | `DEFAULT_TENANT_ID` | the fallback is `00000000-0000-0000-0000-000000000001`, which on this installation happens to be the real tenant ("TGBG"). Set it explicitly anyway: a value that is right by coincidence is not configuration. |
 
 Optional: `PORT` (3020), `ZUPER_API_URL`, `ZUPER_WEBHOOK_HEADER`
-(`x-zupersync-key`), the `RECONCILE_*`, `SWEEP_*`, `PUSH_*` and `API_LOG*` settings
-in `.env.example`, `NODE_ENV` — the image already sets it to `production`, so do
-not override it with `development`.
+(`x-zupersync-key`), `PUBLIC_URL` (`https://zupersync.golfbuggyguy.com`, where
+both systems' webhooks should point), the `RECONCILE_*`, `SWEEP_*`, `PUSH_*` and
+`API_LOG*` settings in `.env.example`, `NODE_ENV` — the image already sets it to
+`production`, so do not override it with `development`.
+
+`SYNC_INBOUND`, `RECONCILE_ENABLED`, `SWEEP_ENABLED`, `SWEEP_EVERY_MINUTES`,
+`PUSH_MODE`, `PUSH_ENTITIES`, `PUSH_DELETES`, `PUSH_ON_CONFLICT`,
+`PUSH_MAX_AGE_MINUTES`, `API_LOG`, `API_LOG_DAYS` and `API_LOG_BODY_HOURS` only
+make the first version of the settings. Once `sync.settings` has a row, change
+them on the dashboard's **Settings** page; changing them in Coolify does nothing.
 
 ### The dashboard's environment
 
 Runtime only (none is a build variable): `DATABASE_URL` (the store's, the same
 value the service has), `DEFAULT_TENANT_ID`, `DASHBOARD_USER` and
 `DASHBOARD_PASSWORD` — the password is generated and can be read in the app's
-Environment Variables in Coolify. Optional: `ZUPERSYNC_URL` (where to ask for
-`/health`) and `ZUPER_WEBHOOK_HEADER`. The old `SUPABASE_URL` and
-`SUPABASE_SERVICE_ROLE_KEY` are no longer read and can be removed.
+Environment Variables in Coolify. Optional: `ZUPER_WEBHOOK_HEADER`. The old
+`ZUPERSYNC_URL`, `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are no longer read
+and can be removed.
 
 Two things made its first deploys fail, both invisible locally:
 
@@ -369,7 +431,9 @@ with one header whose key and value match `ZUPER_WEBHOOK_HEADER` and
 and `value`; there is no separate secret field. `npm run webhooks` lists what is
 registered against what is needed (plan by default; `apply` creates the missing
 ones). On 2026-09-18 all 117 synced events were registered (and `job.new_recurrence`, now a skip). `GET /webhooks/zuper`
-answers a liveness probe, which is what Zuper's "test URL" check uses.
+answers a liveness probe, which is what Zuper's "test URL" check uses. The
+dashboard's **Connections** page shows the same comparison and, when events are
+missing, a **Register** button that has the engine create them.
 
 **In Tuper**, point them at `https://zupersync.golfbuggyguy.com/webhooks/tuper`,
 signed with `TUPER_WEBHOOK_SECRET`, for the ten events the receiver queues:
@@ -394,6 +458,9 @@ each file once (recorded in `public.sync_migrations`):
   deliveries that arrived without a record uid before the receiver learned to.
 - `004_tuper_writes.sql` — one row per record written to Tuper, and
   `api_calls.write_id` tying each call to it.
+- `005_engine_controls.sql` — the settings and their history, the engine's
+  heartbeat and applied version (`engine`), the dashboard's requests (`commands`),
+  and the last connection check (`snapshots`).
 
 ### `migrations/` — Tuper's database, historical
 
@@ -408,9 +475,10 @@ straight back to Zuper. Applying any of them needs the role that owns the schema
 
 ## Pushing back to Zuper
 
-**On hold** (`PUSH_MODE=off` in production, 2026-09-18). Changes made in Tuper are
-received and queued; nothing is planned or sent, and the next Zuper webhook for a
-record puts Zuper's values back in Tuper.
+**On hold** (Tuper → Zuper off in production, 2026-09-18). Changes made in Tuper
+are received and recorded, not queued; nothing is planned or sent, and the next
+Zuper webhook for a record puts Zuper's values back in Tuper. The 69 changes
+queued while pushing was already on hold were discarded on 2026-09-22.
 
 A change made in Tuper arrives as a Tuper webhook (`src/receiver-tuper.ts`), is
 verified by its signature, stored, and turned into a row in `sync.outbox`. The
@@ -467,15 +535,15 @@ events, plans watched in dry-run, one supervised real write, then its name in
 
 ### Modes, and going live
 
-`PUSH_MODE`: `off` reads and writes nothing. `dry-run` plans each change and
-stores the requests on the row; nothing is sent. `live` sends them, then reads the
-record back; a 200 that changed nothing fails the row. `live` reaches only the
-entities in `PUSH_ENTITIES` (default `jobs`). A change queued more than
-`PUSH_MAX_AGE_MINUTES` ago is marked skipped, not sent, so switching on never
-replays old edits over what Zuper holds now.
+Set on the dashboard's **Settings** page (Tuper → Zuper). `Off` queues, reads and
+writes nothing. `Plan only` (`dry-run`) plans each change and stores the requests
+on the row; nothing is sent. `Live` sends them, then reads the record back; a 200
+that changed nothing fails the row. `Live` reaches only the kinds ticked (default
+jobs). A change queued longer ago than the oldest-change limit is marked skipped,
+not sent, so switching on never replays old edits over what Zuper holds now.
 
-To go live: fix the Tuper webhook modules (above) · deploy with `dry-run` and
-read the plans on **To Zuper** · set `live` with `PUSH_ENTITIES=jobs` · make one
+To go live: fix the Tuper webhook modules (above) · switch to *plan only* and
+read the plans on **To Zuper** · switch to *live* with only jobs ticked · make one
 edit on one job and watch it sent, applied in Zuper, and Zuper's own webhook come
 back in **Webhooks** with no second row in **To Zuper** (which would be an echo).
 A status pushed to Zuper is a real status change there: it appears on the

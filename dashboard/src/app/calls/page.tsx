@@ -114,7 +114,7 @@ export default async function Calls({ searchParams }: { searchParams: Promise<SP
       {error ? (
         <p className="error">Could not read the call log: {error}</p>
       ) : notYet ? (
-        <p className="pinned">The call log starts with the service version that records it, which is not deployed yet. The webhooks are on the <a href="/">Webhooks</a> page.</p>
+        <p className="pinned">The call log starts with the service version that records it, which is not deployed yet. The webhooks are on the <a href="/webhooks">Webhooks</a> page.</p>
       ) : (
         <>
           {stats ? (
@@ -222,7 +222,7 @@ function CallDrawer({ c, closeHref }: { c: ApiCallDetail; closeHref: string }) {
             {c.event_id ? (
               <>
                 <dt>Delivery</dt>
-                <dd><a href={`/?open=${c.event_id}&call=${c.id}`}>{c.cause_source === "tuper" ? "Tuper" : "Zuper"} {c.cause_event ?? "webhook"}{c.cause_wo ? ` · job ${c.cause_wo}` : ""}</a></dd>
+                <dd><a href={`/webhooks?open=${c.event_id}&call=${c.id}`}>{c.cause_source === "tuper" ? "Tuper" : "Zuper"} {c.cause_event ?? "webhook"}{c.cause_wo ? ` · job ${c.cause_wo}` : ""}</a></dd>
               </>
             ) : null}
           </dl>

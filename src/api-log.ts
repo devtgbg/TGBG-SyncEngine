@@ -267,11 +267,12 @@ export async function purgeApiLog(): Promise<{ bodies: number; rows: number }> {
   return { bodies, rows };
 }
 
+/**
+ * The purge runs whether recording is on or not: the dashboard can switch recording off, and what was recorded
+ * before still has to go on time.
+ */
 export function startApiLogPurge(): void {
-  if (!config.apiLog.enabled) {
-    console.log("[api-log] off (API_LOG=off) — calls to Zuper and Tuper are not recorded");
-    return;
-  }
+  if (!config.apiLog.enabled) console.log("[api-log] recording is off — calls to Zuper and Tuper are not recorded");
   const run = async () => {
     try {
       const r = await purgeApiLog();

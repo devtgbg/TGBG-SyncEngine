@@ -136,7 +136,7 @@ export default async function ToTuper({ searchParams }: { searchParams: Promise<
       {error ? (
         <p className="error">Could not read the record of writes: {error}</p>
       ) : notYet ? (
-        <p className="pinned">This record starts with the service version that keeps it, which is not deployed yet. Until then, <a href="/?source=zuper">Webhooks › From Zuper</a> shows each change and its outcome.</p>
+        <p className="pinned">This record starts with the service version that keeps it, which is not deployed yet. Until then, <a href="/webhooks?source=zuper">Webhooks › From Zuper</a> shows each change and its outcome.</p>
       ) : (
         <>
           {stats ? (
@@ -261,7 +261,7 @@ function WriteDrawer({ w, calls, call, closeHref, callHref }: {
             <dt>Caused by</dt>
             <dd>
               {label}
-              {w.event_id ? <> · <a href={`/?open=${w.event_id}`}>{w.cause_event ?? "the delivery"}{w.cause_wo ? ` · job ${w.cause_wo}` : ""}</a></> : null}
+              {w.event_id ? <> · <a href={`/webhooks?open=${w.event_id}`}>{w.cause_event ?? "the delivery"}{w.cause_wo ? ` · job ${w.cause_wo}` : ""}</a></> : null}
             </dd>
           </dl>
         </section>

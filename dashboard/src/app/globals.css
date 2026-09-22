@@ -15,6 +15,8 @@
   --warn-bg: #fdf2dd; --warn-ink: #8a5a08;
   --bad-bg: #fbeae8; --bad-ink: #a32c1c;
   --muted-bg: #f0eeeb; --muted-ink: #6f6963;
+  /* Chart series: categorical slots 1 and 2, validated (dataviz validate_palette.js) against #ffffff. */
+  --series-1: #2a78d6; --series-2: #eb6834;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -29,6 +31,7 @@
     --warn-bg: #352713; --warn-ink: #e3b467;
     --bad-bg: #3a1d19; --bad-ink: #f0968a;
     --muted-bg: #27252c; --muted-ink: #9b95a3;
+    --series-1: #3987e5; --series-2: #d95926;
   }
 }
 
@@ -39,6 +42,7 @@
   --warn-bg: #352713; --warn-ink: #e3b467;
   --bad-bg: #3a1d19; --bad-ink: #f0968a;
   --muted-bg: #27252c; --muted-ink: #9b95a3;
+  --series-1: #3987e5; --series-2: #d95926;
 }
 
 * { box-sizing: border-box; }
@@ -62,13 +66,6 @@ main {
   gap: 24px;
 }
 
-nav.site {
-  max-width: 1320px; margin: 0 auto; padding: 14px 20px 0;
-  display: flex; flex-wrap: wrap; align-items: baseline; gap: 18px;
-}
-nav.site strong { font-size: 13px; letter-spacing: 0.02em; margin-right: 6px; }
-nav.site a { color: var(--dim); text-decoration: none; font-size: 13px; }
-nav.site a:hover { color: var(--ink); }
 
 .changes { display: flex; flex-direction: column; gap: 2px; white-space: normal; min-width: 220px; }
 .changes .from { color: var(--dim); text-decoration: line-through; }
@@ -144,18 +141,18 @@ tbody tr:hover { background: var(--muted-bg); }
 
 /* The indicator sits at the far end of the nav. The word carries the state; the
    dot's colour only repeats it. */
-nav.site .live {
+.topbar .live {
   margin-left: auto;
   display: inline-flex; align-items: center; gap: 7px;
   font-size: 12px; color: var(--dim);
 }
-nav.site .live i {
+.topbar .live i {
   width: 7px; height: 7px; border-radius: 50%;
   background: var(--ok-ink);
 }
-nav.site .live.offline { color: var(--warn-ink); }
-nav.site .live.offline i { background: var(--warn-ink); }
-nav.site .live i.blip { animation: blip 1.2s ease-out; }
+.topbar .live.offline { color: var(--warn-ink); }
+.topbar .live.offline i { background: var(--warn-ink); }
+.topbar .live i.blip { animation: blip 1.2s ease-out; }
 
 @keyframes blip {
   0% { box-shadow: 0 0 0 0 var(--ok-ink); }
@@ -171,7 +168,7 @@ tr.fresh td { animation: fresh 4s ease-out; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  nav.site .live i.blip, tr.fresh td { animation: none; }
+  .topbar .live i.blip, tr.fresh td { animation: none; }
 }
 
 /* Two values to a cell, one over the other: seven facts about a person in three
@@ -290,11 +287,13 @@ table.log tbody tr.opened { background: var(--muted-bg); box-shadow: inset 3px 0
 
 /* Which system a row came from or went to. The name carries it; the colour only repeats it. */
 .src {
-  display: inline-block; padding: 1px 7px; border-radius: 5px; font-size: 11px; font-weight: 600;
-  letter-spacing: 0.02em; border: 1px solid var(--line); font-family: ui-sans-serif, system-ui, sans-serif;
+  display: inline-flex; align-items: center; gap: 5px; padding: 1px 7px 1px 6px; border-radius: 5px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.02em; color: var(--ink);
+  border: 1px solid var(--line); background: var(--surface); font-family: ui-sans-serif, system-ui, sans-serif; vertical-align: 1px;
 }
-.src.zuper { color: var(--accent); border-color: var(--accent); }
-.src.tuper { color: var(--warn-ink); border-color: var(--warn-ink); }
+.src::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--dim); }
+.src.zuper::before { background: var(--series-1); }
+.src.tuper::before { background: var(--series-2); }
 
 .filter-rows { display: flex; flex-direction: column; gap: 8px; }
 .filters a .count { margin-left: 6px; opacity: 0.75; font-variant-numeric: tabular-nums; }

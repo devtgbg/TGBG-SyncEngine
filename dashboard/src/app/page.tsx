@@ -1,37 +1,24 @@
 /**
- * The webhook log: what Zuper and Tuper sent, and what Zupersync did about it.
+ * The engine at a glance: which way it syncs, whether it is running, how each direction is doing, what needs a person,
+ * and the controls to act on it.
  *
- * Every row answers the question someone has when a record looks wrong on one side: did the other side tell us, did
- * we accept it, did we act on it, and if not, why not. The Calls column says how many API calls acting on it took;
- * opening the row lists them.
+ * Everything here is either measured from the store or reported by the engine itself (sync.engine); nothing is
+ * assumed from what was last saved. The page refreshes itself when anything it shows moves.
  */
 
+import Link from "next/link";
+import { redirect } from "next/navigation";
 import {
-  callById, callCounts, callsFor, deliveriesPage, deliveryById, missingTable, sourceCounts, totals, userNames, writesFor,
-  type ApiCall, type ApiCallDetail, type CallCount, type Delivery, type DeliveryDetail, type Source, type TuperWrite,
-} from "@/lib/db";
-import { userUidsIn } from "@/lib/describe";
-import { outcome } from "@/lib/outcome";
-import { Detail } from "./detail";
+  connectionSummary, engine, flow, getSettings, hourly, latestBy, liveness, recentCommands, snapshot,
+  type Catalogue, type Command, type Registrations,
+} from "@/lib/control";
+import { COMMANDS, DIRECTION, directionOf, minutes, PUSH_MODE, type Settings } from "@/lib/engine";
+import { dubaiTime } from "@/lib/describe";
+import { ActivityChart } from "./activity-chart";
+import { CommandButton } from "./controls";
 import { Ago } from "./live";
-import { DEFAULT_SIZE, Pager, Pinned, readPaging } from "./pager";
-import { Row } from "./row";
 
 export const dynamic = "force-dynamic";
-
-const FILTERS = [
-  { key: "", label: "All" },
-  { key: "failed", label: "Failed" },
-  { key: "skipped", label: "Not synced" },
-  { key: "unprocessed", label: "Waiting" },
-  { key: "refused", label: "Refused" },
-] as const;
-
-const SOURCES = [
-  { key: "", label: "Both" },
-  { key: "zuper", label: "From Zuper" },
-  { key: "tuper", label: "From Tuper" },
-] as const;
 
 const ago = (iso: string) => {
   const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
@@ -41,213 +28,199 @@ const ago = (iso: string) => {
   return `${Math.floor(s / 86400)}d ago`;
 };
 
-/** Arrived in the last few seconds — highlighted once, so a row appearing live catches the eye. */
-const isFresh = (iso: string) => Date.now() - new Date(iso).getTime() < 15_000;
+/** Why a safety net is not running, when the settings say so; the engine reporting it stopped says the rest. */
+const offBecause = (s: Settings | null | undefined, on: boolean | undefined) =>
+  !s ? "" : !s.inbound ? "Held while Zuper → Tuper is off. " : on === false ? "Turned off in Settings. " : "";
 
-type SP = { filter?: string; source?: string; page?: string; size?: string; upto?: string; open?: string; call?: string };
+type SP = Record<string, string | undefined>;
 
-export default async function Page({ searchParams }: { searchParams: Promise<SP> }) {
+export default async function Overview({ searchParams }: { searchParams: Promise<SP> }) {
+  // The webhook log lived here until 2026-09-22: its links (?open=, ?source=, …) still arrive and belong there.
   const sp = await searchParams;
-  const filter = sp.filter ?? "";
-  const source = sp.source === "zuper" || sp.source === "tuper" ? sp.source : "";
-  const paging = readPaging(sp);
+  if (["open", "filter", "source", "page", "upto", "call", "size"].some((k) => sp[k])) {
+    redirect(`/webhooks?${new URLSearchParams(Object.entries(sp).filter(([, v]) => v) as [string, string][])}`);
+  }
 
-  let rows: Delivery[] = [];
-  let matching = 0;
-  let counts = { total: 0, refused: 0, processed: 0, skipped: 0, failed: 0, waiting: 0 };
-  let bySource: Record<Source, number> = { zuper: 0, tuper: 0 };
-  let calls: Record<string, CallCount> = {};
-  let opened: DeliveryDetail | null = null;
-  let openedCalls: { rows: ApiCall[]; total: number } | null = null;
-  let openedCall: ApiCallDetail | null = null;
-  let written: TuperWrite[] = [];
-  let names: Record<string, string> = {};
   let error: string | null = null;
+  let data: {
+    row: Awaited<ReturnType<typeof getSettings>>; eng: Awaited<ReturnType<typeof engine>>; fl: Awaited<ReturnType<typeof flow>>;
+    hours: Awaited<ReturnType<typeof hourly>>; cmds: Command[]; cat: Catalogue | null; regs: Registrations | null; regsAt: string | null;
+  } | null = null;
   try {
-    const [list, all, src, one] = await Promise.all([
-      deliveriesPage({ limit: paging.size, offset: paging.offset, upto: paging.upto, filter, source }),
-      totals(source),
-      sourceCounts(),
-      sp.open ? deliveryById(sp.open) : Promise.resolve(null),
+    const [row, eng, fl, hours, cmds, cat, regs] = await Promise.all([
+      getSettings().catch(() => null), engine(), flow(), hourly(), recentCommands(8),
+      snapshot<Catalogue>("catalogue"), snapshot<Registrations>("registrations"),
     ]);
-    rows = list.rows; matching = list.total; counts = all; bySource = src; opened = one;
-    calls = await callCounts(rows.map((r) => r.id));
-    if (opened) {
-      // An assignment names people by uid only; a name that cannot be found is no reason to fail the page.
-      names = await userNames(userUidsIn(opened.body)).catch(() => ({}));
-      written = await writesFor(opened.id);
-      try {
-        openedCalls = await callsFor(opened.id);
-        if (sp.call) {
-          const c = await callById(sp.call);
-          openedCall = c && c.event_id === opened.id ? c : null;
-        }
-      } catch (err) {
-        if (!missingTable(err)) throw err;
-      }
-    }
+    data = { row, eng, fl, hours, cmds, cat: cat?.data ?? null, regs: regs?.data ?? null, regsAt: regs?.taken_at ?? null };
   } catch (err) {
     error = err instanceof Error ? err.message : String(err);
   }
+  if (error || !data) return <main><p className="error">Could not read the engine&apos;s state: {error}</p></main>;
 
-  /** This view's own URL: same filters, page size, page and pin, with or without a delivery (and one of its calls) open. */
-  const here = (open?: string, call?: string) => {
-    const q = new URLSearchParams();
-    if (source) q.set("source", source);
-    if (filter) q.set("filter", filter);
-    if (paging.size !== DEFAULT_SIZE) q.set("size", String(paging.size));
-    if (paging.page > 1) q.set("page", String(paging.page));
-    if (paging.upto) q.set("upto", paging.upto);
-    if (open) q.set("open", open);
-    if (open && call) q.set("call", call);
-    const qs = q.toString();
-    return qs ? `/?${qs}` : "/";
-  };
-  const link = (next: { source?: string; filter?: string }) => {
-    const q = new URLSearchParams();
-    const s = next.source ?? source, f = next.filter ?? filter;
-    if (s) q.set("source", s);
-    if (f) q.set("filter", f);
-    const qs = q.toString();
-    return qs ? `/?${qs}` : "/";
-  };
+  const { row, eng, fl, hours, cmds, cat, regs, regsAt } = data;
+  // What runs is what the engine says it applied; before it reports, the saved settings are the best guess.
+  const s: Settings | null = eng?.applied ?? row?.data ?? null;
+  const live = liveness(eng);
+  const latest = latestBy(cmds);
+  const conn = connectionSummary(cat, regs);
+  const unsent = (fl.queue.queued ?? 0) + (fl.queue.planned ?? 0) + (fl.queue.failed ?? 0);
+  const noId = fl.tuper.day - fl.tuper.carriedId;
+  const pending = row && eng && eng.applied_version !== row.version;
 
-  // Older pages are pinned to the newest row on show here; an older page keeps the pin it came with.
-  const pager = (
-    <Pager base="/" keep={{ source, filter }} paging={paging} total={matching} shown={rows.length}
-      anchor={paging.upto ?? (paging.page === 1 ? rows[0]?.received_at : undefined)} />
-  );
+  // What a person should look at, most serious first. Each says what is wrong, why it matters and what to do.
+  const attention: { tone: "bad" | "warn"; title: string; body: React.ReactNode; action?: React.ReactNode }[] = [];
+  if (live.state !== "online") {
+    attention.push({ tone: "bad", title: live.label, body: eng ? `Last heard from ${dubaiTime(eng.heartbeat_at)} (Dubai). Webhooks are still stored by whatever is serving them, but settings and buttons wait for it.` : "No heartbeat yet: the engine reports once it runs the version with engine controls." });
+  }
+  if (fl.failedAll) {
+    attention.push({ tone: "bad", title: `${fl.failedAll} Zuper deliver${fl.failedAll === 1 ? "y" : "ies"} failed`,
+      body: <>Their changes are not in Tuper. <Link href="/webhooks?source=zuper&filter=failed">See why</Link>, fix the cause, then replay them — they are processed again, not relabelled.</>,
+      action: <CommandButton command="replay-failed" label="Replay failed" latest={latest["replay-failed"]} /> });
+  }
+  if (conn.zuper?.missing.length) {
+    attention.push({ tone: "warn", title: `${conn.zuper.missing.length} Zuper events have no webhook`,
+      body: <>The engine handles them, but Zuper was never told to send them, so they never arrive. <Link href="/connections">See which</Link>.</> });
+  }
+  if (conn.tuper?.wrongModule.length) {
+    attention.push({ tone: "warn", title: `${conn.tuper.wrongModule.length} Tuper webhooks are registered under the wrong module`,
+      body: <>Registered as {[...new Set(conn.tuper.wrongModule.map((w) => w.registeredAs))].join(", ")} where Tuper&apos;s catalogue says {[...new Set(conn.tuper.wrongModule.map((w) => w.needs))].join(", ")}, so their deliveries carry no record id{noId ? ` (${noId} in the last 24 hours)` : ""}. <Link href="/connections">Details</Link>.</> });
+  }
+  if (unsent) {
+    attention.push({ tone: "warn", title: `${unsent} change${unsent === 1 ? "" : "s"} from Tuper not sent to Zuper`,
+      body: s?.push.mode === "off" ? "Pushing to Zuper is off, so they will never be sent." : <><Link href="/pushes">See them</Link>.</>,
+      action: <CommandButton command="discard-unsent" label="Discard them" tone="danger" latest={latest["discard-unsent"]}
+        confirm={`Discard ${unsent} change(s) made in Tuper that have not been sent to Zuper? They are removed from the queue and never sent.`} /> });
+  }
+  if (fl.calls.zuperFailed + fl.calls.tuperFailed > 0) {
+    attention.push({ tone: "warn", title: `${fl.calls.zuperFailed + fl.calls.tuperFailed} failed API call${fl.calls.zuperFailed + fl.calls.tuperFailed === 1 ? "" : "s"} in the last hour`,
+      body: <>{fl.calls.zuperFailed} to Zuper, {fl.calls.tuperFailed} to Tuper. Some are expected answers (a record Zuper deleted). <Link href="/calls?failed=1">See them</Link>.</> });
+  }
+
+  const dir = s ? directionOf(s) : null;
+  const pushLabel = s ? (s.push.mode === "live" ? `Live · ${s.push.entities.join(", ") || "nothing chosen"}` : PUSH_MODE[s.push.mode]) : "—";
 
   return (
     <main>
-      <header className="head">
-        <h1>Webhooks</h1>
-        <p>
-          Every webhook Zuper and Tuper have sent, and what became of it. A change in Zuper is re-read from Zuper&apos;s API
-          and written through Tuper&apos;s; a change in Tuper is queued for Zuper. Open a row to see the API calls it took.
-        </p>
-      </header>
+      <section className={`engine-head ${live.state}`}>
+        <div>
+          <p className="eyebrow">Sync engine</p>
+          <h1>{dir ? DIRECTION[dir].label : "Not configured yet"}</h1>
+          <p className="dim">{dir ? DIRECTION[dir].about : "The engine creates its settings the first time it starts with this version."}</p>
+          <p className="engine-status" role="status">
+            <span className={`dot ${live.state === "online" ? "ok" : live.state === "late" ? "warn" : "bad"}`} aria-hidden="true" />
+            <strong>{live.label}</strong>
+            {eng ? <> · heartbeat <Ago iso={eng.heartbeat_at} initial={ago(eng.heartbeat_at)} /> · running since {dubaiTime(eng.started_at)}{eng.commit ? <> · <span className="mono">{eng.commit}</span></> : null}</> : null}
+            {row ? <> · settings v{row.version} {pending ? <span className="warn-text">(v{eng?.applied_version ?? "—"} applied — waiting)</span> : "applied"}</> : null}
+          </p>
+        </div>
+        <Link href="/settings" className="btn primary">Settings</Link>
+      </section>
 
-      {error ? (
-        <p className="error">Could not read the log: {error}</p>
-      ) : (
-        <>
-          <section className="tiles">
-            <Tile n={counts.total} label="received" />
-            <Tile n={counts.processed} label="applied" tone="ok" />
-            <Tile n={counts.skipped} label="not synced" />
-            <Tile n={counts.waiting} label="waiting" tone={counts.waiting ? "warn" : undefined} />
-            <Tile n={counts.failed} label="failed" tone={counts.failed ? "bad" : undefined} />
-            <Tile n={counts.refused} label="refused" tone={counts.refused ? "bad" : undefined} />
-          </section>
+      <div className="lanes">
+        <section className={`lane ${s?.inbound ? "on" : "off"}`}>
+          <header>
+            <h2><span className="src zuper">Zuper</span> <span className="arrow">→</span> <span className="src tuper">Tuper</span></h2>
+            <span className={`state ${s?.inbound ? "on" : "off"}`}>{s?.inbound ? "On" : "Off — held"}</span>
+          </header>
+          <dl className="metrics">
+            <div><dt>Webhooks · last hour</dt><dd>{fl.zuper.hour.toLocaleString()}</dd></div>
+            <div><dt>Webhooks · 24h</dt><dd>{fl.zuper.day.toLocaleString()}</dd></div>
+            <div><dt>Applied</dt><dd className="ok-text">{fl.zuper.applied.toLocaleString()}</dd></div>
+            <div><dt>Failed</dt><dd className={fl.zuper.failed ? "bad-text" : ""}>{fl.zuper.failed.toLocaleString()}</dd></div>
+            <div><dt>{s?.inbound ? "Waiting" : "Held"}</dt><dd className={fl.zuper.held ? "warn-text" : ""}>{fl.zuper.held.toLocaleString()}</dd></div>
+            <div><dt>Median to Tuper</dt><dd>{fl.zuper.median_s !== null ? `${fl.zuper.median_s}s` : "—"}</dd></div>
+          </dl>
+          <p className="lane-foot">
+            Records written to Tuper in 24h: <strong>{fl.writes.total.toLocaleString()}</strong> — {fl.writes.created} created, {fl.writes.updated} updated, {fl.writes.deleted} deleted
+            {fl.writes.failed ? <>, <span className="bad-text">{fl.writes.failed} failed</span></> : null}.
+            {fl.zuper.last ? <> Last webhook <Ago iso={fl.zuper.last} initial={ago(fl.zuper.last)} />.</> : null}
+          </p>
+          <nav className="lane-links"><Link href="/webhooks?source=zuper">Webhooks</Link><Link href="/tuper">To Tuper</Link></nav>
+        </section>
 
-          <div className="filter-rows">
-            <nav className="filters" aria-label="Source">
-              {SOURCES.map((s) => (
-                <a key={s.key} href={link({ source: s.key })} className={source === s.key ? "on" : ""}>
-                  {s.label}{s.key ? <span className="count">{bySource[s.key as Source].toLocaleString()}</span> : null}
-                </a>
+        <section className={`lane ${s && s.push.mode !== "off" ? "on" : "off"}`}>
+          <header>
+            <h2><span className="src tuper">Tuper</span> <span className="arrow">→</span> <span className="src zuper">Zuper</span></h2>
+            <span className={`state ${s?.push.mode === "live" ? "live" : s?.push.mode === "dry-run" ? "plan" : "off"}`}>{pushLabel}</span>
+          </header>
+          <dl className="metrics">
+            <div><dt>Tuper webhooks · 24h</dt><dd>{fl.tuper.day.toLocaleString()}</dd></div>
+            <div><dt>Carried a record id</dt><dd className={noId ? "warn-text" : ""}>{fl.tuper.carriedId.toLocaleString()}</dd></div>
+            <div><dt>Queued</dt><dd>{(fl.queue.queued ?? 0).toLocaleString()}</dd></div>
+            <div><dt>Planned</dt><dd>{(fl.queue.planned ?? 0).toLocaleString()}</dd></div>
+            <div><dt>Sent</dt><dd className="ok-text">{(fl.queue.sent ?? 0).toLocaleString()}</dd></div>
+            <div><dt>Failed</dt><dd className={fl.queue.failed ? "bad-text" : ""}>{(fl.queue.failed ?? 0).toLocaleString()}</dd></div>
+          </dl>
+          <p className="lane-foot">
+            {s?.push.mode === "off" ? "Pushing is off: changes made in Tuper are recorded, not queued, and nothing is sent."
+              : s?.push.mode === "dry-run" ? "Plan only: each change is planned against Zuper's record and shown, nothing is sent."
+              : `Live: changes to ${s?.push.entities.join(", ")} are sent to Zuper; on a conflict ${s?.push.onConflict === "tuper-wins" ? "Tuper" : "Zuper"} wins.`}
+            {fl.tuper.last ? <> Last Tuper webhook <Ago iso={fl.tuper.last} initial={ago(fl.tuper.last)} />.</> : null}
+          </p>
+          <nav className="lane-links"><Link href="/webhooks?source=tuper">Webhooks</Link><Link href="/pushes">To Zuper</Link></nav>
+        </section>
+      </div>
+
+      <section className="card">
+        <header className="card-head"><h2>Needs attention</h2></header>
+        {attention.length ? (
+          <ul className="attention">
+            {attention.map((a, i) => (
+              <li key={i} className={a.tone}>
+                <span className={`dot ${a.tone}`} aria-hidden="true" />
+                <div><strong>{a.title}</strong><p>{a.body}</p></div>
+                {a.action ?? null}
+              </li>
+            ))}
+          </ul>
+        ) : <p className="all-clear"><span className="dot ok" aria-hidden="true" /> Nothing needs attention.</p>}
+      </section>
+
+      <section className="card">
+        <header className="card-head"><h2>Webhooks per hour</h2><p className="note">Last 24 hours, Dubai time.</p></header>
+        <ActivityChart buckets={hours} />
+      </section>
+
+      <div className="grid-2">
+        <section className="card">
+          <header className="card-head"><h2>Safety nets</h2></header>
+          <ul className="nets">
+            <li>
+              <div><strong>Replay</strong> <span className={`state ${eng?.state.timers?.replay ? "on" : "off"}`}>{eng?.state.timers?.replay ? "every 2 minutes" : "off"}</span>
+                <p className="note">Retries failed Zuper deliveries. {offBecause(s, s?.replay)}{eng?.state.replay ? `Last: ${eng.state.replay.attempted} tried, ${eng.state.replay.ok} applied, ${eng.state.replay.failed} still failing (${dubaiTime(eng.state.replay.at)}).` : "Nothing has needed a retry since the engine started."}</p></div>
+            </li>
+            <li>
+              <div><strong>Sweep</strong> <span className={`state ${eng?.state.timers?.sweep ? "on" : "off"}`}>{eng?.state.timers?.sweep ? `every ${minutes(s?.sweep.everyMinutes ?? 30)}` : "off"}</span>
+                <p className="note">Re-reads what Zuper changed recently, for webhooks that never arrived. {offBecause(s, s?.sweep.enabled)}{eng?.state.sweep ? `Last pass ${dubaiTime(eng.state.sweep.at)}: ${eng.state.sweep.jobsInWindow} jobs in the window, ${eng.state.sweep.jobsMissing} missing, ${eng.state.sweep.jobsDrifted} behind; ${eng.state.sweep.resynced} written, ${eng.state.sweep.failed} failed.` : "No pass reported since the engine started."}</p></div>
+              <CommandButton command="sweep-now" label="Sweep now" latest={latest["sweep-now"]} disabled={!s?.inbound} />
+            </li>
+            <li>
+              <div><strong>Connections</strong>
+                <p className="note">The webhooks registered on each side, checked every 30 minutes. {regsAt ? `Last checked ${dubaiTime(regsAt)}.` : "Not checked yet."}</p></div>
+              <CommandButton command="refresh-connections" label="Check now" latest={latest["refresh-connections"]} />
+            </li>
+            <li>
+              <div><strong>API call log</strong> <span className={`state ${s?.apiLog.enabled ? "on" : "off"}`}>{s?.apiLog.enabled ? "recording" : "off"}</span>
+                <p className="note">Last hour: {fl.calls.zuper.toLocaleString()} calls to Zuper, {fl.calls.tuper.toLocaleString()} to Tuper. <Link href="/calls">API calls</Link></p></div>
+            </li>
+          </ul>
+        </section>
+
+        <section className="card">
+          <header className="card-head"><h2>Recent actions</h2></header>
+          {cmds.length ? (
+            <ol className="history">
+              {cmds.map((c) => (
+                <li key={c.id}>
+                  <span className={`dot ${c.finished_at ? (c.ok ? "ok" : "bad") : "warn"}`} aria-hidden="true" />
+                  <span><strong>{COMMANDS[c.command]?.label ?? c.command}</strong>{c.result ? <span className="note"> — {c.result}</span> : <span className="note"> — {c.started_at ? "running" : "waiting for the engine"}</span>}</span>
+                  <span className="dim">{dubaiTime(c.requested_at)}{c.requested_by ? ` · ${c.requested_by}` : ""}</span>
+                </li>
               ))}
-            </nav>
-            <nav className="filters" aria-label="Outcome">
-              {FILTERS.map((f) => (
-                <a key={f.key} href={link({ filter: f.key })} className={filter === f.key ? "on" : ""}>{f.label}</a>
-              ))}
-            </nav>
-          </div>
-
-          <Pinned upto={paging.upto} base="/" keep={{ source, filter }} size={paging.size} />
-          {pager}
-
-          {rows.length === 0 ? (
-            <p className="empty">{paging.page > 1 ? "No rows on this page." : `No deliveries${filter || source ? " matching that filter" : " yet"}.`}</p>
-          ) : (
-            <div className="scroll">
-              <table className="log">
-                {/* Fixed shares, so the table is always exactly as wide as its box: a long
-                    value is cut with an ellipsis (full text on hover), never a scrollbar. */}
-                <colgroup>
-                  <col style={{ width: "6.5%" }} /><col style={{ width: "7%" }} /><col style={{ width: "13%" }} />
-                  <col style={{ width: "6.5%" }} /><col style={{ width: "15%" }} /><col style={{ width: "11%" }} />
-                  <col style={{ width: "13%" }} /><col style={{ width: "8%" }} /><col style={{ width: "15.5%" }} />
-                  <col style={{ width: "4.5%" }} />
-                </colgroup>
-                <thead>
-                  <tr><th>When</th><th>From</th><th>Event</th><th>Record</th><th>By</th><th>Role</th><th>Staff ID</th><th>API calls</th><th>Outcome</th><th className="num">Tries</th></tr>
-                </thead>
-                <tbody>
-                  {rows.map((d) => {
-                    const o = outcome(d);
-                    const c = calls[d.id];
-                    return (
-                      <Row key={d.id} href={here(d.id)}
-                        className={[isFresh(d.received_at) ? "fresh" : "", opened?.id === d.id ? "opened" : ""].filter(Boolean).join(" ") || undefined}>
-                        <td className="dim" title={d.received_at}><Ago iso={d.received_at} initial={ago(d.received_at)} /></td>
-                        <td><Pair top={<span className={`src ${d.source}`}>{d.source === "tuper" ? "Tuper" : "Zuper"}</span>} under={d.module} /></td>
-                        <td className="mono" title={d.event ?? undefined}>{d.event ?? "—"}</td>
-                        <td className="mono dim" title={d.work_order_number ?? d.zuper_uid ?? undefined}>{d.work_order_number ?? d.zuper_uid?.slice(0, 8) ?? "—"}</td>
-                        <td><Pair top={personName(d)} under={d.by_email} /></td>
-                        <td><Pair top={d.by_role} under={d.by_designation} /></td>
-                        <td><Pair top={d.by_emp_code} under={d.by_uid} mono /></td>
-                        <td className="mono" title={c ? `${c.zuper} to Zuper, ${c.tuper} to Tuper${c.failed ? `, ${c.failed} failed` : ""}` : "No calls recorded"}>
-                          {c ? <CallTally c={c} /> : <span className="dim">—</span>}
-                        </td>
-                        <td><span className={`pill ${o.tone}`} title={o.label}>{o.label}</span></td>
-                        <td className="num dim">{d.source === "tuper" ? "" : d.attempts}</td>
-                      </Row>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {rows.length > 15 ? pager : null}
-        </>
-      )}
-
-      {opened ? (
-        <Detail d={opened} names={names} closeHref={here()} calls={openedCalls} call={openedCall} written={written}
-          callHref={(id) => here(opened!.id, id)} />
-      ) : null}
+            </ol>
+          ) : <p className="dim">No actions asked for yet. Buttons here and on Connections send them to the engine.</p>}
+        </section>
+      </div>
     </main>
-  );
-}
-
-const clean = (v: string | null) => v?.trim() || null;
-const personName = (d: Delivery) => [clean(d.by_first), clean(d.by_last)].filter(Boolean).join(" ") || null;
-
-/** Z 3 · T 41, and how many of them failed. */
-function CallTally({ c }: { c: CallCount }) {
-  return (
-    <span className="tally">
-      {c.zuper ? <span>Z {c.zuper}</span> : null}
-      {c.tuper ? <span>T {c.tuper}</span> : null}
-      {c.failed ? <span className="bad">{c.failed} ✗</span> : null}
-    </span>
-  );
-}
-
-/**
- * Two short lines in one cell: who over their email, role over designation, employee code over user uid. All come
- * from the delivery's `triggered_by`, the person whose action fired it.
- */
-function Pair({ top, under, mono }: { top: React.ReactNode | string | null; under: string | null; mono?: boolean }) {
-  const a = typeof top === "string" ? clean(top) : top, b = clean(under);
-  if (!a && !b) return <span className="dim">—</span>;
-  return (
-    <span className="pair">
-      <span title={typeof a === "string" ? a : undefined}>{a ?? "—"}</span>
-      {b ? <span className={mono ? "note mono" : "note"} title={b}>{b}</span> : null}
-    </span>
-  );
-}
-
-function Tile({ n, label, tone }: { n: number; label: string; tone?: "ok" | "warn" | "bad" }) {
-  return (
-    <div className={`tile ${tone ?? ""}`}>
-      <strong>{n.toLocaleString()}</strong>
-      <span>{label}</span>
-    </div>
   );
 }

@@ -175,6 +175,10 @@ receiver.post("/", async (req: Request, res: Response) => {
 
   res.status(200).json({ ok: true, stored: eventId });
 
+  // Zuper → Tuper switched off on the dashboard: the delivery is stored and left unprocessed, so the replay applies it
+  // once the switch is on again. Nothing is lost by holding it.
+  if (!config.inbound) return;
+
   // ── after the ACK ──
   setImmediate(async () => {
     try {

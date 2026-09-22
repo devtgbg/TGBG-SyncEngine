@@ -43,6 +43,17 @@ const EVENTS: Record<string, (body: Record<string, any>) => Queued | null> = {
   "customer.delete": () => ({ entity: "customers", operation: "delete", changed: {} }),
 };
 
+/**
+ * The events this receiver acts on, for the dashboard's Connections page: what each queues, and the module the webhook
+ * has to be registered under in Tuper for its body to carry the record's uid.
+ */
+export function tuperEventCatalogue(): { event: string; entity: string; operation: string; module: string }[] {
+  return Object.entries(EVENTS).map(([event, rule]) => {
+    const q = rule({});
+    return { event, entity: q?.entity ?? "", operation: q?.operation ?? "", module: event.startsWith("job.") ? "JOB" : "CUSTOMER" };
+  });
+}
+
 /** The record a delivery is about, as Tuper names it. */
 function uidOf(event: string, body: Record<string, any>): string | null {
   const key = event.startsWith("job.") ? "job_uid" : event.startsWith("customer.") ? "customer_uid" : null;
@@ -110,6 +121,9 @@ tuperReceiver.post("/", async (req: Request, res: Response) => {
   if (!event) { await finish(stored, "the delivery names no event"); return; }
   const rule = EVENTS[event];
   if (!rule) { await finish(stored, `skipped: Zupersync does not push ${event} to Zuper`); return; }
+  // Pushing to Zuper switched off on the dashboard: nothing would ever send the change, so it is not queued. (Queued
+  // while off, 69 changes piled up in three days and had to be discarded by hand on 2026-09-22.)
+  if (config.push.mode === "off") { await finish(stored, "skipped: pushing to Zuper is off, so the change is not queued"); return; }
   if (!uid) {
     // Seen on 2026-09-17: Tuper builds job.new, job.update, job.delete and customer.* bodies from the webhook's
     // module, and leaves the uid out when that module is not one it knows (registered as JOBS instead of JOB).

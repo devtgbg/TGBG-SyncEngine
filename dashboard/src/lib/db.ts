@@ -40,6 +40,29 @@ async function q<T extends QueryResultRow>(text: string, values: unknown[] = [])
   return (await pool().query<T>(text, values)).rows;
 }
 
+/** A read, for the engine-control queries in lib/control.ts. */
+export const query = q;
+
+/**
+ * The only writes the dashboard makes: saving the settings and asking the engine for a command (lib/control.ts).
+ * Sessions are read-only by default; this opens one transaction that is explicitly READ WRITE, so a write can only
+ * happen here, never by accident in a page's query.
+ */
+export async function readWrite<T>(fn: (run: <R extends QueryResultRow>(text: string, values?: unknown[]) => Promise<R[]>) => Promise<T>): Promise<T> {
+  const client = await pool().connect();
+  try {
+    await client.query("BEGIN READ WRITE");
+    const out = await fn(async <R extends QueryResultRow>(text: string, values: unknown[] = []) => (await client.query<R>(text, values)).rows);
+    await client.query("COMMIT");
+    return out;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 export const tenantId = () => process.env.DEFAULT_TENANT_ID ?? "";
 
 /** The call log arrives with the service version that writes it; until then its table does not exist. */
@@ -490,32 +513,6 @@ export async function pushTotals(): Promise<Record<string, number>> {
   return Object.fromEntries(rows.map((r) => [r.status, r.n]));
 }
 
-// ── The service itself ───────────────────────────────────────────────────────
-
-export interface ServiceState {
-  ok: boolean;
-  push: { mode: "off" | "dry-run" | "live"; sentToZuper: string[]; plannedOnly: string[] } | null;
-}
-
-let lastState: { at: number; value: ServiceState | null } = { at: 0, value: null };
-
-/**
- * What the running service says about itself (its public /health): whether pushing to Zuper is on, and for what.
- * Asked at most every ten seconds; null when it cannot be reached, which the pages say rather than guess.
- */
-export async function serviceState(): Promise<ServiceState | null> {
-  if (Date.now() - lastState.at < 10_000) return lastState.value;
-  const base = (process.env.ZUPERSYNC_URL ?? "https://zupersync.golfbuggyguy.com").replace(/\/+$/, "");
-  let value: ServiceState | null = null;
-  try {
-    const res = await fetch(`${base}/health`, { cache: "no-store", signal: AbortSignal.timeout(3_000) });
-    const j = (await res.json()) as { ok?: boolean; push?: ServiceState["push"] };
-    value = { ok: j.ok === true, push: j.push ?? null };
-  } catch { /* unreachable: said on the page */ }
-  lastState = { at: Date.now(), value };
-  return value;
-}
-
 // ── Live updates ─────────────────────────────────────────────────────────────
 
 /** FNV-1a, 32-bit. A fingerprint only — nothing here needs to resist anyone. */
@@ -530,7 +527,40 @@ function fingerprint(s: string): string {
  * applied, failed or sent. The browser polls this instead of the page: one indexed query of ids and state columns, no
  * bodies, no customer data. Calls are only ever added, so the newest id is the whole story there.
  */
-export async function pulse(view: "deliveries" | "pushes" | "calls" | "writes"): Promise<string> {
+export type PulseView = "deliveries" | "pushes" | "calls" | "writes" | "overview" | "settings" | "connections";
+
+export async function pulse(view: PulseView): Promise<string> {
+  if (view === "overview" || view === "settings" || view === "connections") {
+    // One cheap row of maxima, hashed, of only what the page shows — Connections is the heaviest page and reads no
+    // calls, so the call log (which moves every few seconds) must not re-render it. Every page carries the engine's
+    // applied version and whether it is online, late or offline (liveness()'s 30s and 180s), for the badge in the bar:
+    // not the heartbeat itself, which moves every 5 seconds and is shown by a clock that ticks in the browser. Late
+    // counts in minutes, because its label says for how long.
+    const terms: Record<string, string> = {
+      settings: "(SELECT version FROM sync.settings WHERE tenant_id = $1)",
+      engine: `(SELECT applied_version::text || ' ' || CASE
+                  WHEN heartbeat_at > now() - interval '30 seconds' THEN 'online'
+                  WHEN heartbeat_at > now() - interval '180 seconds' THEN 'late ' || floor(extract(epoch FROM now() - heartbeat_at) / 60)
+                  ELSE 'offline' END FROM sync.engine WHERE tenant_id = $1)`,
+      commands: "(SELECT max(coalesce(finished_at, started_at, requested_at))::text || count(*) FROM sync.commands WHERE tenant_id = $1)",
+    };
+    if (view !== "settings") {
+      terms.delivery = "(SELECT max(id::text) FROM (SELECT id FROM sync.webhook_events WHERE tenant_id = $1 ORDER BY received_at DESC LIMIT 1) x)";
+      terms.processed = "(SELECT count(*) FROM sync.webhook_events WHERE tenant_id = $1 AND received_at > now() - interval '5 minutes' AND processed_at IS NOT NULL)";
+    }
+    if (view === "overview") {
+      terms.call = "(SELECT max(id) FROM sync.api_calls WHERE tenant_id = $1)";
+      terms.queued = "(SELECT count(*) FROM sync.outbox WHERE tenant_id = $1)";
+    }
+    if (view === "connections") terms.snapshots = "(SELECT max(taken_at)::text FROM sync.snapshots WHERE tenant_id = $1)";
+    try {
+      const [r] = await q(`SELECT ${Object.entries(terms).map(([k, v]) => `${v} AS ${k}`).join(", ")}`, [tenantId()]);
+      return fingerprint(JSON.stringify(r ?? {}));
+    } catch (err) {
+      if (missingTable(err)) return "none";
+      throw err;
+    }
+  }
   if (view === "calls" || view === "writes") {
     try {
       const table = view === "calls" ? "sync.api_calls" : "sync.tuper_writes";

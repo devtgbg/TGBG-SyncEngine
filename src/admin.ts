@@ -63,6 +63,11 @@ admin.post("/sync/:entity", async (req: Request, res: Response) => {
     res.status(404).json({ ok: false, error: `no such entity '${name}'`, entities: Object.keys(ENTITIES).sort() });
     return;
   }
+  // Zuper → Tuper switched off on the dashboard means nothing is written to Tuper, a re-sync asked for by hand included.
+  if (!config.inbound) {
+    res.status(409).json({ ok: false, error: "Zuper → Tuper is off in the dashboard's Settings" });
+    return;
+  }
   // Answer before the work: a full entity can take minutes, and the caller should not hold a socket open for it.
   res.status(202).json({ ok: true, started: name });
 

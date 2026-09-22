@@ -6,11 +6,11 @@
  * nothing else, so a poll never moves customer data.
  */
 
-import { pulse } from "@/lib/db";
+import { pulse, type PulseView } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
-const VIEWS = ["deliveries", "pushes", "calls", "writes"] as const;
+const VIEWS: PulseView[] = ["deliveries", "pushes", "calls", "writes", "overview", "settings", "connections"];
 
 export async function GET(req: Request) {
   const asked = new URL(req.url).searchParams.get("view");

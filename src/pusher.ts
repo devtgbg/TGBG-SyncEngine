@@ -48,6 +48,7 @@ import { config, errorText } from "./config.js";
 import { tuper as db } from "./tuper-client.js";
 import { sql } from "./store.js";
 import { logCall, withCause } from "./api-log.js";
+import { report } from "./settings.js";
 import { getSyncConfig, zuperGet, type SyncConfig } from "./lib/migration/zuper-sync.js";
 import { JOB_CREATE_LOCK, oneAtATime, setBeforeInbound } from "./processor.js";
 // The two modules import each other; both only define functions, so neither needs the other while loading.
@@ -853,18 +854,45 @@ let timer: NodeJS.Timeout | null = null;
 let running = false;
 let missingTableWarned = false;
 
+export const pusherRunning = () => timer !== null;
+
+/**
+ * An inbound sync rewrites a record's row from Zuper, so when any kind is live its pending edits are pushed first.
+ * Follows the settings: set while something is live, cleared otherwise.
+ */
+function followLive(): string[] {
+  const live = config.push.mode === "off" ? [] : Object.keys(PLANNERS).filter((e) => modeFor(config.push.mode, e) === "live");
+  setBeforeInbound(live.length ? (entity, uid) => pushRecordNow(entity, uid) : null);
+  return live;
+}
+
+/**
+ * Start the push loop, or bring it in line with the settings: each tick reads the mode then in force, so a change of
+ * mode or of the live kinds needs no restart. Safe to call again.
+ */
 export function startPusher(): void {
-  const mode = config.push.mode;
-  if (mode === "off") {
-    console.log("[zupersync] push to Zuper is OFF (PUSH_MODE=off) — changes made in Tuper stay in Tuper");
+  const live = followLive();
+  if (config.push.mode === "off") {
+    stopPusher();
+    console.log("[zupersync] push to Zuper is OFF — changes made in Tuper are not queued, and nothing is sent");
     return;
   }
+  const planOnly = Object.keys(PLANNERS).filter((e) => !live.includes(e));
+  console.log(`[zupersync] push to Zuper every ${config.push.everySeconds}s — ` +
+    (live.length ? `LIVE for ${live.join(", ")}` : "nothing is sent") +
+    (planOnly.length ? `; planned only (never sent): ${planOnly.join(", ")}` : "") +
+    `; on a conflict ${config.push.onConflict}`);
+  if (timer) return;
   timer = setInterval(async () => {
-    if (running) return;
+    const mode = config.push.mode;
+    if (running || mode === "off") return;
     running = true;
     try {
       const r = await withCause({ origin: "push" }, () => pushPending(mode));
-      if (r.jobs) console.log(`[zupersync] push (${mode}): ${r.jobs} record(s) — ${r.planned} planned, ${r.sent} sent, ${r.skipped} skipped, ${r.failed} failed${r.waiting ? `, ${r.waiting} waiting` : ""}`);
+      if (r.jobs) {
+        console.log(`[zupersync] push (${mode}): ${r.jobs} record(s) — ${r.planned} planned, ${r.sent} sent, ${r.skipped} skipped, ${r.failed} failed${r.waiting ? `, ${r.waiting} waiting` : ""}`);
+        report("push", { mode, ...r });
+      }
     } catch (err) {
       const msg = errorText(err);
       // Before migrations/0002 is applied the table does not exist; say so once.
@@ -879,19 +907,10 @@ export function startPusher(): void {
     }
   }, config.push.everySeconds * 1000);
   timer.unref?.();
-  const live = Object.keys(PLANNERS).filter((e) => modeFor(mode, e) === "live");
-  const planOnly = Object.keys(PLANNERS).filter((e) => !live.includes(e));
-  if (live.length) {
-    // An inbound sync rewrites the row from Zuper: push the record's pending edits first.
-    setBeforeInbound((entity, uid) => pushRecordNow(entity, uid));
-  }
-  console.log(`[zupersync] push to Zuper every ${config.push.everySeconds}s — ` +
-    (live.length ? `LIVE for ${live.join(", ")}` : "nothing is sent") +
-    (planOnly.length ? `; planned only (never sent): ${planOnly.join(", ")}` : "") +
-    `; on a conflict ${config.push.onConflict}`);
 }
 
 export function stopPusher(): void {
   if (timer) clearInterval(timer);
   timer = null;
+  setBeforeInbound(null);
 }
