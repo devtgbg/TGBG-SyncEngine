@@ -730,7 +730,9 @@ async function writeJobAssignments(ctx: Ctx, jobId: string, r: any, isNew: boole
       tenant_id: ctx.tenantId, job_id: jobId, user_id: userId, is_primary: a.is_primary === true,
       team_id: mapGet(teams, a.team?.team_uid),
       accepted_at: accepted ? at ?? ts(r.updated_at) ?? ts(r.created_at) : null,
-      ...(at ? { created_at: at } : {}),
+      // Every row names the column (one insert carries them all, and a row that left it out went as NULL and failed
+      // the job's whole insert — after its old rows were deleted); an assignment with no time of its own takes now.
+      created_at: at ?? new Date().toISOString(),
     });
   }
   const tbl = () => ctx.client.schema("jms").from("job_assignments");
@@ -2191,14 +2193,19 @@ ENTITIES.organization_fields = zuperFieldPass("organization_fields", "organizati
 // view — which only the by-uid read carries (the list leaves it out) and nothing imported. Kept as Zuper sends it; the
 // burden rate and comp code also fill Tuper's own columns.
 ENTITIES.user_details = {
-  name: "user_details", schema: "jms", table: "users", mapEntity: "users", enrichOnly: true, concurrency: 4,
+  name: "user_details", schema: "jms", table: "users", mapEntity: "users", enrichOnly: true, concurrency: 4, deps: ["access_roles"],
   pages: mappedUids("users", "user_uid"),
   uid: (r) => r.user_uid,
   async transform(r, ctx) {
     const d = (await zuperGet(ctx.cfg, `/api/user/${r.user_uid}`)).data ?? {};
-    if (!("meta_data" in d)) return {};
+    // The access role the person has in Zuper (owner OK 2026-09-22): it decides what they may do in Tuper too.
+    const access = "access_role" in d
+      ? { access_role_id: d.access_role?.access_role_uid ? mapGet(await ctxMap(ctx, "access_roles"), d.access_role.access_role_uid) : null }
+      : {};
+    if (!("meta_data" in d)) return access;
     const m = d.meta_data && typeof d.meta_data === "object" ? d.meta_data : null;
     return {
+      ...access,
       // An empty object where Zuper answers null (the column is NOT NULL); Tuper answers null for an empty one.
       meta_data: m ?? {},
       burden_rate: m?.burden_rate && typeof m.burden_rate === "object" && m.burden_rate.value != null ? num0(m.burden_rate.value) : null,
@@ -2543,7 +2550,15 @@ ENTITIES.job_people = {
   name: "job_people", schema: "jms", table: "jobs", mapEntity: "jobs", enrichOnly: true, concurrency: 8, deps: ["users", "teams"],
   pages: (ctx) => jobsByMonth(ctx.cfg),
   uid: (r) => r.job_uid,
-  async transform() { return {}; },
+  // On the job itself: its tags as the job's own column holds them (the job answers that column; the pass above only
+  // wrote the tag records), Zuper's own duration figure (Tuper 00204), and its territory.
+  async transform(r, ctx) {
+    return {
+      ...(Array.isArray(r.job_tags) ? { job_tags: r.job_tags.map((t: unknown) => T(t)).filter((t: string | null): t is string => Boolean(t)) } : {}),
+      ...sent(r, "actual_duration", "actual_duration", (v) => (v == null ? null : Math.round(num0(v)))),
+      ...("service_territory" in r ? { service_territory_id: await territoryId(ctx, r.service_territory) } : {}),
+    };
+  },
   async afterWrite(ctx, id, r) {
     if (Array.isArray(r.assigned_to)) await writeJobAssignments(ctx, id, r, false);
     if (Array.isArray(r.job_tags)) await setEntityTags(ctx.client, ctx.tenantId, "JOB", id, r.job_tags.map((t: unknown) => T(t)).filter((t: string | null): t is string => Boolean(t)));
@@ -2565,6 +2580,38 @@ ENTITIES.customer_tags = {
   uid: (r) => r.customer_uid,
   async transform() { return {}; },
   afterWrite: (ctx, id, r) => writeCustomerTags(ctx, id, r),
+};
+// Zuper's access roles (GBG: Super Admin, Technician, Mechanic, EXPO Technician) and the permissions each grants —
+// owner OK 2026-09-22. Zuper's API publishes the grants at /api/access_role_permission/{uid}; its permission keys are
+// Tuper's own (jms.permissions, the same names), so a grant is matched by key. A key Tuper's catalogue lacks
+// (Super Admin's legacy settings.custom_function) is left out. The role's grants are replaced as a whole.
+ENTITIES.access_roles = {
+  name: "access_roles", schema: "jms", table: "access_roles",
+  fetch: (ctx) => zuperGet(ctx.cfg, "/api/access_role?page=1&count=100").then((j) => j.data ?? []),
+  uid: (r) => r.access_role_uid,
+  async transform(r, ctx) {
+    return {
+      name: T(r.role_name) ?? "Role", description: T(r.role_description), is_active: r.is_active !== false,
+      created_by: mapGet(await ctxMap(ctx, "users"), r.created_by_user?.user_uid), ...createdAt(r),
+    };
+  },
+  async afterWrite(ctx, id, r) {
+    const grants: any[] = (await zuperGet(ctx.cfg, `/api/access_role_permission/${r.access_role_uid}`))?.data ?? [];
+    if (!ctx.extra.permissionIds) {
+      const { data, error } = await ctx.client.schema("jms").from("permissions").select("id, permission_key").eq("tenant_id", ctx.tenantId);
+      if (error) throw error;
+      ctx.extra.permissionIds = new Map(((data ?? []) as { id: string; permission_key: string }[]).map((p) => [p.permission_key, p.id]));
+    }
+    const perms: Map<string, string> = ctx.extra.permissionIds;
+    const ids = [...new Set(grants.map((g) => perms.get(String(g?.permissions?.permission_key ?? ""))).filter((x): x is string => Boolean(x)))];
+    const tbl = () => ctx.client.schema("jms").from("access_role_permissions");
+    const { error } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("access_role_id", id);
+    if (error) throw error;
+    if (ids.length) {
+      const { error: insErr } = await tbl().insert(ids.map((permission_id) => ({ tenant_id: ctx.tenantId, access_role_id: id, permission_id })));
+      if (insErr) throw insErr;
+    }
+  },
 };
 // Zuper's customer categories (Residential, Rental, Commercial … for GBG). Tuper's own of the same name are kept.
 ENTITIES.customer_categories = {
