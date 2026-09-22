@@ -733,7 +733,8 @@ async function provisionImportedUser(ctx: Ctx, payload: Record<string, unknown>,
     if (coreErr) { await ctx.client.auth.admin.deleteUser(id).catch(() => {}); throw coreErr; }
   }
   const users = () => ctx.client.schema("jms").from("users");
-  const gone = opts.inactive ? { is_deleted: true, deleted_at: new Date().toISOString() } : {};
+  // Removed only for being inactive (Tuper 00222): Tuper's API still lists them, as Zuper does.
+  const gone = opts.inactive ? { is_deleted: true, deleted_at: new Date().toISOString(), removed_as_inactive: true } : {};
   let ins = await users().insert({ ...payload, ...gone, id, tenant_id: ctx.tenantId });
   if (ins.error?.code === "23505" && payload.emp_code) ins = await users().insert({ ...payload, ...gone, emp_code: null, id, tenant_id: ctx.tenantId }); // emp code taken
   if (ins.error) {
@@ -3527,7 +3528,17 @@ async function writeChecklistResponse(ctx: Ctx, jobId: string, statusId: string,
 // Internal. Nobody is notified. A note by someone Tuper doesn't have (a customer, say) has no author.
 ENTITIES.notes = {
   name: "notes", schema: "jms", table: "entity_comments", deps: ["jobs", "requests", "assets", "customers", "projects", "purchase_orders", "users", "files"], concurrency: 16,
-  pages: (ctx) => zuperListPages(ctx.cfg, "/api/notes", 100),
+  // ZUPER_ONLY_MISSING takes up only the notes Tuper doesn't have yet (those whose record came over later — a deleted
+  // job, say); the rest of the list is read and passed over.
+  async *pages(ctx) {
+    const have = process.env.ZUPER_ONLY_MISSING ? await ctxMap(ctx, "notes") : null;
+    // include_deleted: Zuper's plain list leaves out its deleted notes (134 at GBG) and 165 more (39,649 of 39,948,
+    // 2026-09-22); each comes over with its own is_deleted.
+    for await (const page of zuperListPages(ctx.cfg, "/api/notes?include_deleted=true", 100)) {
+      const rows = have ? page.filter((r) => !have.has(String(r?.note_uid))) : page;
+      if (rows.length) yield rows;
+    }
+  },
   uid: (r) => r.note_uid,
   async transform(r, ctx) {
     const hosts: [string, string, unknown][] = [["job", "jobs", r.job?.job_uid], ["request", "requests", r.request?.request_uid], ["asset", "assets", r.asset?.asset_uid], ["customer", "customers", r.customer?.customer_uid], ["project", "projects", r.project?.project_uid], ["purchase_order", "purchase_orders", r.purchase_order?.purchase_order_uid]];
@@ -3842,6 +3853,29 @@ ENTITIES.customer_activity = recordActivity("customer_activity", "customers", "c
 ENTITIES.asset_activity = recordActivity("asset_activity", "assets", "assets", "ASSET", "asset", "asset_uid");
 ENTITIES.organization_activity = recordActivity("organization_activity", "organizations", "organizations", "ORGANIZATION", "organization", "organization_uid");
 ENTITIES.property_activity = recordActivity("property_activity", "properties", "properties", "PROPERTY", "property", "property_uid");
+/**
+ * Zuper's deleted customers and jobs (its lists with filter.is_deleted=true: 51 and 2,108), brought over deleted — so
+ * their notes, activity and history keep a record to belong to, and Tuper's deleted lists answer what Zuper's do (it
+ * held 5 and 310). Those lists leave is_deleted out of each row, and a missing key must never read as "live" (a list
+ * row once brought a deleted customer back), so it is said here.
+ */
+ENTITIES.deleted_customers = {
+  ...ENTITIES.customers, name: "deleted_customers", mapEntity: "customers",
+  pages: (ctx) => zuperListPages(ctx.cfg, "/api/customers?filter.is_deleted=true"),
+  async transform(r, ctx) {
+    const payload = await ENTITIES.customers.transform({ ...r, is_deleted: true }, ctx);
+    return payload ? { ...payload, is_deleted: true } : payload;
+  },
+};
+ENTITIES.deleted_jobs = {
+  ...ENTITIES.jobs, name: "deleted_jobs", mapEntity: "jobs",
+  pages: (ctx) => zuperListPages(ctx.cfg, "/api/jobs?filter.is_deleted=true"),
+  async transform(r, ctx) {
+    const payload = await ENTITIES.jobs.transform({ ...r, is_deleted: true }, ctx);
+    return payload ? { ...payload, is_deleted: true } : payload;
+  },
+  async afterWrite(ctx, id, r, isNew) { await ENTITIES.jobs.afterWrite!(ctx, id, { ...r, is_deleted: true }, isNew); },
+};
 // Every imported request's activity.
 ENTITIES.request_activity = {
   name: "request_activity", schema: "jms", table: "requests", mapEntity: "requests", enrichOnly: true, deps: ["users"], concurrency: 4,
@@ -3938,16 +3972,26 @@ export async function syncEntity(ctx: Ctx, name: string): Promise<{ fetched: num
     };
     // ZUPER_SYNC_CONCURRENCY runs a long pass wider than its default (records side by side).
     const n = Number(process.env.ZUPER_SYNC_CONCURRENCY) || e.concurrency || 1;
+    // ZUPER_ONLY_UIDS names a failed-records file (ZUPER_SYNC_FAILED_FILE's format): only this entity's records in it
+    // are taken up, the rest of the list is read and passed over.
+    let only: Set<string> | null = null;
+    if (process.env.ZUPER_ONLY_UIDS) {
+      const { readFileSync } = await import("node:fs");
+      only = new Set(readFileSync(process.env.ZUPER_ONLY_UIDS, "utf8").split(/\r?\n/).map((l) => l.split("\t")).filter((c) => c[0] === name && c[1]).map((c) => c[1]));
+      log(`only the ${only.size} records named in ${process.env.ZUPER_ONLY_UIDS}`);
+    }
+    const wanted = (batch: any[]) => only ? batch.filter((r) => { try { return only!.has(String(e.uid(r) ?? "")); } catch { return false; } }) : batch;
     let rows: any[] = [];
     if (e.pages) {
       let page = 0;
-      for await (const batch of e.pages(ctx)) {
+      for await (const all of e.pages(ctx)) {
+        const batch = wanted(all);
         fetched += batch.length;
         await inChunks(batch, n, one);
         if (++page % 10 === 0) log(`${fetched} fetched, ${upserted} upserted, ${failed} failed`);
       }
     } else {
-      rows = await e.fetch!(ctx); fetched = rows.length;
+      rows = wanted(await e.fetch!(ctx)); fetched = rows.length;
       await inChunks(rows, n, one);
     }
     if (e.afterAll) await e.afterAll(ctx, rows);
@@ -3989,7 +4033,8 @@ export async function runSync(client: SupabaseClient, tenantId: string, order: s
 
 /** Owner decision 2026-09-11: once Zuper customers are imported with their ids, soft-delete the legacy
  *  customers (old mirror migration — no Zuper id, no creator, heavily duplicated). Customers created in
- *  Tuper, and any legacy customer a live record still points at, are kept. */
+ *  Tuper, and any legacy customer a live record still points at, are kept. legacy_retired (Tuper 00221) keeps the
+ *  retired ones out of the API's list of deleted customers, which answers Zuper's deleted only. */
 export async function retireLegacyCustomers(client: SupabaseClient, tenantId: string): Promise<{ legacy: number; retired: number; keptInUse: number }> {
   const imported = new Set((await loadMap(client, tenantId, "customers")).values());
   if (imported.size === 0) throw new Error("import Zuper customers before retiring the legacy ones");
@@ -4015,7 +4060,7 @@ export async function retireLegacyCustomers(client: SupabaseClient, tenantId: st
   const retire = legacy.filter((id) => !inUse.has(id));
   const deletedAt = new Date().toISOString();
   for (let i = 0; i < retire.length; i += 200) {
-    const { error } = await client.schema("jms").from("customers").update({ is_deleted: true, deleted_at: deletedAt }).eq("tenant_id", tenantId).in("id", retire.slice(i, i + 200));
+    const { error } = await client.schema("jms").from("customers").update({ is_deleted: true, deleted_at: deletedAt, legacy_retired: true }).eq("tenant_id", tenantId).in("id", retire.slice(i, i + 200));
     if (error) throw error;
   }
   return { legacy: legacy.length, retired: retire.length, keptInUse: legacy.length - retire.length };
