@@ -1167,16 +1167,22 @@ async function contractPackageId(ctx: Ctx, p: any): Promise<string | null> {
     const row = {
       description: T(p.package_description), prefix: T(p.prefix), term_months: p.package_terms == null ? null : Math.trunc(num0(p.package_terms)),
       price: ((p.line_items ?? []) as any[]).reduce((sum, l) => sum + num0(l?.total), 0), is_active: p.is_deleted !== true,
+      // The package's own items as Zuper gives them (Tuper 00225).
+      ...(Array.isArray(p.line_items) ? { line_items: p.line_items } : {}),
     };
     const found = ((data ?? []) as { id: string }[])[0]?.id;
+    let id = found;
     if (found) {
       const { error: upErr } = await tbl().update(row).eq("tenant_id", ctx.tenantId).eq("id", found);
       if (upErr) throw upErr;
-      return found;
+    } else {
+      const made = await tbl().insert({ tenant_id: ctx.tenantId, name, ...row }).select("id").single();
+      if (made.error) throw made.error;
+      id = (made.data as { id: string }).id;
     }
-    const made = await tbl().insert({ tenant_id: ctx.tenantId, name, ...row }).select("id").single();
-    if (made.error) throw made.error;
-    return (made.data as { id: string }).id;
+    // Known by Zuper's uid, so the API answers it.
+    if (T(p.package_uid) && id) await setMap(ctx, "contract_packages", String(p.package_uid), id);
+    return id ?? null;
   });
 }
 /** The request source a request names, written from the request's own copy of it the first time a run sees it. The
@@ -1355,8 +1361,11 @@ async function documentTemplateId(ctx: Ctx, templateUid: unknown, embedded?: any
   const id = cache.get(uid) ?? null;
   if (id && embedded && typeof embedded === "object") {
     await once(ctx, `template_options:${uid}`, async () => {
+      // Its page border too, where Zuper gives one (Tuper 00225), as Zuper writes it.
+      const border = embedded.template_options?.border;
       const { error } = await ctx.client.schema("jms").from("document_templates")
-        .update({ page_options: "template_options" in embedded }).eq("tenant_id", ctx.tenantId).eq("id", id);
+        .update({ page_options: "template_options" in embedded, page_border: border && typeof border === "object" ? border : null })
+        .eq("tenant_id", ctx.tenantId).eq("id", id);
       if (error) throw error;
       return id;
     });
@@ -2263,6 +2272,18 @@ export const ENTITIES: Record<string, Entity> = {
         ...sent(r, "discount", "discount_setting", (v) => (v && typeof v === "object" ? v : null)),
         ...sent(r, "remarks", "remarks", (v) => T(v)),
         ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...ownTimes(r),
+        // Zuper's fields Tuper has no column for, where the invoice carries them (Tuper 00224).
+        extra: (() => {
+          const x: Record<string, unknown> = pickKeys(r, ["assets", "auto_charge", "secondary_customers"]) ?? {};
+          if (r.taxation_meta && typeof r.taxation_meta === "object" && "tax_provider" in r.taxation_meta) x.tax_provider = r.taxation_meta.tax_provider;
+          const flags: Record<string, unknown> = {};
+          for (const f of Array.isArray(r.custom_fields) ? r.custom_fields : []) {
+            const kept = pickKeys(f, ["hide_field", "read_only"]);
+            if (kept && T(f?.label)) flags[String(f.label)] = kept;
+          }
+          if (Object.keys(flags).length) x.custom_field_flags = flags;
+          return Object.keys(x).length ? x : null;
+        })(),
       };
     },
     async afterWrite(ctx, id, r, isNew) {
