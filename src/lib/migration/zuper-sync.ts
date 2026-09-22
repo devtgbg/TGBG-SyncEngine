@@ -241,6 +241,9 @@ const dubaiDate = (v: any): string | null => {
 };
 const stripHtml = (v: any): string | null => T(String(v ?? "").replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " "));
 const createdAt = (r: any) => (r?.created_at ? { created_at: String(r.created_at) } : {});
+/** A job's parent as Zuper names it: a uid in its list, the parent job itself ({ job_uid, … }) in its single read — which
+ *  the import read as a uid, so a child job that came by event (an AMC visit) lost its parent. */
+const parentJobUid = (p: any): string | null => (typeof p === "string" ? T(p) : T(p?.job_uid));
 /**
  * One of Zuper's three roles (Admin, Team Leader, Field Executive) as a person or an assignee carries it: Tuper's role
  * of the same key is mapped to Zuper's uid, and where the role carries its dates (a job's assignee does; Zuper made all
@@ -798,6 +801,8 @@ async function writeJobHistory(ctx: Ctx, jobId: string, r: any, isNew: boolean):
       // made. Every row names every column: one insert carries the job's whole timeline.
       eta: T(s.eta), facial_auth_status: T(s.facial_auth_status),
       time_on_status_tracked: "time_on_status" in s,
+      // Whether the change names its status's category (Zuper's timeline does from May 2026 on; Tuper 00210).
+      category_named: "category" in s,
       time_on_status: s.time_on_status == null ? null : Math.round(num0(s.time_on_status)),
       checklist_internal_object: s.checklist_internal_object && typeof s.checklist_internal_object === "object" ? s.checklist_internal_object : null,
       ...geoPoint(s.geo_cordinates),
@@ -1981,7 +1986,7 @@ export const ENTITIES: Record<string, Entity> = {
       const customer_id = await customerId(ctx, r.customer);
       const organization_id = await organizationId(ctx, r.organization);
       if (!customer_id && !organization_id) throw new Error(`${label}: no customer or organization`);
-      if (r.parent_job) (ctx.extra.jobParents ??= []).push([r.job_uid, r.parent_job]);
+      if (parentJobUid(r.parent_job)) (ctx.extra.jobParents ??= []).push([r.job_uid, parentJobUid(r.parent_job)]);
       const custOrg = r.customer?.customer_organization?.organization_uid;
       if (r.customer?.customer_uid && custOrg) (ctx.extra.customerOrgs ??= new Map()).set(r.customer.customer_uid, custOrg);
       const priority = String(r.job_priority ?? "").toUpperCase();
@@ -2061,7 +2066,8 @@ export const ENTITIES: Record<string, Entity> = {
       r.assigned_to_team = d.assigned_to_team;
       r.job_tags = d.job_tags;
       const description = T(d.plain_text_description) ?? stripHtml(d.job_description);
-      const parent = d.parent_job && d.parent_job !== r.job_uid ? mapGet(await ctxMap(ctx, "jobs"), d.parent_job) : null;
+      const parentUid = parentJobUid(d.parent_job);
+      const parent = parentUid && parentUid !== r.job_uid ? mapGet(await ctxMap(ctx, "jobs"), parentUid) : null;
       // Category + current status as Zuper has them now — also fills jobs whose status wasn't known.
       const category = await jobCategoryId(ctx, d.job_category);
       const status = await jobStatusId(ctx, d.current_job_status, category);
@@ -3389,7 +3395,12 @@ async function writeChecklistResponse(ctx: Ctx, jobId: string, statusId: string,
     // Unanswered: "" where Zuper answers "", no value where it answers null (the API answers each back as it came).
     const col = raw ? await answerColumn(ctx, jobId, f, raw, by, at, typeof c.answer === "string" ? c.answer : raw) : null;
     // Its place in the checklist as the change had it (00206): the checklist has been reordered and pruned since.
+    // And its own meta_data as Zuper keeps it (the description as it stood, selected_values, a picture's attachment
+    // details, a signature's name — 00210).
     answers.push({ tenant_id: ctx.tenantId, form_field_id: f.id, position, value_text: null, value_number: null, value_date: null, value_json: null, file_url: null,
+      // false where Zuper sends none (462 of 972 answers read), so the API leaves the key out rather than answering the
+      // question's description, which an answer given in Tuper (meta null) does.
+      meta: c.meta_data && typeof c.meta_data === "object" ? c.meta_data : false,
       ...(col ?? (c.answer === "" ? { value_text: "" } : {})) });
   }
   if (!answers.length) return null;
