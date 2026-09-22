@@ -242,6 +242,9 @@ const dubaiDate = (v: any): string | null => {
 };
 const stripHtml = (v: any): string | null => T(String(v ?? "").replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " "));
 const createdAt = (r: any) => (r?.created_at ? { created_at: String(r.created_at) } : {});
+/** A record's own times as Zuper has them, created and last changed; the ten main record tables keep a written
+ *  updated_at (Tuper 00220), so a re-import no longer makes every record look changed that day. */
+const ownTimes = (r: any) => ({ ...createdAt(r), ...(r?.updated_at ? { updated_at: String(r.updated_at) } : {}) });
 /** A job's parent as Zuper names it: a uid in its list, the parent job itself ({ job_uid, … }) in its single read — which
  *  the import read as a uid, so a child job that came by event (an AMC visit) lost its parent. */
 const parentJobUid = (p: any): string | null => (typeof p === "string" ? T(p) : T(p?.job_uid));
@@ -534,14 +537,14 @@ export function customerFields(r: any): Record<string, unknown> {
     // deleted customers (filter.is_deleted=true) sends rows without the key — so feeding one of those rows back
     // un-deleted a customer Zuper had deleted. It happened once, on 2026-09-21, and was put back by hand.
     ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
-    ...createdAt(r),
+    ...ownTimes(r),
   };
 }
 function organizationFields(r: any): Record<string, unknown> {
   return {
     name: T(r.organization_name) ?? "Organization", email: T(r.organization_email),
     description: T(r.plain_text_description) ?? stripHtml(r.organization_description), plain_text_description: T(r.plain_text_description),
-    tax_exempt: r.tax?.tax_exempt === true, is_active: r.is_active !== false, ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
+    tax_exempt: r.tax?.tax_exempt === true, is_active: r.is_active !== false, ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...ownTimes(r),
   };
 }
 /** The jms customer for an embedded Zuper customer — created on the spot when the customer list lacks
@@ -1074,6 +1077,12 @@ function quoteState(r: any): Record<string, unknown> {
     } : {}),
   };
 }
+/** The keys of `r` among `keys`, as given; null when it has none of them. */
+function pickKeys(r: any, keys: string[]): Record<string, unknown> | null {
+  const out: Record<string, unknown> = {};
+  for (const k of keys) if (r && typeof r === "object" && k in r) out[k] = r[k];
+  return Object.keys(out).length ? out : null;
+}
 /** A quote's Zuper status_history → jms.quote_status_history (00107), replacing the imported rows and keeping any
  *  Tuper made after the import. Nothing is touched when Zuper returned no history. */
 async function writeQuoteStatusHistory(ctx: Ctx, quoteId: string, history: any[] | undefined): Promise<void> {
@@ -1089,6 +1098,8 @@ async function writeQuoteStatusHistory(ctx: Ctx, quoteId: string, history: any[]
       tenant_id: ctx.tenantId, quote_id: quoteId, status, remarks: T(h.remarks),
       changed_by: String(h.done_by_type ?? "EMPLOYEE").toUpperCase() === "EMPLOYEE" ? mapGet(users, h.done_by?.user_uid) : null,
       changed_at: String(h.created_at), source: "zuper",
+      // What the change carries beside (Tuper 00219), as Zuper gives it.
+      extra: pickKeys(h, ["line_items_status", "attachments", "customer_signature"]),
     }));
   if (rows.length) { const { error } = await tbl().insert(rows); if (error) throw error; }
 }
@@ -1665,6 +1676,8 @@ export const ENTITIES: Record<string, Entity> = {
         // The list's "Part / Service No" is the prefix and the part number together ("AMCJGE SERAMCJGE1").
         name: S(r.product_name) ?? "Product", sku: [T(r.prefix), T(r.product_id)].filter(Boolean).join(" ") || null, product_no: N(r.product_no),
         description: S(r.plain_text_description ?? r.product_description),
+        // The description as typed (Tuper 00218): tabs and line breaks the plain copy loses (498 of 2,074 parts).
+        description_as_entered: typeof r.product_description === "string" ? r.product_description : null,
         product_type, service_type: r.service_type ? String(r.service_type).toUpperCase() === "HOURLY" ? "HOURLY" : "FIXED" : null,
         unit_price: N(r.price) ?? 0, unit_cost: N(r.purchase_price), is_available: r.is_available !== false, is_billable: r.is_billable !== false,
         category_id: r.product_category?.category_uid ? catMap.get(r.product_category.category_uid) ?? null : null,
@@ -1676,7 +1689,7 @@ export const ENTITIES: Record<string, Entity> = {
         markdown_description: typeof r.markdown_description === "string" ? r.markdown_description : null,
         low_stock: typeof r.low_stock === "boolean" ? r.low_stock : null,
         barcode: T(r.product_barcode), image_url: T(r.product_image), is_tax_exempt: r.tax?.tax_exempt === true,
-        created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid), ...createdAt(r),
+        created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid), ...ownTimes(r),
       };
     },
     afterWrite: (ctx, id, r) => writeProductStockAndFields(ctx, id, r),
@@ -1816,7 +1829,7 @@ export const ENTITIES: Record<string, Entity> = {
         is_active: r.is_active !== false,
         ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
-        ...createdAt(r),
+        ...ownTimes(r),
       };
     },
     afterWrite: (ctx, id, r, isNew) => writePropertyParts(ctx, id, r, isNew),
@@ -1920,7 +1933,7 @@ export const ENTITIES: Record<string, Entity> = {
         organization_id: await organizationId(ctx, r.organization),
         parent_asset_id: mapGet(await ctxMap(ctx, "assets"), r.parent_asset?.asset_uid),
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
-        is_active: r.is_active !== false, ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
+        is_active: r.is_active !== false, ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...ownTimes(r),
       };
     },
     async afterWrite(ctx, id, r) {
@@ -1965,7 +1978,7 @@ export const ENTITIES: Record<string, Entity> = {
         ...sent(r, "discount", "discount_setting", (v) => (v && typeof v === "object" ? v : null)),
         ...sent(r, "tax_exempt", "tax_exempt", (v) => v === true),
         ...sent(r, "non_billable_total", "non_billable_total", (v) => (v == null ? null : num0(v))),
-        is_active: r.is_active !== false && r.is_expired !== true, ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
+        is_active: r.is_active !== false && r.is_expired !== true, ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...ownTimes(r),
       };
     },
     async afterWrite(ctx, id, r, isNew) {
@@ -2008,7 +2021,7 @@ export const ENTITIES: Record<string, Entity> = {
         // Zuper stores the flag: 4 of GBG's 8 requests are converted with no job to show for it.
         ...sent(r, "is_converted", "is_converted", (v) => (v == null ? null : v === true)),
         request_source: T(r.request_source?.request_source_name),
-        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
+        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...ownTimes(r),
       };
     },
     async afterWrite(ctx, id, r, isNew) {
@@ -2058,7 +2071,7 @@ export const ENTITIES: Record<string, Entity> = {
         service_territory_id: await territoryId(ctx, r.service_territory),
         service_address: zAddress(r.customer_address), billing_address: zAddress(r.customer_billing_address),
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
-        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
+        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...ownTimes(r),
       };
     },
     async afterWrite(ctx, id, r, isNew) {
@@ -2124,6 +2137,8 @@ export const ENTITIES: Record<string, Entity> = {
         ...(category ? { category_id: category } : {}),
         ...(status ? { current_status_id: status, current_status_color: hexColor(d.current_job_status?.status_color) } : {}),
         is_recurring: d.is_recurrence === true,
+        // Zuper's own last change, so this write keeps it (Tuper 00220).
+        ...(d.updated_at ? { updated_at: String(d.updated_at) } : {}),
         job_skills: ((d.skills ?? []) as any[]).map((s) => T(s?.skill_name)).filter(Boolean),
         // Its tags as the job's own column holds them and Zuper's own duration figure (00204), as job_people writes them
         // from the list: one pass over every job brings both.
@@ -2170,6 +2185,14 @@ export const ENTITIES: Record<string, Entity> = {
         tax_exempt: r.tax_exempt === true, is_converted: r.is_converted === true, accepted_date: ts(r.accepted_date),
         converted_date: ts(r.converted_date),
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
+        // Zuper's fields Tuper has no column for, where the quote carries them (Tuper 00219).
+        extra: (() => {
+          // is_expired is Zuper's stored flag, not a rule Tuper can recompute (archived quotes: 8 flagged, 2 not; one
+          // sent quote past its date not flagged).
+          const x = pickKeys(r, ["vendor", "pending_option_selection", "payment_methods", "surcharge", "await_signature_by", "signatures", "discount_breakups", "option_groups", "assets", "cpq_status", "is_expired"]) ?? {};
+          if (r.deposit && typeof r.deposit === "object" && "credits" in r.deposit) x.deposit_credits = r.deposit.credits;
+          return Object.keys(x).length ? x : null;
+        })(),
         // Zuper's Quote Details: prefix + number ("JGE33"), title, reference, sold by, tags, template, rich description.
         prefix: T(r.prefix), title: T(r.proposal_title), reference_no: T(r.reference_no),
         sold_by: mapGet(await ctxMap(ctx, "users"), (r.sold_by_user ?? r.sold_by)?.user_uid),
@@ -2178,7 +2201,7 @@ export const ENTITIES: Record<string, Entity> = {
         description_html: T(r.estimate_description),
         deposit_amount: r.deposit?.total == null ? null : num0(r.deposit.total), deposit_status: T(r.deposit?.status),
         ...quoteState(r),
-        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
+        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...ownTimes(r),
       };
     },
     async afterWrite(ctx, id, r, isNew) {
@@ -2223,7 +2246,7 @@ export const ENTITIES: Record<string, Entity> = {
         ...sent(r, "financing", "financing_enabled", (v) => v?.is_enabled === true),
         ...sent(r, "discount", "discount_setting", (v) => (v && typeof v === "object" ? v : null)),
         ...sent(r, "remarks", "remarks", (v) => T(v)),
-        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...createdAt(r),
+        ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...ownTimes(r),
       };
     },
     async afterWrite(ctx, id, r, isNew) {
@@ -2409,6 +2432,8 @@ ENTITIES.customer_details = {
     // Only what Zuper's by-uid read says (owner OK 2026-09-21 to re-read every customer). A key the answer leaves out
     // is left alone, so a customer Zuper answers nothing for is not blanked.
     return {
+      // Zuper's own last change, so this write keeps it (Tuper 00220).
+      ...(d.updated_at ? { updated_at: String(d.updated_at) } : {}),
       ...(n && typeof n === "object" ? { notifications: { email: n.email !== false, sms: n.sms === true, call: n.call === true } } : {}),
       ...sent(d, "customer_description", "description", (v) => T(v)),
       ...sent(d, "plain_text_description", "plain_text_description", (v) => T(v)),
@@ -2601,7 +2626,8 @@ async function writeProductStockAndFields(ctx: Ctx, productId: string, r: any): 
   for (const a of (r.location_availability ?? []) as any[]) {
     const locationId = await stockLocationId(ctx, a.location, a.location?.is_deleted !== true);
     if (!locationId) continue;
-    stock.set(locationId, { tenant_id: ctx.tenantId, product_id: productId, location_id: locationId, quantity: num0(a.quantity), min_quantity: num0(a.min_quantity), serial_nos: ((a.serial_nos ?? []) as unknown[]).map(String) });
+    // When the part was first stocked there, as Zuper has it.
+    stock.set(locationId, { tenant_id: ctx.tenantId, product_id: productId, location_id: locationId, quantity: num0(a.quantity), min_quantity: num0(a.min_quantity), serial_nos: ((a.serial_nos ?? []) as unknown[]).map(String), created_at: a.created_at ? String(a.created_at) : new Date().toISOString() });
   }
   if (stock.size) {
     const { error } = await ctx.client.schema("jms").from("product_locations").upsert([...stock.values()], { onConflict: "product_id,location_id" });
@@ -2686,6 +2712,7 @@ ENTITIES.job_people = {
     return {
       ...(Array.isArray(r.job_tags) ? { job_tags: r.job_tags.map((t: unknown) => T(t)).filter((t: string | null): t is string => Boolean(t)) } : {}),
       ...sent(r, "actual_duration", "actual_duration", (v) => (v == null ? null : Math.round(num0(v)))),
+      ...(r.updated_at ? { updated_at: String(r.updated_at) } : {}),
       ...("service_territory" in r ? { service_territory_id: await territoryId(ctx, r.service_territory) } : {}),
     };
   },
