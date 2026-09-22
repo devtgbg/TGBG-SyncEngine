@@ -750,7 +750,29 @@ async function provisionImportedUser(ctx: Ctx, payload: Record<string, unknown>,
   return id;
 }
 
-/** Assigned users (those Tuper has; inactive staff are imported too since 2026-09-15) → jms.job_assignments. */
+/**
+ * A person a job names (its creator, an assignee) whom Tuper doesn't have: Zuper's user list leaves deleted people out,
+ * but still answers them by uid, so one is read and imported the first time a job names them — as deleted or inactive,
+ * like the rest (provisionImportedUser). Null when Zuper has no such person (or no email to sign them up by). Their own
+ * creator is not chased: createdByField only links people already here.
+ */
+async function userOnSight(ctx: Ctx, u: any): Promise<string | null> {
+  const uid = T(u?.user_uid);
+  if (!uid) return null;
+  const known = mapGet(await ctxMap(ctx, "users"), uid);
+  if (known) return known;
+  return once(ctx, `user:${uid}`, async () => {
+    const full = (await zuperGet(ctx.cfg, `/api/user/${uid}`).catch(() => null))?.data;
+    if (!full?.user_uid || !T(full.email)) return null;
+    const payload = await ENTITIES.users.transform!(full, ctx);
+    if (!payload) return null;
+    const id = await provisionImportedUser(ctx, payload, full, full.is_deleted === true ? { deleted: true } : { inactive: full.is_active === false });
+    await setMap(ctx, "users", uid, id);
+    return id;
+  });
+}
+
+/** Assigned users → jms.job_assignments; one Tuper doesn't have yet is imported on sight (userOnSight). */
 async function writeJobAssignments(ctx: Ctx, jobId: string, r: any, isNew: boolean): Promise<void> {
   const users = await ctxMap(ctx, "users");
   const teams = await ctxMap(ctx, "teams");
@@ -759,7 +781,7 @@ async function writeJobAssignments(ctx: Ctx, jobId: string, r: any, isNew: boole
   for (const a of r.assigned_to ?? []) {
     // An assignee's role carries Zuper's dates for it (writeRole).
     await writeRole(ctx, a.user?.role);
-    const userId = mapGet(users, a.user?.user_uid);
+    const userId = mapGet(users, a.user?.user_uid) ?? (await userOnSight(ctx, a.user));
     if (!userId || seen.has(userId)) continue;
     seen.add(userId);
     // When Zuper assigned them (older assignments carry no time; the row's own time stands then), the team they were
@@ -773,7 +795,7 @@ async function writeJobAssignments(ctx: Ctx, jobId: string, r: any, isNew: boole
       accepted_at: accepted ? at ?? ts(r.updated_at) ?? ts(r.created_at) : null,
       // Every row names the column (one insert carries them all, and a row that left it out went as NULL and failed
       // the job's whole insert — after its old rows were deleted); an assignment with no time of its own takes now.
-      created_at: at ?? new Date().toISOString(),
+      created_at: at ?? ts(r.created_at) ?? new Date().toISOString(),
     });
   }
   const tbl = () => ctx.client.schema("jms").from("job_assignments");
@@ -2109,7 +2131,7 @@ export const ENTITIES: Record<string, Entity> = {
         job_skills: ((r.skills ?? []) as any[]).map((s) => T(s?.skill_name)).filter(Boolean),
         service_territory_id: await territoryId(ctx, r.service_territory),
         service_address: zAddress(r.customer_address), billing_address: zAddress(r.customer_billing_address),
-        created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
+        created_by: await userOnSight(ctx, r.created_by),
         ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}), ...ownTimes(r),
       };
     },
@@ -2157,6 +2179,10 @@ export const ENTITIES: Record<string, Entity> = {
     uid: (r) => r.job_uid,
     async transform(r, ctx) {
       const d = (await zuperGet(ctx.cfg, `/api/jobs/${r.job_uid}`)).data ?? {};
+      // The job's own times: an accepted assignment with no time of its own is dated by them (writeJobAssignments).
+      // Without them every such assignment read as waiting and was dated the day of the re-read.
+      r.created_at = d.created_at;
+      r.updated_at = d.updated_at;
       r.custom_fields = d.custom_fields;
       r.customer = d.customer;
       r.job_status = d.job_status;
@@ -2176,6 +2202,9 @@ export const ENTITIES: Record<string, Entity> = {
         ...(category ? { category_id: category } : {}),
         ...(status ? { current_status_id: status, current_status_color: hexColor(d.current_job_status?.status_color) } : {}),
         is_recurring: d.is_recurrence === true,
+        // Who made the job. The list pass ran before inactive and deleted staff were in Tuper, and 2,311 jobs were
+        // left with no creator; one Tuper doesn't have yet is imported on sight.
+        ...(await (async () => { const by = await userOnSight(ctx, d.created_by); return by ? { created_by: by } : {}; })()),
         // Zuper's own last change, so this write keeps it (Tuper 00220).
         ...(d.updated_at ? { updated_at: String(d.updated_at) } : {}),
         // The job's own fields as Zuper has them now — its schedule above all. Six jobs Zuper moved on 2026-09-15 kept
