@@ -870,8 +870,10 @@ async function writeLineItems(ctx: Ctx, parentType: "QUOTE" | "INVOICE" | "CONTR
  * hide_to_fe, hide_field, read_only, module_name, ref_uid, group_name, group_uid, _id — which vary value by value. The
  * value and its meta_data go in their own columns.
  */
-function fieldShape(f: any): Record<string, unknown> {
-  const out: Record<string, unknown> = { keys: Object.keys(f ?? {}) };
+function fieldShape(f: any, position?: number): Record<string, unknown> {
+  // Where the value sits in the record's own list: Zuper orders a record's fields its own way (an asset's are not in
+  // the account's order of definitions), so the list is answered in this order.
+  const out: Record<string, unknown> = { keys: Object.keys(f ?? {}), ...(position === undefined ? {} : { position }) };
   for (const k of ["type", "hide_to_fe", "hide_field", "read_only", "module_name", "ref_uid", "group_name", "group_uid", "_id"]) {
     if (f && k in f) out[k] = f[k];
   }
@@ -898,7 +900,7 @@ async function writeCustomFieldValues(ctx: Ctx, entityType: string, entityId: st
     rows.push({
       tenant_id: ctx.tenantId, definition_id: def.id, entity_type: entityType, entity_id: entityId,
       value_text: dated || multi ? null : value ?? "", value_date: dated ? value : null, value_json: multi ? (value ? [value] : []) : null,
-      shape: fieldShape(f), meta_data: f && typeof f === "object" && "meta_data" in f ? f.meta_data : null,
+      shape: fieldShape(f, fields.indexOf(f)), meta_data: f && typeof f === "object" && "meta_data" in f ? f.meta_data : null,
     });
   }
   if (rows.length) {
@@ -1043,8 +1045,8 @@ async function writeZuperCustomFields(ctx: Ctx, entityType: string, entityId: st
       value_text: dated ? null : def.field_type === "MULTI_SELECTION" || def.field_type === "DATA_TABLE" ? null : value ?? "",
       value_number: null, value_date: dated ? value : null, value_bool: null,
       value_json: def.field_type === "MULTI_SELECTION" || def.field_type === "DATA_TABLE" ? (value ? [value] : []) : null,
-      // How Zuper gave the value, and its meta_data (Tuper 00226).
-      shape: fieldShape(f), meta_data: f && typeof f === "object" && "meta_data" in f ? f.meta_data : null,
+      // How Zuper gave the value, where it sits in the record's list, and its meta_data (Tuper 00226).
+      shape: fieldShape(f, list.indexOf(f)), meta_data: f && typeof f === "object" && "meta_data" in f ? f.meta_data : null,
     });
   }
   // Zuper lists the fields the RECORD has, empty ones among them (a customer with one Zoho id answers one field, not
