@@ -19,6 +19,7 @@ import { addDays as addDaysYmd, cleanFileName, kindOf } from "../helpers";
 import { sanitizeRichText, richTextToPlain } from "../rich-text";
 import { one as storeOne, sql as storeSql } from "../../store.js";
 import { logCall } from "../../api-log.js";
+import { randomUUID } from "node:crypto";
 
 export interface SyncConfig { api_key: string | null; api_base: string; company: string | null; enabled: boolean; interval_hours: number; last_run_at: string | null; next_run_at: string | null; is_syncing: boolean }
 
@@ -599,7 +600,7 @@ async function jobCategoryId(ctx: Ctx, c: any): Promise<string | null> {
 async function jobStatusId(ctx: Ctx, s: any, categoryId: string | null): Promise<string | null> {
   const uid = s?.status_uid;
   if (!uid) return null;
-  const have = (await ctxMap(ctx, "job_statuses")).get(uid);
+  const have = (await ctxMap(ctx, "job_statuses")).get(uid) ?? (await ctxMap(ctx, "job_status_aliases")).get(uid);
   if (have) return have;
   if (!categoryId) return null;
   return once(ctx, `job_statuses:${uid}`, async () => {
@@ -609,8 +610,15 @@ async function jobStatusId(ctx: Ctx, s: any, categoryId: string | null): Promise
     let res = await statuses()
       .insert({ tenant_id: ctx.tenantId, category_id: categoryId, name, status_type: JOB_STATUS_TYPES.has(type) ? type : "OTHER", color: T(s.status_color), display_order: 999, is_active: false })
       .select("id").single();
-    // A same-named status already in the category (an older Zuper status id) is that status.
-    if (res.error?.code === "23505") res = await statuses().select("id").eq("tenant_id", ctx.tenantId).eq("category_id", categoryId).eq("name", name).limit(1).single();
+    // A same-named status already in the category (an older Zuper status id) is that status — kept as an alias, so the
+    // status still answers its live uid: mapped under job_statuses too, a status had two uids and answered either
+    // (16 did, 2026-09-22).
+    if (res.error?.code === "23505") {
+      res = await statuses().select("id").eq("tenant_id", ctx.tenantId).eq("category_id", categoryId).eq("name", name).limit(1).single();
+      if (res.error) throw res.error;
+      await setMap(ctx, "job_status_aliases", uid, (res.data as { id: string }).id);
+      return (res.data as { id: string }).id;
+    }
     if (res.error) throw res.error;
     await setMap(ctx, "job_statuses", uid, (res.data as { id: string }).id);
     return (res.data as { id: string }).id;
@@ -803,6 +811,8 @@ async function writeJobHistory(ctx: Ctx, jobId: string, r: any, isNew: boolean):
       time_on_status_tracked: "time_on_status" in s,
       // Whether the change names its status's category (Zuper's timeline does from May 2026 on; Tuper 00210).
       category_named: "category" in s,
+      // When it reached Zuper's server (Tuper 00215); an offline change syncs after it was made.
+      synced_at: s.synced_at ? String(s.synced_at) : null,
       time_on_status: s.time_on_status == null ? null : Math.round(num0(s.time_on_status)),
       checklist_internal_object: s.checklist_internal_object && typeof s.checklist_internal_object === "object" ? s.checklist_internal_object : null,
       ...geoPoint(s.geo_cordinates),
@@ -1404,10 +1414,35 @@ export const ENTITIES: Record<string, Entity> = {
     name: "job_categories", schema: "jms", table: "job_categories",
     fetch: (ctx) => zuperGet(ctx.cfg, "/api/jobs/category").then((j) => j.data ?? []),
     uid: (r) => r.category_uid,
-    async transform(r) {
+    async transform(r, ctx) {
       const d = r.estimated_duration ?? {};
       const mins = (Number(d.days) || 0) * 1440 + (Number(d.hours) || 0) * 60 + (Number(d.minutes) || 0);
-      return { name: S(r.category_name) ?? "Category", color: S(r.category_color), display_order: N(r.display_order) ?? 0, estimated_duration_minutes: mins || null, is_active: r.is_active !== false };
+      return {
+        name: S(r.category_name) ?? "Category", color: S(r.category_color), display_order: N(r.display_order) ?? 0, estimated_duration_minutes: mins || null, is_active: r.is_active !== false,
+        // The rest of Zuper's category (API comparison, 2026-09-22): its description, who made it and when, whether its
+        // jobs can be dispatched and which timers they run — Tuper answered all three timers on and dispatchable.
+        description: T(r.category_description),
+        ...("is_dispatchable" in (r ?? {}) ? { is_dispatchable: r.is_dispatchable !== false } : {}),
+        ...(r.job_timelog && typeof r.job_timelog === "object" ? {
+          enable_labor_time: r.job_timelog.job_timer !== false, enable_travel_time: r.job_timelog.travel_timer !== false,
+          enable_meal_break_time: r.job_timelog.meal_break_timer !== false,
+        } : {}),
+        created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
+        ...createdAt(r), ...(r.updated_at ? { updated_at: String(r.updated_at) } : {}),
+      };
+    },
+    // A category Zuper's list no longer names is retired there: not deleted (its record reads is_deleted false and its
+    // jobs keep it — "Flat Tyre" has 327), but no list or picker offers it. 12 of GBG's were still offered in Tuper
+    // (2026-09-22). They stay on their jobs, inactive; one that comes back to the list is active again (transform).
+    async afterAll(ctx, rows) {
+      if (!rows.length) return;
+      const listed = new Set(rows.map((r) => String(r.category_uid)));
+      const gone = [...(await ctxMap(ctx, "job_categories")).entries()].filter(([uid]) => !listed.has(uid)).map(([, id]) => id);
+      for (let i = 0; i < gone.length; i += 50) {
+        const { error } = await ctx.client.schema("jms").from("job_categories").update({ is_active: false })
+          .eq("tenant_id", ctx.tenantId).in("id", gone.slice(i, i + 50));
+        if (error) throw error;
+      }
     },
   },
   // Each synced category's status workflow (GET /api/jobs/status/{category_uid}), in Zuper's order,
@@ -1836,6 +1871,8 @@ export const ENTITIES: Record<string, Entity> = {
       const empCode = T(r.emp_code);
       return {
         emp_code: empCode, first_name: T(r.first_name) ?? "User", last_name: T(r.last_name), designation: T(r.designation),
+        // The address as entered (Tuper 00214): the sign-in copy is lower-cased.
+        email_as_entered: T(r.email),
         role_id: mapGet(ctx.extra.roles, r.role?.role_key), home_phone: T(r.home_phone_number), mobile_phone: T(r.mobile_phone_number),
         work_phone: T(r.work_phone_number), external_login_id: T(r.external_login_id), hourly_labor_charge: N(r.hourly_labor_charge),
         licence_type: T(r.license_type), is_billable: r.is_billable !== false,
@@ -2053,7 +2090,9 @@ export const ENTITIES: Record<string, Entity> = {
     deps: ["customers", "organizations", "users", "assets", "teams", "service_territories"], concurrency: 6,
     async *pages(ctx) {
       // ZUPER_SKIP resumes a stopped pass: the first N jobs (in the map's order) are left out.
-      const uids = [...(await ctxMap(ctx, "jobs")).keys()].slice(Math.max(0, Number(process.env.ZUPER_SKIP ?? 0) || 0));
+      // ZUPER_TAKE stops after that many (a pass split in two runs).
+      const skip = Math.max(0, Number(process.env.ZUPER_SKIP ?? 0) || 0), take = Number(process.env.ZUPER_TAKE ?? 0) || Infinity;
+      const uids = [...(await ctxMap(ctx, "jobs")).keys()].slice(skip, skip + take);
       for (let i = 0; i < uids.length; i += 100) yield uids.slice(i, i + 100).map((job_uid) => ({ job_uid }));
     },
     uid: (r) => r.job_uid,
@@ -2083,6 +2122,8 @@ export const ENTITIES: Record<string, Entity> = {
         // from the list: one pass over every job brings both.
         ...(Array.isArray(d.job_tags) ? { job_tags: d.job_tags.map((t: unknown) => T(t)).filter((t: string | null): t is string => Boolean(t)) } : {}),
         ...sent(d, "actual_duration", "actual_duration", (v) => (v == null ? null : Math.round(num0(v)))),
+        // The job's external ids as Zuper holds them (Tuper 00215): false where it has none.
+        ...("external_id" in d ? { external_ids: d.external_id && typeof d.external_id === "object" ? d.external_id : false } : {}),
         service_territory_id: await territoryId(ctx, d.service_territory),
         // jms.jobs holds one asset; Zuper can link several — the first is the one its lists show.
         asset_id: mapGet(await ctxMap(ctx, "assets"), (d.assets ?? [])[0]?.asset?.asset_uid),
@@ -2579,7 +2620,14 @@ ENTITIES.product_categories = {
   name: "product_categories", schema: "jms", table: "product_categories",
   fetch: (ctx) => zuperGet(ctx.cfg, "/api/products/category?page=1&count=500").then((j) => j.data ?? []),
   uid: (r) => r.category_uid,
-  async transform(r) { return { name: T(r.category_name) ?? "Category" }; },
+  // Its description, icon and maker too (the list carries all three; Tuper kept only the name — 2026-09-22).
+  async transform(r, ctx) {
+    return {
+      name: T(r.category_name) ?? "Category", description: T(r.category_description), icon_url: T(r.category_icon),
+      created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
+      ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
+    };
+  },
 };
 // Where a request came from ("Customer Portal", "Website" …). Zuper keeps these as records of their own and answers the
 // whole record as a request's request_source; Tuper had only the name until 00197. Zuper sends no event for them: this
@@ -3455,6 +3503,7 @@ ENTITIES.notes = {
       ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true, deleted_at: r.is_deleted === true ? ts(r.updated_at) : null } : {}),
       edited_at: r.is_edited === true ? ts(r.updated_at) : null,
       zuper_uid: r.note_uid, ...createdAt(r), ...(r.updated_at ? { updated_at: String(r.updated_at) } : {}),
+      extra: noteExtra(r),
     };
   },
   // A note an earlier run wrote but didn't get to map (it was stopped in between) is taken up again, not added twice.
@@ -3476,6 +3525,33 @@ ENTITIES.notes = {
     if (r.is_deleted === true) return;
     await writeZuperFiles(ctx, r._host, r.attachments, { note_id: id, uploaded_by: r._author, created_at: ts(r.created_at) });
   },
+};
+
+/**
+ * What a Zuper note carries that Tuper keeps no column for (Tuper 00213), with the note's own key order: its type, its
+ * text as Zuper holds it, who made it (employee or customer), mentions, the four visibility flags as set, the pin's
+ * time, comment count, edit mark, offline flag, sync time, v2 flag, and the hosts it names (a job note's customer: null).
+ */
+function noteExtra(r: any): Record<string, unknown> {
+  const out: Record<string, unknown> = { keys: Object.keys(r ?? {}).filter((k) => !k.startsWith("_")) };
+  for (const k of ["note_type", "note", "job", "request", "asset", "customer", "project", "purchase_order", "created_by_type", "created_by_customer",
+    "user_mentions", "is_private", "visible_to_customer", "visibility", "visible_to_fe", "is_pinned", "pinned_at", "comment_count", "is_edited",
+    "is_offline", "synced_at", "is_v2_note"]) {
+    if (r && k in r) out[k] = r[k];
+  }
+  // Its files in Zuper's order with both of Zuper's ids for each (company_attachment_uid is not always the
+  // attachment_uid) and its internal _id; the files themselves are Tuper's (writeZuperFiles).
+  if (Array.isArray(r?.attachments)) {
+    out.attachments = r.attachments.map((a: any) => ({ attachment_uid: a?.attachment_uid ?? null, company_attachment_uid: a?.company_attachment_uid ?? null, _id: a?._id ?? null }));
+  }
+  return out;
+}
+// Zuper's own note fields for every imported note, from its note list, without re-writing the note or its files.
+ENTITIES.note_fields = {
+  name: "note_fields", schema: "jms", table: "entity_comments", mapEntity: "notes", enrichOnly: true, concurrency: 16,
+  pages: (ctx) => zuperListPages(ctx.cfg, "/api/notes", 100),
+  uid: (r) => r.note_uid,
+  async transform(r) { return { extra: noteExtra(r) }; },
 };
 
 // ── Activity and time logs ── a record's Zuper activity feed (GET /api/activities/recent?filter.activity_module=…&
@@ -3533,6 +3609,7 @@ export function punchTime(v: unknown): string {
 
 async function writeJobTimelogs(ctx: Ctx, jobId: string, punches: any[]): Promise<void> {
   punches = punches.map((p) => (p?.checked_time ? { ...p, checked_time: punchTime(p.checked_time) } : p));
+  const sessionOf = new Map<string, string>();
   const users = await ctxMap(ctx, "users");
   const map = await ctxMap(ctx, "timelogs");
   const tbl = () => ctx.client.schema("jms").from("job_timelogs");
@@ -3555,17 +3632,53 @@ async function writeJobTimelogs(ctx: Ctx, jobId: string, punches: any[]): Promis
         job_id: jobId, user_id: userId, log_type: T(p.timelog_type) ?? "JOB", started_at: started, ended_at: valid,
         duration_minutes: valid ? Math.round((Date.parse(valid) - Date.parse(started)) / 60000) : null,
       };
-      const id = map.get(String(p.timelog_uid));
+      let id = map.get(String(p.timelog_uid));
       if (id) {
         const { error } = await tbl().update(row).eq("id", id).eq("tenant_id", ctx.tenantId);
         if (error) throw error;
       } else {
         const { data, error } = await tbl().insert({ ...row, tenant_id: ctx.tenantId }).select("id").single();
         if (error) throw error;
-        await setMap(ctx, "timelogs", String(p.timelog_uid), (data as { id: string }).id);
+        id = (data as { id: string }).id;
+        await setMap(ctx, "timelogs", String(p.timelog_uid), id);
       }
+      sessionOf.set(String(p.timelog_uid), id);
+      if (out && T(out.timelog_uid)) sessionOf.set(String(out.timelog_uid), id);
     }
   }
+  await writeJobPunches(ctx, jobId, punches, sessionOf);
+}
+/**
+ * A job's punches as Zuper keeps them (Tuper 00211): each CLOCK_IN and CLOCK_OUT with its own uid, time, place (the
+ * phone's text, "25.0287433"), remarks, reason code and offline flag, linked to the session it opens or closes. The
+ * job's punches are replaced whole; each keeps its Tuper id from one run to the next (map `timelog_punches`).
+ */
+async function writeJobPunches(ctx: Ctx, jobId: string, punches: any[], sessionOf: Map<string, string>): Promise<void> {
+  const users = await ctxMap(ctx, "users");
+  const uids = punches.map((p) => T(p?.timelog_uid)).filter((u): u is string => Boolean(u));
+  const known = await mapForUids(ctx, "timelog_punches", uids);
+  const text = (v: unknown) => (v === null || v === undefined || v === "" ? null : String(v));
+  const rows: Record<string, unknown>[] = [];
+  const fresh: [string, string][] = [];
+  for (const p of punches) {
+    const uid = T(p?.timelog_uid);
+    const userId = mapGet(users, p?.user?.user_uid);
+    if (!uid || !userId || !p.checked_time || !T(p.type)) continue;
+    let id = known.get(uid);
+    if (!id) { id = randomUUID(); fresh.push([uid, id]); }
+    rows.push({
+      id, tenant_id: ctx.tenantId, job_id: jobId, timelog_id: sessionOf.get(uid) ?? null, user_id: userId,
+      punch_type: String(p.type).toUpperCase(), punched_at: String(p.checked_time),
+      latitude: text(p.latitude), longitude: text(p.longitude), remarks: typeof p.remarks === "string" ? p.remarks : null,
+      timelog_type: T(p.timelog_type) ?? "JOB", reason_code: text(typeof p.reason_code === "object" ? p.reason_code?.reason_code ?? null : p.reason_code),
+      is_offline: p.is_offline === true,
+    });
+  }
+  const tbl = () => ctx.client.schema("jms").from("job_timelog_punches");
+  const { error } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("job_id", jobId);
+  if (error) throw error;
+  if (rows.length) { const { error: insErr } = await tbl().insert(rows); if (insErr) throw insErr; }
+  for (const [uid, id] of fresh) await setMap(ctx, "timelog_punches", uid, id);
 }
 
 // Every imported job's activity, and — when its feed shows punches — its time logs (GET /api/jobs/{uid}/timelog).
@@ -3593,6 +3706,80 @@ ENTITIES.job_activity = {
     }
   },
 };
+// Every job Zuper holds time logs for, and its punches (Tuper 00211). The jobs come from Zuper's own time-log list
+// (GET /api/jobs/timelog_summary — a session a row, each naming its job): job_activity only read a job's punches when
+// its activity feed showed a time log, and so held 1,078 sessions where Zuper has 2,008 (2026-09-22).
+ENTITIES.job_timelogs = {
+  name: "job_timelogs", schema: "jms", table: "jobs", mapEntity: "jobs", enrichOnly: true, deps: ["users", "teams", "timelogs"], concurrency: 6,
+  async *pages(ctx) {
+    // The whole list first (a job's sessions are spread over its pages), then a job at a time with its sessions.
+    const byJob = new Map<string, any[]>();
+    for await (const page of zuperListPages(ctx.cfg, "/api/jobs/timelog_summary")) {
+      for (const s of page) {
+        const u = T(s?.job?.job_uid);
+        if (u) byJob.set(u, [...(byJob.get(u) ?? []), s]);
+      }
+    }
+    const jobs = [...byJob.entries()].map(([job_uid, summaries]) => ({ job_uid, _summaries: summaries }));
+    for (let i = 0; i < jobs.length; i += 100) yield jobs.slice(i, i + 100);
+  },
+  uid: (r) => r.job_uid,
+  async transform(r, ctx) {
+    r._timelog = (await zuperGet(ctx.cfg, `/api/jobs/${r.job_uid}/timelog`)).data ?? [];
+    return {};
+  },
+  async afterWrite(ctx, id, r) {
+    if (Array.isArray(r._timelog)) await writeJobTimelogs(ctx, id, r._timelog);
+    await writeTimelogSummaries(ctx, id, r._summaries ?? []);
+  },
+};
+/**
+ * Zuper's own record of each session on a job (its time-log summary): its uid, the team the time was logged under and
+ * the hourly charge then. Matched to the session Tuper made from the punches by person and clock-in instant; the uid is
+ * kept in map `timelog_summaries`, the team and charge on the session (Tuper 00211).
+ */
+async function writeTimelogSummaries(ctx: Ctx, jobId: string, summaries: any[]): Promise<void> {
+  if (!summaries.length) return;
+  const users = await ctxMap(ctx, "users"), teams = await ctxMap(ctx, "teams");
+  const { data, error } = await ctx.client.schema("jms").from("job_timelogs").select("id, user_id, started_at")
+    .eq("tenant_id", ctx.tenantId).eq("job_id", jobId);
+  if (error) throw error;
+  const sessions = (data ?? []) as { id: string; user_id: string; started_at: string }[];
+  const known = await mapForUids(ctx, "timelog_summaries", summaries.map((x) => T(x?.timelog_summary_uid)).filter((u): u is string => Boolean(u)));
+  for (const x of summaries) {
+    const uid = T(x?.timelog_summary_uid), userId = mapGet(users, x?.user?.user_uid);
+    const at = x?.clock_in_time ? Date.parse(punchTime(x.clock_in_time)) : NaN;
+    if (!uid || !userId || !Number.isFinite(at)) continue;
+    const session = sessions.find((s) => s.user_id === userId && Math.abs(Date.parse(s.started_at) - at) < 1000);
+    if (!session) continue;
+    const { error: upErr } = await ctx.client.schema("jms").from("job_timelogs").update({
+      team_id: mapGet(teams, x?.team?.team_uid), hourly_charge: x.hourly_charge == null ? null : num0(x.hourly_charge),
+    }).eq("id", session.id).eq("tenant_id", ctx.tenantId);
+    if (upErr) throw upErr;
+    if (known.get(uid) !== session.id) await setMap(ctx, "timelog_summaries", uid, session.id);
+  }
+}
+/**
+ * A kind of record's Zuper activity feed, every record of it (customers, assets, organizations, properties): their
+ * summaries answer the latest few, and none had been imported — each answered no activity where Zuper had some
+ * (API comparison, 2026-09-22).
+ */
+function recordActivity(name: string, mapEntity: string, table: string, zuperModule: string, entityType: string, uidKey: string): Entity {
+  return {
+    name, schema: "jms", table, mapEntity, enrichOnly: true, deps: ["users"], concurrency: 8,
+    async *pages(ctx) {
+      const uids = [...(await ctxMap(ctx, mapEntity)).keys()];
+      for (let i = 0; i < uids.length; i += 100) yield uids.slice(i, i + 100).map((u) => ({ [uidKey]: u }));
+    },
+    uid: (r) => r[uidKey],
+    async transform(r, ctx) { r._activity = await zuperActivity(ctx, zuperModule, r[uidKey]); return {}; },
+    async afterWrite(ctx, id, r) { await writeZuperActivity(ctx, entityType, id, r._activity ?? []); },
+  };
+}
+ENTITIES.customer_activity = recordActivity("customer_activity", "customers", "customers", "CUSTOMER", "customer", "customer_uid");
+ENTITIES.asset_activity = recordActivity("asset_activity", "assets", "assets", "ASSET", "asset", "asset_uid");
+ENTITIES.organization_activity = recordActivity("organization_activity", "organizations", "organizations", "ORGANIZATION", "organization", "organization_uid");
+ENTITIES.property_activity = recordActivity("property_activity", "properties", "properties", "PROPERTY", "property", "property_uid");
 // Every imported request's activity.
 ENTITIES.request_activity = {
   name: "request_activity", schema: "jms", table: "requests", mapEntity: "requests", enrichOnly: true, deps: ["users"], concurrency: 4,
