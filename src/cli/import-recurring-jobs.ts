@@ -187,7 +187,8 @@ for (let page = 1; ; page++) {
       job_title: String(r.job_title ?? "").trim(),
       category_id: categories.get(r.job_category?.category_uid) ?? null,
       customer_id: customers.get(r.customer?.customer_uid) ?? null,
-      organization_id: organizations.get(r.customer?.customer_organization?.organization_uid) ?? null,
+      // The repeat's own organization (765 of 1,320 name one), else its customer's.
+      organization_id: organizations.get(r.organization?.organization_uid ?? r.customer?.customer_organization?.organization_uid) ?? null,
       service_address: address(r.customer_address),
       billing_address: address(r.customer_billing_address),
       rrule: String(r.rrule ?? ""),
@@ -203,6 +204,8 @@ for (let page = 1; ; page++) {
       is_deleted: r.is_deleted === true,
       created_by: users.get(r.created_by?.user_uid) ?? null,
       ...(r.created_at ? { created_at: r.created_at } : {}),
+      // Zuper's own last change (Tuper 00217 keeps a written updated_at).
+      ...(r.updated_at ? { updated_at: r.updated_at } : {}),
     };
     if (!payload.rrule) { skipped++; continue; }
 

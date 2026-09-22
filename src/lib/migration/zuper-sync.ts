@@ -1553,14 +1553,21 @@ export const ENTITIES: Record<string, Entity> = {
         name: S(r.template_name) ?? "Job Card",
         description: S(r.template_description),
         is_active: true,                                   // Zuper has no on/off for a card: a deleted one is gone
-        job_category_id: primary ?? associated[0] ?? null,
+        // Its main category as Zuper names it — none on 5 of GBG's 19, which answer job_category {} — apart from the
+        // categories it is associated with.
+        job_category_id: primary ?? null,
         associated_category_ids: associated.length ? associated : primary ? [primary] : [],
         content: {
           html: String(r.template ?? ""),
           format: String(opts.format ?? "A4"),
           orientation: String(opts.orientation ?? "portrait"),
           borders: { top: side(border.top), right: side(border.right), bottom: side(border.bottom), left: side(border.left) },
+          // Zuper's renderer name where it gives one (16 of 19 cards).
+          ...(typeof r.render_engine === "string" ? { render_engine: r.render_engine } : {}),
         },
+        // Who made it and when, as Zuper has it (Tuper 00216 keeps a written updated_at).
+        created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
+        ...createdAt(r), ...(r.updated_at ? { updated_at: String(r.updated_at) } : {}),
       };
     },
   },
@@ -3586,10 +3593,11 @@ async function writeZuperActivity(ctx: Ctx, entityType: string, entityId: string
     // Zuper's own Activity tab reads none of the sentence above: it renders metadata.fields_updated — each field's
     // label with its old and new value, and for a status move the status's name and colour. Tuper's tab renders the
     // same, so the list is kept as Zuper sends it. The rest of metadata (the client that made the call) is dropped.
-    const fields = Array.isArray(a.metadata?.fields_updated) && a.metadata.fields_updated.length ? a.metadata.fields_updated : null;
+    // Zuper's metadata whole — fields_updated for the Activity tab, and the rest (request_source …) a summary answers.
+    const metadata = a.metadata && typeof a.metadata === "object" && Object.keys(a.metadata).length ? a.metadata : null;
     return {
       tenant_id: ctx.tenantId, entity_type: entityType, entity_id: entityId, actor_id: mapGet(users, a.users?.user_uid), verb,
-      meta: { message, zuper_type: T(a.activity_type), zuper_action: T(action), ...(remarks ? { remarks } : {}), ...(fields ? { metadata: { fields_updated: fields } } : {}), zuper_uid: T(a.user_activity_uid) },
+      meta: { message, zuper_type: T(a.activity_type), zuper_action: T(action), ...(remarks ? { remarks } : {}), ...(metadata ? { metadata } : {}), zuper_uid: T(a.user_activity_uid) },
       ...(a.created_at ? { created_at: String(a.created_at) } : {}),
     };
   });
