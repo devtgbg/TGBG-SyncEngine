@@ -2077,7 +2077,11 @@ export const ENTITIES: Record<string, Entity> = {
       r._category_id = category_id; // for the status history in afterWrite
       const customer_id = await customerId(ctx, r.customer);
       const organization_id = await organizationId(ctx, r.organization);
-      if (!customer_id && !organization_id) throw new Error(`${label}: no customer or organization`);
+      // Zuper keeps a job whose customer is gone: customer null, no organization (nine of GBG's, 2645 … 27981). Tuper
+      // keeps it the same way (no_customer, 00227). A customer or organization Zuper names that isn't here yet is
+      // still a failure.
+      const no_customer = !r.customer && !r.organization;
+      if (!customer_id && !organization_id && !no_customer) throw new Error(`${label}: no customer or organization`);
       if (parentJobUid(r.parent_job)) (ctx.extra.jobParents ??= []).push([r.job_uid, parentJobUid(r.parent_job)]);
       const custOrg = r.customer?.customer_organization?.organization_uid;
       if (r.customer?.customer_uid && custOrg) (ctx.extra.customerOrgs ??= new Map()).set(r.customer.customer_uid, custOrg);
@@ -2095,7 +2099,7 @@ export const ENTITIES: Record<string, Entity> = {
         // The colour the status had when it was set, which Zuper keeps with the job (migration 00100).
         current_status_color: hexColor(r.current_job_status?.status_color),
         priority: JOB_PRIORITIES.has(priority) ? priority : "LOW", job_type: r.job_type === "REVISIT" ? "REVISIT" : "NEW",
-        customer_id, organization_id,
+        customer_id, organization_id, no_customer,
         scheduled_start_time: ts(r.scheduled_start_time), scheduled_end_time: end,
         // jobs_end_or_due_ck: a job needs an end or a due date.
         due_date: due ?? (end ? null : ts(r.scheduled_start_time) ?? ts(r.created_at) ?? new Date().toISOString()),
