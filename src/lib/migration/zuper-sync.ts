@@ -241,6 +241,30 @@ const dubaiDate = (v: any): string | null => {
 };
 const stripHtml = (v: any): string | null => T(String(v ?? "").replace(/<[^>]*>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " "));
 const createdAt = (r: any) => (r?.created_at ? { created_at: String(r.created_at) } : {});
+/**
+ * One of Zuper's three roles (Admin, Team Leader, Field Executive) as a person or an assignee carries it: Tuper's role
+ * of the same key is mapped to Zuper's uid, and where the role carries its dates (a job's assignee does; Zuper made all
+ * three on 2018-01-22) they are written too — Tuper 00209 keeps a written updated_at. Once per role and run.
+ */
+export async function writeRole(ctx: Ctx, role: any): Promise<void> {
+  const uid = T(role?.role_uid), key = T(role?.role_key);
+  if (!uid || !key) return;
+  const dated = Boolean(role.created_at);
+  await onceRetrying(ctx, `role:${uid}:${dated}`, async () => {
+    const { data, error } = await ctx.client.schema("jms").from("roles").select("id").eq("tenant_id", ctx.tenantId).eq("role_key", key).maybeSingle();
+    if (error) throw error;
+    const id = (data as { id: string } | null)?.id;
+    if (!id) return null;
+    if (!(await ctxMap(ctx, "roles")).has(uid)) await setMap(ctx, "roles", uid, id);
+    if (dated) {
+      const { error: upErr } = await ctx.client.schema("jms").from("roles")
+        .update({ created_at: String(role.created_at), ...(role.updated_at ? { updated_at: String(role.updated_at) } : {}) })
+        .eq("id", id).eq("tenant_id", ctx.tenantId);
+      if (upErr) throw upErr;
+    }
+    return id;
+  });
+}
 
 // ── Job statuses + their checklists ──
 const JOB_STATUS_TYPES = new Set(["NEW", "SCHEDULED", "ON_MY_WAY", "STARTED", "ON_HOLD", "COMPLETED", "CANNOT_COMPLETE", "CANCELED", "FAILED", "PAID", "CLOSED", "FOLLOW_UP", "FOLLOW_UP_SAME_JOB", "OTHER"]);
@@ -715,6 +739,8 @@ async function writeJobAssignments(ctx: Ctx, jobId: string, r: any, isNew: boole
   const seen = new Set<string>();
   const rows: Record<string, unknown>[] = [];
   for (const a of r.assigned_to ?? []) {
+    // An assignee's role carries Zuper's dates for it (writeRole).
+    await writeRole(ctx, a.user?.role);
     const userId = mapGet(users, a.user?.user_uid);
     if (!userId || seen.has(userId)) continue;
     seen.add(userId);
@@ -1810,11 +1836,18 @@ export const ENTITIES: Record<string, Entity> = {
         licence_type: T(r.license_type), is_billable: r.is_billable !== false,
         // Who added the person. Zuper's /api/user/all list leaves created_by out; its by-uid read carries it.
         ...(await createdByField(ctx, r)),
+        // The person's own times (Tuper 00208): created and last changed in Zuper, and the last sign-in there — which a
+        // later sign-in to Tuper outranks (the trigger never moves it back).
+        ...createdAt(r), ...(r.updated_at ? { updated_at: String(r.updated_at) } : {}),
+        ...(r.last_login_at ? { last_login_at: String(r.last_login_at) } : {}),
       };
     },
     insert: provisionImportedUser,
-    // The person's own custom fields (GBG uses one, "Nickname") — again only on a by-uid read.
-    afterWrite: (ctx, id, r) => writeZuperCustomFields(ctx, "USER", id, r.custom_fields, r.custom_field_internal_object, r.created_at),
+    // The person's own custom fields (GBG uses one, "Nickname") — again only on a by-uid read — and their role's uid.
+    async afterWrite(ctx, id, r) {
+      await writeZuperCustomFields(ctx, "USER", id, r.custom_fields, r.custom_field_internal_object, r.created_at);
+      await writeRole(ctx, r.role);
+    },
   },
   assets: {
     name: "assets", schema: "jms", table: "assets", deps: ["customers", "asset_categories"], concurrency: 8,
@@ -2229,9 +2262,13 @@ ENTITIES.user_details = {
   async transform(r, ctx) {
     const d = (await zuperGet(ctx.cfg, `/api/user/${r.user_uid}`)).data ?? {};
     // The access role the person has in Zuper (owner OK 2026-09-22): it decides what they may do in Tuper too.
-    const access = "access_role" in d
-      ? { access_role_id: d.access_role?.access_role_uid ? mapGet(await ctxMap(ctx, "access_roles"), d.access_role.access_role_uid) : null }
-      : {};
+    const access = {
+      ...("access_role" in d
+        ? { access_role_id: d.access_role?.access_role_uid ? mapGet(await ctxMap(ctx, "access_roles"), d.access_role.access_role_uid) : null }
+        : {}),
+      // Zuper's own last change, kept rather than stamped by this write (Tuper 00208).
+      ...(d.updated_at ? { updated_at: String(d.updated_at) } : {}),
+    };
     if (!("meta_data" in d)) return access;
     const m = d.meta_data && typeof d.meta_data === "object" ? d.meta_data : null;
     return {
