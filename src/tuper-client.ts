@@ -49,15 +49,26 @@ async function post(path: string, body: unknown, opts: { quiet?: boolean } = {})
     // An HTML page instead of an answer means the request never reached Tuper's API: a proxy's 502 while Tuper
     // redeploys, or the dev server's error page while it recompiles. Nothing was done, so it is safe to ask again —
     // a few times, waiting longer each time — where giving up would end a long import half way.
+    // A connection that fails outright ("fetch failed": reset, refused, timed out) is asked again too, but only for a
+    // call that is safe to repeat — a read, or an upsert, update or delete, which land the same however often they
+    // run. An insert or an RPC may have been done before the connection broke, so it fails as before.
+    const op = (body as { op?: string } | null)?.op;
+    const repeatable = path === "/api/sync/query" || (path === "/api/sync/mutate" && (op === "upsert" || op === "update" || op === "delete"));
     let res: Response, text: string;
     for (let attempt = 1; ; attempt++) {
-      res = await fetch(`${config.tuper.url}${path}`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-api-key": config.tuper.apiKey },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      });
-      text = await res.text();
+      try {
+        res = await fetch(`${config.tuper.url}${path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-api-key": config.tuper.apiKey },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(TIMEOUT_MS),
+        });
+        text = await res.text();
+      } catch (err) {
+        if (!repeatable || attempt >= 5) throw err;
+        await new Promise((r) => setTimeout(r, 2000 * 2 ** (attempt - 1)));
+        continue;
+      }
       if (!/^\s*<(!doctype|html)/i.test(text) || attempt >= 5) break;
       await new Promise((r) => setTimeout(r, 2000 * 2 ** (attempt - 1)));
     }

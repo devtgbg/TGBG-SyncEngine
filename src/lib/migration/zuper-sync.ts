@@ -70,7 +70,15 @@ async function zuperJson(cfg: SyncConfig, path: string, init: RequestInit, what:
     }
     const text = await res.text().catch(() => "");
     logCall({ system: "zuper", method, path, status: res.status, ok: res.ok, started, attempt, request: init.body, response: text });
-    if (res.ok) return JSON.parse(text);
+    if (res.ok) {
+      // A 200 whose body is cut short (seen 2026-09-22 on the job month pager, 23,767 jobs into a run that it then
+      // stopped) is as transient as a 5xx: asked again the same way.
+      try { return JSON.parse(text); } catch (err) {
+        if (attempt >= 6) throw new Error(`Zuper ${what} → unreadable answer (${err instanceof Error ? err.message : err})`);
+        await new Promise((r) => setTimeout(r, Math.min(30_000, 1000 * 2 ** attempt)));
+        continue;
+      }
+    }
     if (attempt >= 6 || (res.status < 500 && res.status !== 429)) throw new Error(`Zuper ${what} → ${res.status}`);
     await new Promise((r) => setTimeout(r, Math.min(30_000, 1000 * 2 ** attempt)));
   }
@@ -742,6 +750,13 @@ async function writeJobAssignments(ctx: Ctx, jobId: string, r: any, isNew: boole
 /** "#AA7942" as Zuper sends it, or null when it isn't a six-digit colour (the status's own colour is used then). */
 export const hexColor = (v: unknown): string | null => (typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v.trim()) ? v.trim().toLowerCase() : null);
 /** Zuper's status timeline → jms.job_status_history, oldest first, each row's from = the previous to. */
+/** A text exactly as Zuper holds it (not trimmed, "" kept); null when it sent none. */
+const asTyped = (v: unknown): string | null => (typeof v === "string" ? v : null);
+/** Zuper's geo_cordinates ([latitude, longitude]) as the two columns; none when it sent no usable pair. */
+function geoPoint(g: unknown): { latitude: number | null; longitude: number | null } {
+  const [lat, lng] = Array.isArray(g) ? g.map(Number) : [];
+  return Number.isFinite(lat) && Number.isFinite(lng) ? { latitude: lat, longitude: lng } : { latitude: null, longitude: null };
+}
 async function writeJobHistory(ctx: Ctx, jobId: string, r: any, isNew: boolean): Promise<void> {
   const entries = [...(r.job_status ?? [])].sort((a: any, b: any) => String(a.created_at).localeCompare(String(b.created_at)));
   const rows: Record<string, unknown>[] = [];
@@ -755,11 +770,22 @@ async function writeJobHistory(ctx: Ctx, jobId: string, r: any, isNew: boolean):
     const response = (s.checklist ?? []).length ? await writeChecklistResponse(ctx, jobId, to, s) : null;
     rows.push({
       tenant_id: ctx.tenantId, job_id: jobId, from_status_id: prev, to_status_id: to, status_color: hexColor(s.status_color),
-      remarks: T(s.remarks), remarks_free_text: T(s.remarks_free_text), changed_by: mapGet(await ctxMap(ctx, "users"), by), ...createdAt(s),
+      // The remarks as typed — trailing space and empty string kept, as Zuper answers them (28 of 296 changes end in a
+      // space) — and null only where Zuper sent none.
+      remarks: asTyped(s.remarks), remarks_free_text: asTyped(s.remarks_free_text), changed_by: mapGet(await ctxMap(ctx, "users"), by), ...createdAt(s),
       // The customer's signature taken at this change (Zuper's link to the picture) and who signed. Job cards print it
-      // from the status: 13 of GBG's 19 read {{customer_signature}} inside "Completed".
-      signature_path: T(s.customer_signature), signer_name: T(s.customer_signature_name),
-      ...(response ? { form_response_id: response } : {}),
+      // from the status: 13 of GBG's 19 read {{customer_signature}} inside "Completed". Zuper answers "" on a change
+      // that asked for none (67 of 296) and leaves the key out on others; both are kept.
+      signature_path: asTyped(s.customer_signature), signer_name: asTyped(s.customer_signature_name),
+      form_response_id: response ?? null,
+      // What else the change carries (Tuper 00205): the ETA given on the way, the minutes on that status (counted only
+      // where Zuper counts them — jobs from March 2026), the face check, the checklist's keyed answers and where it was
+      // made. Every row names every column: one insert carries the job's whole timeline.
+      eta: T(s.eta), facial_auth_status: T(s.facial_auth_status),
+      time_on_status_tracked: "time_on_status" in s,
+      time_on_status: s.time_on_status == null ? null : Math.round(num0(s.time_on_status)),
+      checklist_internal_object: s.checklist_internal_object && typeof s.checklist_internal_object === "object" ? s.checklist_internal_object : null,
+      ...geoPoint(s.geo_cordinates),
     });
     prev = to;
   }
@@ -2014,6 +2040,10 @@ export const ENTITIES: Record<string, Entity> = {
         ...(status ? { current_status_id: status, current_status_color: hexColor(d.current_job_status?.status_color) } : {}),
         is_recurring: d.is_recurrence === true,
         job_skills: ((d.skills ?? []) as any[]).map((s) => T(s?.skill_name)).filter(Boolean),
+        // Its tags as the job's own column holds them and Zuper's own duration figure (00204), as job_people writes them
+        // from the list: one pass over every job brings both.
+        ...(Array.isArray(d.job_tags) ? { job_tags: d.job_tags.map((t: unknown) => T(t)).filter((t: string | null): t is string => Boolean(t)) } : {}),
+        ...sent(d, "actual_duration", "actual_duration", (v) => (v == null ? null : Math.round(num0(v)))),
         service_territory_id: await territoryId(ctx, d.service_territory),
         // jms.jobs holds one asset; Zuper can link several — the first is the one its lists show.
         asset_id: mapGet(await ctxMap(ctx, "assets"), (d.assets ?? [])[0]?.asset?.asset_uid),
@@ -2533,7 +2563,9 @@ export async function* jobsByMonth(cfg: SyncConfig): AsyncGenerator<any[]> {
   const DAY = 86_400_000;
   const isoSeconds = (t: number) => new Date(t).toISOString().replace(/\.\d{3}Z$/, "Z");
   const start = Date.parse("2015-01-01T00:00:00Z");
-  for (let to = Date.now() + 60_000; to > start; to -= 30 * DAY) {
+  // ZUPER_JOBS_BEFORE resumes a stopped pass at the month it had reached (jobs updated before that instant).
+  const resume = Date.parse(process.env.ZUPER_JOBS_BEFORE ?? "");
+  for (let to = Number.isFinite(resume) ? resume : Date.now() + 60_000; to > start; to -= 30 * DAY) {
     const q = `filter.updated_at_from=${encodeURIComponent(isoSeconds(to - 30 * DAY))}&filter.updated_at_to=${encodeURIComponent(isoSeconds(to))}`;
     for (let page = 1; page <= 200; page++) {
       const j = await zuperGet(cfg, `/api/jobs?page=${page}&count=100&${q}`);
@@ -3190,7 +3222,7 @@ const zuperWhen = (raw: string): string | null => {
   return Number.isNaN(Date.parse(raw)) ? null : new Date(raw).toISOString();
 };
 /** One answer → the typed column Tuper's checklist keeps it in (forms.ts valueColumn); null to leave it out. */
-async function answerColumn(ctx: Ctx, jobId: string, f: AnswerField, raw: string, by: string | null, at: string | null): Promise<Record<string, unknown> | null> {
+async function answerColumn(ctx: Ctx, jobId: string, f: AnswerField, raw: string, by: string | null, at: string | null, asSent = raw): Promise<Record<string, unknown> | null> {
   const option = (p: string) => f.options.find((o) => o.label.trim().toLowerCase() === p.trim().toLowerCase())?.value ?? p.trim();
   switch (f.field_type) {
     case "SINGLE_IMAGE": case "MULTI_IMAGE": case "SIGNATURE": case "UPLOAD": case "VIDEO": {
@@ -3200,42 +3232,128 @@ async function answerColumn(ctx: Ctx, jobId: string, f: AnswerField, raw: string
       return { file_url: f.field_type === "MULTI_IMAGE" || ids.length > 1 ? JSON.stringify(ids) : ids[0] };
     }
     case "DATE": case "DATE_TIME": {
+      // The instant for Tuper's own screens and reports, and the text as Zuper wrote it ("2025-03-27 11:04:00" on
+      // older answers, an ISO instant on newer ones), which is what its timeline answers back.
       const when = zuperWhen(raw);
-      return when ? { value_date: when } : { value_text: raw };
+      return when ? { value_date: when, value_text: asSent } : { value_text: asSent };
     }
     case "NUMBER": {
       const n = Number(raw);
       return Number.isFinite(n) ? { value_number: n } : { value_text: raw };
     }
     case "MULTI_SELECTION": {
+      // The choices for Tuper's screens, and the text as Zuper wrote it ("A, B", "A ,B"), which its timeline answers.
       const whole = f.options.some((o) => o.label.trim().toLowerCase() === raw.toLowerCase());
-      return { value_json: (whole ? [raw] : raw.split(",")).map((p) => p.trim()).filter(Boolean).map(option) };
+      return { value_json: (whole ? [raw] : raw.split(",")).map((p) => p.trim()).filter(Boolean).map(option), value_text: asSent };
     }
-    case "SINGLE_SELECTION": case "DROPDOWN":
-      return { value_text: option(raw) };
+    case "SINGLE_SELECTION": case "DROPDOWN": {
+      // The option's value; where that is the wording itself (8,178 of 8,180), the wording as Zuper sent it.
+      const value = option(raw);
+      return { value_text: value === raw ? asSent : value };
+    }
     default:
-      return { value_text: raw };
+      // As typed: Zuper keeps the trailing space ("all good ").
+      return { value_text: asSent };
   }
+}
+/** A short, stable key for a retired question (FNV-1a of its wording and occurrence). */
+const retiredKey = (text: string): string => {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return `retired_${h.toString(16).padStart(8, "0")}`;
+};
+/** Like once(), for any value, and a failure is forgotten, so the next caller tries again. */
+function onceRetrying<T>(ctx: Ctx, key: string, make: () => Promise<T>): Promise<T> {
+  const cache: Map<string, Promise<T>> = (ctx.extra.onceRetired ??= new Map());
+  let p = cache.get(key);
+  if (!p) {
+    p = make();
+    cache.set(key, p);
+    p.catch(() => cache.delete(key));
+  }
+  return p;
+}
+/**
+ * The checklist that holds a status's answers when the status has none today. Zuper keeps each change's checklist as
+ * it stood; a status whose checklist was since removed still has answers on older jobs (22803's "Started": 91). The
+ * status's earlier form is used when the import made one; otherwise one is made, deleted, so no screen offers it.
+ */
+async function retiredChecklistForm(ctx: Ctx, s: any): Promise<string | null> {
+  const statusUid = T(s.status_uid);
+  if (!statusUid) return null;
+  return onceRetrying(ctx, `form:${statusUid}`, async () => {
+    const earlier = (await ctxMap(ctx, "job_status_checklists")).get(statusUid);
+    if (earlier) return earlier;
+    const name = `${T(s.category?.category_name) ?? "Checklist"} – ${T(s.status_name) ?? "Status"} (retired questions)`;
+    const { data, error } = await ctx.client.schema("jms").from("forms").insert({
+      tenant_id: ctx.tenantId, form_kind: "CHECKLIST", name, description: "Questions older jobs answered that the status's checklist no longer has",
+      is_active: false, is_deleted: true, deleted_at: new Date().toISOString(),
+    }).select("id").single();
+    if (error) throw error;
+    const id = (data as { id: string }).id;
+    await setMap(ctx, "job_status_checklists", statusUid, id);
+    return id;
+  });
+}
+/**
+ * A question a change answered that its checklist no longer has: kept as a retired (deleted) question on that
+ * checklist — the builder and new checklists never show it — made once per wording and occurrence, and reused by every
+ * job that answered it. Its answers stay readable in the job's timeline, as Zuper's are.
+ */
+async function retiredField(ctx: Ctx, formId: string, label: string, zuperType: unknown, occurrence: number): Promise<AnswerField> {
+  const fieldKey = retiredKey(`${label.toLowerCase()}#${occurrence}`);
+  return onceRetrying(ctx, `field:${formId}:${fieldKey}`, async () => {
+    const tbl = () => ctx.client.schema("jms").from("form_fields");
+    const find = async () => {
+      const { data, error } = await tbl().select("id, field_type").eq("tenant_id", ctx.tenantId).eq("form_id", formId).eq("field_key", fieldKey).maybeSingle();
+      if (error) throw error;
+      return data as { id: string; field_type: string } | null;
+    };
+    const found = await find();
+    if (found) return { id: found.id, field_type: found.field_type, options: [] };
+    const field_type = CHECKLIST_FIELD_TYPES[String(zuperType ?? "").trim().toUpperCase()] ?? "SINGLE_LINE_TEXT";
+    const { data, error } = await tbl().insert({
+      tenant_id: ctx.tenantId, form_id: formId, field_key: fieldKey, label, field_type, display_order: 1000 + occurrence,
+      is_deleted: true, deleted_at: new Date().toISOString(),
+    }).select("id").single();
+    if (error) {
+      // Made meanwhile by the service's own pass over the same job.
+      const again = (error as { code?: string }).code === "23505" ? await find() : null;
+      if (!again) throw error;
+      return { id: again.id, field_type: again.field_type, options: [] };
+    }
+    return { id: (data as { id: string }).id, field_type, options: [] };
+  });
 }
 /** A timeline entry's checklist answers → its form response on the job; null when there's nothing to keep. */
 async function writeChecklistResponse(ctx: Ctx, jobId: string, statusId: string, s: any): Promise<string | null> {
-  const given: any[] = (s.checklist ?? []).filter((c: any) => c && c.type !== "HEADER");
+  // Every question the change lists, headers and unanswered ones too: Zuper's timeline answers the whole checklist as
+  // it stood (48601's "Started" lists 10 questions, none answered), where Tuper kept only the answered ones.
+  const given: any[] = (s.checklist ?? []).filter((c: any) => c && typeof c === "object");
   const entryUid = T(s.status_history_uid) ?? T(s._id);
   if (!given.length || !entryUid) return null;
-  const formId = await statusFormId(ctx, statusId);
+  const formId = (await statusFormId(ctx, statusId)) ?? (await retiredChecklistForm(ctx, s));
   if (!formId) return null;
   const fields = await formFieldsByLabel(ctx, formId);
   const by = mapGet(await ctxMap(ctx, "users"), s.done_by?.user_uid ?? (typeof s.done_by === "string" ? s.done_by : null));
   const at = ts(s.created_at);
   const taken = new Set<string>();
   const answers: Record<string, unknown>[] = [];
-  for (const c of given) {
-    const f = (fields.get(String(c.question ?? "").trim().toLowerCase()) ?? []).find((x) => !taken.has(x.id));
+  const seen = new Map<string, number>();
+  for (const [position, c] of given.entries()) {
+    const label = String(c.question ?? "").trim();
+    const occurrence = seen.get(label.toLowerCase()) ?? 0;
+    seen.set(label.toLowerCase(), occurrence + 1);
+    const f = (fields.get(label.toLowerCase()) ?? []).find((x) => !taken.has(x.id))
+      ?? (label ? await retiredField(ctx, formId, label, c.type, occurrence) : undefined);
     const raw = c.answer == null ? "" : typeof c.answer === "string" ? c.answer.trim() : JSON.stringify(c.answer);
-    if (!f || !raw) continue;
+    if (!f) continue;
     taken.add(f.id);
-    const col = await answerColumn(ctx, jobId, f, raw, by, at);
-    if (col) answers.push({ tenant_id: ctx.tenantId, form_field_id: f.id, ...col });
+    // Unanswered: "" where Zuper answers "", no value where it answers null (the API answers each back as it came).
+    const col = raw ? await answerColumn(ctx, jobId, f, raw, by, at, typeof c.answer === "string" ? c.answer : raw) : null;
+    // Its place in the checklist as the change had it (00206): the checklist has been reordered and pruned since.
+    answers.push({ tenant_id: ctx.tenantId, form_field_id: f.id, position, value_text: null, value_number: null, value_date: null, value_json: null, file_url: null,
+      ...(col ?? (c.answer === "" ? { value_text: "" } : {})) });
   }
   if (!answers.length) return null;
   const head = { form_id: formId, job_id: jobId, status_id: statusId, submitted_by: by, submitted_at: at };
@@ -3511,6 +3629,14 @@ export async function syncEntity(ctx: Ctx, name: string): Promise<{ fetched: num
         const msg = rowErr instanceof Error ? rowErr.message : (rowErr as any)?.message ?? "row error";
         if (!detail) detail = String(msg).slice(0, 200);
         if (reasons.size < 10 && !reasons.has(msg)) { reasons.add(msg); log(`failed — ${String(msg).slice(0, 200)}`); }
+        // ZUPER_SYNC_FAILED_FILE lists every record that failed, one per line, so a long pass can be finished for just
+        // those afterwards.
+        if (process.env.ZUPER_SYNC_FAILED_FILE) {
+          const { appendFileSync } = await import("node:fs");
+          let uid = "";
+          try { uid = e.uid(r) ?? ""; } catch { /* the uid is what failed */ }
+          appendFileSync(process.env.ZUPER_SYNC_FAILED_FILE, [name, uid, String(msg).replace(/\s+/g, " ").slice(0, 200)].join("\t") + "\n");
+        }
       }
     };
     const n = e.concurrency ?? 1;
