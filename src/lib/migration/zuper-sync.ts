@@ -936,6 +936,9 @@ async function writeLineItems(ctx: Ctx, parentType: "QUOTE" | "INVOICE" | "CONTR
       item_type: type === "SECTION" || type === "HEADER" ? "HEADER" : type === "BUNDLE" ? "BUNDLE" : type.startsWith("CUSTOM") ? "CUSTOM" : "ITEM",
       item_code: T(l.product_id), product_type: T(l.product_type), brand: T(l.brand), specification: T(l.specification),
       uom: T(l.uom), details: T(l.plain_text_description) ?? T(l.description),
+      // The location's name as the line carries it: Zuper keeps the name it had then, and GBG has renamed one since
+      // ("JGE Workshop" is now "Agronomy Center").
+      location_name: asTyped(l.location_name),
       unit_cost: l.purchase_price == null ? null : num0(l.purchase_price), location_id: lineLocations[i] ?? null,
       tax_id: taxId && l?.tax?.tax_exempt !== true ? taxId : null,
     };
@@ -1800,6 +1803,9 @@ export const ENTITIES: Record<string, Entity> = {
       return {
         // The list's "Part / Service No" is the prefix and the part number together ("AMCJGE SERAMCJGE1").
         name: S(r.product_name) ?? "Product", sku: [T(r.prefix), T(r.product_id)].filter(Boolean).join(" ") || null, product_no: N(r.product_no),
+        // Zuper keeps the prefix apart from the number and answers both; the sku above is the two together, which is
+        // what Tuper's lists show as "Part / Service No" (Tuper 00230).
+        prefix: asTyped(r.prefix),
         description: S(r.plain_text_description ?? r.product_description),
         // The description as typed (Tuper 00218): tabs and line breaks the plain copy loses (498 of 2,074 parts).
         description_as_entered: typeof r.product_description === "string" ? r.product_description : null,
@@ -2016,7 +2022,8 @@ export const ENTITIES: Record<string, Entity> = {
       // for everyone who has it (it used to be left off all but the first).
       const empCode = T(r.emp_code);
       return {
-        emp_code: empCode, first_name: T(r.first_name) ?? "User", last_name: T(r.last_name), designation: T(r.designation),
+        // Names exactly as Zuper holds them: trimming turned "Tofazzal " into "Tofazzal" on two of this account's staff.
+        emp_code: empCode, first_name: asTyped(r.first_name) ?? "User", last_name: asTyped(r.last_name), designation: T(r.designation),
         // The address as entered (Tuper 00214): the sign-in copy is lower-cased.
         email_as_entered: T(r.email),
         role_id: mapGet(ctx.extra.roles, r.role?.role_key), home_phone: T(r.home_phone_number), mobile_phone: T(r.mobile_phone_number),
