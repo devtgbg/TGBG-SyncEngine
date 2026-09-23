@@ -1242,6 +1242,11 @@ async function contractInvoiceSettings(ctx: Ctx, s: any): Promise<Record<string,
       .eq("tenant_id", ctx.tenantId).eq("interval_months", months).eq("is_active", true).limit(1);
     if (error) throw error;
     billing_period_id = ((data ?? []) as { id: string }[])[0]?.id ?? null;
+    // Zuper's own id for the period, so a contract answers the id Zuper answers rather than Tuper's row id.
+    const periodUid = T(s.billing_period?.billing_period_uid);
+    if (billing_period_id && periodUid && !(await ctxMap(ctx, "contract_billing_periods")).has(periodUid)) {
+      await setMap(ctx, "contract_billing_periods", periodUid, billing_period_id);
+    }
     const zuperName = T(s.billing_period?.billing_period_name);
     if (billing_period_id && zuperName) {
       const { error: nameErr } = await ctx.client.schema("jms").from("contract_billing_periods").update({ name: zuperName })
@@ -1829,13 +1834,14 @@ export const ENTITIES: Record<string, Entity> = {
         name: S(r.team_name) ?? "Team",
         description: T(r.team_description),
         color: T(r.team_color),
-        // Zuper sends "" for a team on the company's own zone; Tuper reads null as the same thing.
-        timezone: T(r.team_timezone),
+        // As Zuper holds it: "" for a team on the company's own zone on some, none on others.
+        timezone: asTyped(r.team_timezone),
         is_dispatchable: r.is_dispatchable === true,
         is_active: r.is_active !== false,
         ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
         created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
-        ...createdAt(r),
+        // Zuper's own times, so a team answers when Zuper last changed it rather than when this ran.
+        ...ownTimes(r),
       };
     },
     // The members as the team's own read has them: Zuper's list leaves out some (7 people across 6 teams, 2026-09-22).
