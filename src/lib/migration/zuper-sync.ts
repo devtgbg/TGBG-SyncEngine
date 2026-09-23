@@ -2972,6 +2972,45 @@ ENTITIES.customer_categories = {
   },
 };
 
+
+// An asset's own history (Asset Details › History): serial number changes, status moves, who it went to. Zuper lists
+// it per asset (GET /api/assets/{uid}/history) and has no list of all of them, so every asset Tuper holds is asked.
+// Nothing imported it before, and Tuper answered an empty history for an asset Zuper has entries for.
+ENTITIES.asset_history = {
+  name: "asset_history", schema: "jms", table: "asset_history", concurrency: 6,
+  deps: ["assets", "customers", "organizations", "properties", "products", "jobs", "users"],
+  async *pages(ctx) {
+    const assets = [...(await ctxMap(ctx, "assets"))];
+    for (let i = 0; i < assets.length; i += 8) {
+      const part = await Promise.all(assets.slice(i, i + 8).map(async ([uid, id]) => {
+        const answer = await zuperGet(ctx.cfg, `/api/assets/${uid}/history`).catch(() => null);
+        return ((answer?.data ?? []) as any[]).map((h) => ({ ...h, _asset_id: id }));
+      }));
+      const rows = part.flat();
+      if (rows.length) yield rows;
+    }
+  },
+  uid: (r) => r.asset_history_uid,
+  async transform(r, ctx) {
+    return {
+      asset_id: r._asset_id,
+      action_type: T(r.action_type) ?? "UPDATE",
+      status: asTyped(r.status), serial_number: asTyped(r.serial_number), remarks: asTyped(r.remarks),
+      meta_data: r.meta_data && typeof r.meta_data === "object" ? r.meta_data : {},
+      job_id: mapGet(await ctxMap(ctx, "jobs"), r.job?.job_uid),
+      customer_id: await customerId(ctx, r.customer),
+      organization_id: await organizationId(ctx, r.organization),
+      property_id: mapGet(await ctxMap(ctx, "properties"), r.property?.property_uid),
+      product_id: mapGet(await ctxMap(ctx, "products"), r.product?.product_uid),
+      attachments: Array.isArray(r.attachments) ? r.attachments : [],
+      is_active: r.is_active !== false,
+      ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
+      created_by: await userOnSight(ctx, r.created_by),
+      ...ownTimes(r),
+    };
+  },
+};
+
 // Zuper's skills (Settings › Skills, its own uid for each): a job names the skills it needs, and without these Tuper
 // answered a skill's name where Zuper answers its uid. One of Tuper's own with the same name is the same skill.
 ENTITIES.skills = {
