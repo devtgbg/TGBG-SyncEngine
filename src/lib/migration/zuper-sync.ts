@@ -788,6 +788,30 @@ async function userOnSight(ctx: Ctx, u: any): Promise<string | null> {
   });
 }
 
+/**
+ * Every asset a job names, as Zuper lists them (Tuper 00232). jobs.asset_id keeps the first, which is what Tuper's own
+ * lists show; without the rest, an asset's summary counted only the jobs that name it first.
+ */
+async function writeJobAssets(ctx: Ctx, jobId: string, assets: any[] | undefined): Promise<void> {
+  if (!Array.isArray(assets)) return;
+  const map = await ctxMap(ctx, "assets");
+  const rows: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+  for (const [i, a] of assets.entries()) {
+    const id = mapGet(map, a?.asset?.asset_uid ?? a?.asset_uid);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    rows.push({
+      tenant_id: ctx.tenantId, job_id: jobId, asset_id: id, display_order: i,
+      remarks: asTyped(a?.remarks), inspection_submission_uid: T(a?.asset_inspection_form_submission_uid),
+    });
+  }
+  const tbl = () => ctx.client.schema("jms").from("job_assets");
+  const { error: delErr } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("job_id", jobId);
+  if (delErr) throw delErr;
+  if (rows.length) { const { error } = await tbl().insert(rows); if (error) throw error; }
+}
+
 /** Assigned users → jms.job_assignments; one Tuper doesn't have yet is imported on sight (userOnSight). */
 async function writeJobAssignments(ctx: Ctx, jobId: string, r: any, isNew: boolean): Promise<void> {
   const users = await ctxMap(ctx, "users");
@@ -1525,6 +1549,26 @@ async function paymentTermId(ctx: Ctx, term: unknown): Promise<string | null> {
   if (id && uid && !(await ctxMap(ctx, "payment_terms")).has(uid)) await setMap(ctx, "payment_terms", uid, id);
   return id;
 }
+/**
+ * The address list of a customer Zuper has since deleted. Its own read answers 404, so the list survives only in the
+ * documents that embed it — an invoice answered two addresses where Tuper had none. Only filled where Tuper holds none.
+ */
+async function fillCustomerAddressList(ctx: Ctx, customer: any): Promise<void> {
+  const uid = T(customer?.customer_uid), list = customer?.customer_all_addresses;
+  if (!uid || !Array.isArray(list) || !list.length) return;
+  const id = mapGet(await ctxMap(ctx, "customers"), uid);
+  if (!id) return;
+  const rows = () => ctx.client.schema("jms").from("customers");
+  const { data, error } = await rows().select("address_list").eq("tenant_id", ctx.tenantId).eq("id", id).maybeSingle();
+  if (error) throw error;
+  const have = (data as { address_list?: unknown[] } | null)?.address_list;
+  if (Array.isArray(have) && have.length) return;
+  const { error: upErr } = await rows()
+    .update({ address_list: list, ...(T(customer.updated_at) ? { updated_at: String(customer.updated_at) } : {}) })
+    .eq("tenant_id", ctx.tenantId).eq("id", id);
+  if (upErr) throw upErr;
+}
+
 /** Zuper's customer list has no organization, but jobs name it — fill it in on a customer that has none. */
 async function linkCustomerOrganization(ctx: Ctx, customer: any): Promise<void> {
   const customerJmsId = mapGet(await ctxMap(ctx, "customers"), customer?.customer_uid);
@@ -2227,6 +2271,7 @@ export const ENTITIES: Record<string, Entity> = {
       await writeZuperCustomFields(ctx, "JOB", id, r.custom_fields, r.custom_field_internal_object, r.created_at);
       await writeJobTeams(ctx, id, r, isNew);
       await writeJobTags(ctx, id, r.job_tags);
+      await writeJobAssets(ctx, id, r.assets);
       // Files attached to the job itself (not to a note or a checklist). Only a full job read carries them - the
       // list the bulk import pages through does not - and linking is additive: a file removed in Zuper stays.
       if (Array.isArray(r.attachments) && r.attachments.length) await writeZuperFiles(ctx, { type: "job", id }, r.attachments, {});
@@ -2268,6 +2313,7 @@ export const ENTITIES: Record<string, Entity> = {
       r.created_at = d.created_at;
       r.updated_at = d.updated_at;
       r.custom_fields = d.custom_fields;
+      r.assets = d.assets;
       r.customer = d.customer;
       r.job_status = d.job_status;
       r.assigned_to = d.assigned_to;
@@ -2338,6 +2384,7 @@ export const ENTITIES: Record<string, Entity> = {
       await linkCustomerOrganization(ctx, r.customer);
       await writeJobTeams(ctx, id, r, false);
       await writeJobTags(ctx, id, r.job_tags);
+      await writeJobAssets(ctx, id, r.assets);
     },
   },
   estimates: {
@@ -2387,6 +2434,7 @@ export const ENTITIES: Record<string, Entity> = {
       // The quote's own files. `fetch` reads every quote in full, so these come over on an import as well as on an event.
       await writeRecordFiles(ctx, "quote", id, r);
       await writeDocumentNotes(ctx, "quote", id, r);
+      await fillCustomerAddressList(ctx, r.customer);
     },
   },
   invoices: {
@@ -2447,6 +2495,7 @@ export const ENTITIES: Record<string, Entity> = {
       await writeRecordFiles(ctx, "invoice", id, r);
       await writeDocumentNotes(ctx, "invoice", id, r);
       await writeInvoiceStatusHistory(ctx, id, r.status_history);
+      await fillCustomerAddressList(ctx, r.customer);
     },
   },
 };
