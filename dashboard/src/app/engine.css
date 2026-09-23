@@ -22,7 +22,10 @@
 .brand-mark { display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 7px; background: var(--accent); color: var(--bg); font-size: 14px; }
 nav.site { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; }
 .nav-group { display: inline-flex; align-items: center; gap: 2px; }
-.nav-label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); margin-right: 6px; }
+/* The two groups are told apart by a rule, not by a word: a grey word beside the links reads as a disabled one. */
+.nav-group + .nav-group { border-left: 1px solid var(--line); padding-left: 14px; margin-left: 4px; }
+/* Wrapped onto its own line, a left border would sit under nothing — the rows are separation enough. */
+@media (max-width: 720px) { .nav-group + .nav-group { border-left: 0; padding-left: 0; margin-left: 0; } }
 nav.site a { color: var(--dim); text-decoration: none; font-size: 13px; padding: 5px 9px; border-radius: 6px; }
 nav.site a:hover { color: var(--ink); background: var(--muted-bg); }
 nav.site a.on { color: var(--ink); background: var(--muted-bg); font-weight: 600; }
