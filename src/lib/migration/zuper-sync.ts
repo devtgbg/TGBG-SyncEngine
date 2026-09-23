@@ -1454,7 +1454,8 @@ async function writeInvoiceStatusHistory(ctx: Ctx, invoiceId: string, history: a
 /** Tuper's copy of a Zuper payment term. Terms are not imported as records of their own, so they are matched by the
  *  name Zuper answers ("Immediatly", "Monthly"), which is the name Tuper's seeded terms carry. */
 async function paymentTermId(ctx: Ctx, term: unknown): Promise<string | null> {
-  const name = T((term as { payment_term_name?: unknown } | null)?.payment_term_name);
+  const t = term as { payment_term_name?: unknown; payment_term_uid?: unknown } | null;
+  const name = T(t?.payment_term_name);
   if (!name) return null;
   const cache: Map<string, string | null> = (ctx.extra.paymentTermIds ??= new Map());
   const key = name.trim().toLowerCase();
@@ -1467,7 +1468,12 @@ async function paymentTermId(ctx: Ctx, term: unknown): Promise<string | null> {
     }
     if (!cache.has(key)) cache.set(key, null);
   }
-  return cache.get(key) ?? null;
+  const id = cache.get(key) ?? null;
+  // Zuper answers a uid for the term beside its name, and has no list of terms to import: the uid is kept against the
+  // matched term, so Tuper answers Zuper's own id for it rather than its row id.
+  const uid = T(t?.payment_term_uid);
+  if (id && uid && !(await ctxMap(ctx, "payment_terms")).has(uid)) await setMap(ctx, "payment_terms", uid, id);
+  return id;
 }
 /** Zuper's customer list has no organization, but jobs name it — fill it in on a customer that has none. */
 async function linkCustomerOrganization(ctx: Ctx, customer: any): Promise<void> {
