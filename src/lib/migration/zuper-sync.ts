@@ -596,6 +596,15 @@ async function jobCategoryId(ctx: Ctx, c: any): Promise<string | null> {
     return (res.data as { id: string }).id;
   });
 }
+/** A category Zuper has deleted: its jobs still name it and say so, where Zuper's category list leaves it out. */
+async function markCategoryDeleted(ctx: Ctx, id: string): Promise<void> {
+  await once(ctx, `job_category_deleted:${id}`, async () => {
+    const { error } = await ctx.client.schema("jms").from("job_categories")
+      .update({ is_deleted: true, is_active: false }).eq("tenant_id", ctx.tenantId).eq("id", id).eq("is_deleted", false);
+    if (error) throw error;
+    return id;
+  });
+}
 /** The jms status for an embedded Zuper status (a job's current status or a history entry) — created
  *  on the spot in the job's category when the status workflow import didn't include it. Such a status is one Zuper
  *  has taken out of the category: it's kept for the jobs and history that use it but not offered as a next status
@@ -802,6 +811,15 @@ async function writeJobAssignments(ctx: Ctx, jobId: string, r: any, isNew: boole
   if (!isNew) { const { error } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("job_id", jobId); if (error) throw error; }
   if (rows.length) { const { error } = await tbl().insert(rows); if (error) throw error; }
 }
+/**
+ * The status name and kind a job carries, which Zuper keeps as they were when the job was given that status: GBG
+ * renamed statuses ("Invoiced" → "Closed"), and Zuper still answers the old name on the older job (Tuper 00228).
+ */
+const statusAsGiven = (s: any): Record<string, unknown> =>
+  (s && typeof s === "object"
+    ? { ...(T(s.status_name) ? { current_status_name: T(s.status_name) } : {}), ...(T(s.status_type) ? { current_status_type: String(s.status_type).toUpperCase() } : {}) }
+    : {});
+
 /** "#AA7942" as Zuper sends it, or null when it isn't a six-digit colour (the status's own colour is used then). */
 // As Zuper holds it ("#02B875"): its answers keep the case, and CSS doesn't care.
 export const hexColor = (v: unknown): string | null => (typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v.trim()) ? v.trim() : null);
@@ -2121,6 +2139,10 @@ export const ENTITIES: Record<string, Entity> = {
         // The colour the status had when it was set, which Zuper keeps with the job (migration 00100).
         current_status_color: hexColor(r.current_job_status?.status_color),
         priority: JOB_PRIORITIES.has(priority) ? priority : "LOW", job_type: r.job_type === "REVISIT" ? "REVISIT" : "NEW",
+        // What Zuper keeps on the job itself (Tuper 00228): the status's name and kind as they were when the job was
+        // given it (a status since renamed answers its old name on the job), and Zuper's own money figure.
+        ...statusAsGiven(r.current_job_status),
+        ...sent(r, "job_total", "job_total", (v) => (v == null ? null : num0(v))),
         customer_id, organization_id, no_customer,
         scheduled_start_time: ts(r.scheduled_start_time), scheduled_end_time: end,
         // jobs_end_or_due_ck: a job needs an end or a due date.
@@ -2194,6 +2216,7 @@ export const ENTITIES: Record<string, Entity> = {
       const parent = parentUid && parentUid !== r.job_uid ? mapGet(await ctxMap(ctx, "jobs"), parentUid) : null;
       // Category + current status as Zuper has them now — also fills jobs whose status wasn't known.
       const category = await jobCategoryId(ctx, d.job_category);
+      if (category && d.job_category?.is_deleted === true) await markCategoryDeleted(ctx, category);
       const status = await jobStatusId(ctx, d.current_job_status, category);
       r._category_id = category;
       return {
@@ -2201,6 +2224,13 @@ export const ENTITIES: Record<string, Entity> = {
         ...(parent ? { parent_job_id: parent } : {}),
         ...(category ? { category_id: category } : {}),
         ...(status ? { current_status_id: status, current_status_color: hexColor(d.current_job_status?.status_color) } : {}),
+        // The rest of what Zuper keeps on the job itself (Tuper 00228).
+        ...statusAsGiven(d.current_job_status),
+        ...sent(d, "job_total", "job_total", (v) => (v == null ? null : num0(v))),
+        ...(d.gallery && typeof d.gallery === "object" ? { gallery_enabled: d.gallery.is_enabled !== false } : {}),
+        // Zuper's own answer about the job's territory, conflicts and all: Tuper worked it out again and said a job
+        // with no territory had NO_TERRITORY_FOUND, where Zuper's own answer for the same job is no conflict at all.
+        ...("service_territory" in d ? { territory_check: d.service_territory ?? null } : {}),
         is_recurring: d.is_recurrence === true,
         // Who made the job. The list pass ran before inactive and deleted staff were in Tuper, and 2,311 jobs were
         // left with no creator; one Tuper doesn't have yet is imported on sight.
@@ -2868,6 +2898,105 @@ ENTITIES.customer_categories = {
     return { name: T(r.category_name) ?? "Category", is_active: r.is_deleted !== true };
   },
 };
+
+// Zuper's skills (Settings › Skills, its own uid for each): a job names the skills it needs, and without these Tuper
+// answered a skill's name where Zuper answers its uid. One of Tuper's own with the same name is the same skill.
+ENTITIES.skills = {
+  name: "skills", schema: "jms", table: "skills",
+  fetch: (ctx) => zuperGet(ctx.cfg, "/api/skills").then((j) => j.data ?? []),
+  uid: (r) => r.skillset_uid,
+  async transform(r, ctx) {
+    const name = T(r.skillset_name) ?? "Skill";
+    const map = await ctxMap(ctx, "skills");
+    if (!map.has(String(r.skillset_uid))) {
+      const tbl = () => ctx.client.schema("jms").from("skills");
+      const { data, error } = await tbl().select("id, name").eq("tenant_id", ctx.tenantId);
+      if (error) throw error;
+      let id = ((data ?? []) as { id: string; name: string }[]).find((x) => x.name.trim().toLowerCase() === name.toLowerCase())?.id;
+      if (!id) {
+        const made = await tbl().insert({ tenant_id: ctx.tenantId, name, is_active: r.is_deleted !== true }).select("id").single();
+        if (made.error) throw made.error;
+        id = (made.data as { id: string }).id;
+      }
+      await setMap(ctx, "skills", String(r.skillset_uid), id);
+    }
+    return {
+      // Zuper's own name, so a job's skill matches by name as well as by uid ("Breakdown recovery", not "Breakdown Recovery").
+      name, description: T(r.skillset_description),
+      ...(N(r.default_validity) === null ? {} : { default_validity: N(r.default_validity) }),
+      ...(N(r.display_order) === null ? {} : { display_order: N(r.display_order) }),
+      is_active: r.is_deleted !== true,
+    };
+  },
+};
+
+/** Zuper's module names for the custom fields it holds, and the kind of record each is in Tuper. */
+const CUSTOM_FIELD_MODULES: [string, string][] = [
+  ["JOB", "JOB"], ["CUSTOMER", "CUSTOMER"], ["ASSET", "ASSET"], ["ORGANIZATION", "ORGANIZATION"],
+  ["ESTIMATE", "QUOTE"], ["INVOICE", "INVOICE"], ["PRODUCT", "PRODUCT"], ["USER", "USER"],
+];
+
+/**
+ * Tuper's definition for one of Zuper's custom fields, by its label within that kind of record: a field Tuper learned
+ * from a record that carried it is the same field, mapped rather than made twice. A field nobody has filled in is made
+ * here — three of GBG's asset fields were missing from every asset's custom_field_internal_object because no asset
+ * carries them.
+ */
+async function customFieldDefinitionId(ctx: Ctx, entityType: string, f: any): Promise<string | null> {
+  const uid = T(f?.custom_field_uid), label = T(f?.field_name);
+  if (!uid || !label) return null;
+  const map = await ctxMap(ctx, "custom_field_definitions");
+  if (map.has(uid)) return map.get(uid)!;
+  return once(ctx, `custom_field_definition:${uid}`, async () => {
+    const tbl = () => ctx.client.schema("jms").from("custom_field_definitions");
+    const { data, error } = await tbl().select("id, label").eq("tenant_id", ctx.tenantId).eq("entity_type", entityType);
+    if (error) throw error;
+    let id = ((data ?? []) as { id: string; label: string }[]).find((x) => String(x.label).trim().toLowerCase() === label.toLowerCase())?.id;
+    if (!id) {
+      // Only a field being made takes Zuper's kind: changing the kind of one that already holds values would move
+      // where those values live (a MULTI_SELECTION keeps them as a list).
+      const made = await tbl().insert({
+        tenant_id: ctx.tenantId, entity_type: entityType, field_key: snakeKey(label), label,
+        field_type: jmsFieldType(f.field_type), display_order: N(f.display_order) ?? 0,
+        config: { zuper_type: String(f.field_type ?? "") },
+      }).select("id").single();
+      if (made.error) throw made.error;
+      id = (made.data as { id: string }).id;
+    }
+    await setMap(ctx, "custom_field_definitions", uid, id);
+    return id;
+  });
+}
+
+// Zuper's own list of each module's custom fields (Settings › Custom Fields), so Tuper holds the fields themselves and
+// not only the ones some record happens to carry.
+ENTITIES.custom_field_defs = {
+  name: "custom_field_defs", schema: "jms", table: "custom_field_definitions", mapEntity: "custom_field_definitions",
+  async fetch(ctx) {
+    const out: any[] = [];
+    for (const [module, entityType] of CUSTOM_FIELD_MODULES) {
+      const answer = await zuperGet(ctx.cfg, `/api/settings/custom_fields?module_name=${module}`).catch(() => null);
+      for (const f of (answer?.data ?? []) as any[]) out.push({ ...f, _entityType: entityType });
+    }
+    return out;
+  },
+  uid: (r) => r.custom_field_uid,
+  async transform(r, ctx) {
+    await customFieldDefinitionId(ctx, r._entityType, r);
+    // What Zuper says about the field, beside its kind: a field Tuper learned from a record was made required-less,
+    // shown to everyone and writable, whatever Zuper's settings said.
+    return {
+      label: T(r.field_name) ?? "Field",
+      is_required: r.is_required === true, hide_to_fe: r.hide_to_fe === true,
+      hide_field: r.hide_field === true, read_only: r.read_only === true,
+      ...(N(r.display_order) === null ? {} : { display_order: N(r.display_order) }),
+      // Zuper's own key for the field (custom_field_internal_object is keyed by it) and that the field is one of the
+      // module's own, which is the list that object answers — not the fields a record happens to carry.
+      config: { zuper_type: String(r.field_type ?? ""), ...(T(r.internal_key) ? { zuper_key: T(r.internal_key) } : {}), module_field: true },
+    };
+  },
+};
+
 // Zuper's request statuses (Open, Booked, Canceled for GBG), in its order, with their colour and description.
 ENTITIES.request_statuses = {
   name: "request_statuses", schema: "jms", table: "request_statuses",
