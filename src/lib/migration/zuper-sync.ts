@@ -1902,6 +1902,14 @@ export const ENTITIES: Record<string, Entity> = {
       const uid = (r.team ?? r).team_uid;
       const one = uid ? (await zuperGet(ctx.cfg, `/api/team/${uid}`)).data : null;
       await writeTeamMembers(ctx, id, Array.isArray(one?.users) ? { users: one.users } : r);
+      // Zuper's team LIST carries no updated_at and its by-uid read does, so the team's own time comes from here —
+      // all 5 teams answered when the sync last wrote them instead of when Zuper last changed them.
+      const changed = T((one?.team ?? one)?.updated_at);
+      if (changed) {
+        const { error } = await ctx.client.schema("jms").from("teams").update({ updated_at: changed })
+          .eq("tenant_id", ctx.tenantId).eq("id", id);
+        if (error) throw error;
+      }
     },
   },
 
@@ -2076,6 +2084,9 @@ export const ENTITIES: Record<string, Entity> = {
         role_id: mapGet(ctx.extra.roles, r.role?.role_key), home_phone: T(r.home_phone_number), mobile_phone: T(r.mobile_phone_number),
         work_phone: T(r.work_phone_number), external_login_id: T(r.external_login_id), hourly_labor_charge: N(r.hourly_labor_charge),
         licence_type: T(r.license_type), is_billable: r.is_billable !== false,
+        // Whether Zuper calls them active, as it answers it (00233): its own support account is deleted and active,
+        // where a technician it deleted is neither, so this cannot be worked out from Tuper's row.
+        ...("is_active" in (r ?? {}) ? { zuper_is_active: r.is_active !== false } : {}),
         // Who added the person. Zuper's /api/user/all list leaves created_by out; its by-uid read carries it.
         ...(await createdByField(ctx, r)),
         // The person's own times (Tuper 00208): created and last changed in Zuper, and the last sign-in there — which a
@@ -2576,6 +2587,8 @@ ENTITIES.user_details = {
     r._photo = d.profile_picture;
     // The access role the person has in Zuper (owner OK 2026-09-22): it decides what they may do in Tuper too.
     const access = {
+      // Whether Zuper calls them active (00233) — its own deleted support account is active, a deleted technician is not.
+      ...("is_active" in d ? { zuper_is_active: d.is_active !== false } : {}),
       ...("access_role" in d
         ? { access_role_id: d.access_role?.access_role_uid ? mapGet(await ctxMap(ctx, "access_roles"), d.access_role.access_role_uid) : null }
         : {}),
