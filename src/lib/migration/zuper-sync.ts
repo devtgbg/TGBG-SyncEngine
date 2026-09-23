@@ -794,6 +794,9 @@ async function writeJobAssignments(ctx: Ctx, jobId: string, r: any, isNew: boole
   const teams = await ctxMap(ctx, "teams");
   const seen = new Set<string>();
   const rows: Record<string, unknown>[] = [];
+  // Zuper answers a job's people in its own order, which Tuper now keeps (display_order, 00231): read back by row id
+  // they came out shuffled on 10 of 11 jobs with three or more people.
+  let place = 0;
   for (const a of r.assigned_to ?? []) {
     // An assignee's role carries Zuper's dates for it (writeRole).
     await writeRole(ctx, a.user?.role);
@@ -806,7 +809,7 @@ async function writeJobAssignments(ctx: Ctx, jobId: string, r: any, isNew: boole
     const at = ts(a.assigned_at);
     const accepted = a.is_accepted === true || String(a.acceptance_status ?? "").toUpperCase() === "ACCEPTED";
     rows.push({
-      tenant_id: ctx.tenantId, job_id: jobId, user_id: userId, is_primary: a.is_primary === true,
+      tenant_id: ctx.tenantId, job_id: jobId, user_id: userId, is_primary: a.is_primary === true, display_order: place++,
       team_id: mapGet(teams, a.team?.team_uid),
       accepted_at: accepted ? at ?? ts(r.updated_at) ?? ts(r.created_at) : null,
       // Every row names the column (one insert carries them all, and a row that left it out went as NULL and failed
@@ -2824,7 +2827,7 @@ export async function writeProductStockAndFields(ctx: Ctx, productId: string, r:
     const locationId = await stockLocationId(ctx, a.location, a.location?.is_deleted !== true);
     if (!locationId) continue;
     // When the part was first stocked there, as Zuper has it.
-    stock.set(locationId, { tenant_id: ctx.tenantId, product_id: productId, location_id: locationId, quantity: num0(a.quantity), min_quantity: num0(a.min_quantity), serial_nos: ((a.serial_nos ?? []) as unknown[]).map(String), created_at: a.created_at ? String(a.created_at) : new Date().toISOString() });
+    stock.set(locationId, { tenant_id: ctx.tenantId, product_id: productId, location_id: locationId, quantity: num0(a.quantity), min_quantity: N(a.min_quantity), serial_nos: ((a.serial_nos ?? []) as unknown[]).map(String), created_at: a.created_at ? String(a.created_at) : new Date().toISOString() });
   }
   if (stock.size) {
     const { error } = await ctx.client.schema("jms").from("product_locations").upsert([...stock.values()], { onConflict: "product_id,location_id" });
@@ -3149,17 +3152,38 @@ const stockAction = (r: any): string => {
   return "TRANSFER";   // what every movement of GBG's is, and what this wrote before there was anything else to say
 };
 
+/**
+ * A part named only by uid and name — all a stock movement carries for one Zuper has deleted. Written flagged deleted,
+ * so no picker offers it and the movement keeps its part.
+ */
+async function namedPartOnSight(ctx: Ctx, uid: string | null, name: string | null): Promise<string | null> {
+  if (!uid || !name) return null;
+  const known = mapGet(await ctxMap(ctx, "products"), uid);
+  if (known) return known;
+  return once(ctx, `product:${uid}`, async () => {
+    const made = await ctx.client.schema("jms").from("products").insert({
+      tenant_id: ctx.tenantId, name, product_type: "PRODUCT", unit_price: 0,
+      is_deleted: true, deleted_at: new Date().toISOString(), is_available: false,
+    }).select("id").single();
+    if (made.error) throw made.error;
+    const id = (made.data as { id: string }).id;
+    await setMap(ctx, "products", uid, id);
+    return id;
+  });
+}
+
 ENTITIES.product_transactions = {
   name: "product_transactions", schema: "jms", table: "product_transactions", deps: ["products", "users", "stock_locations"], concurrency: 8,
   pages: (ctx) => zuperListPages(ctx.cfg, "/api/product/transaction", 100),
   uid: (r) => r.transaction_uid,
   async transform(r, ctx) {
     const productUid = T(r.product?.product_uid);
-    const productId = mapGet(await ctxMap(ctx, "products"), productUid);
-    // jms.product_transactions.product_id is NOT NULL: a movement has to hang off a part. Zuper keeps movements of
-    // parts it has since deleted — `GET /api/product/{uid}` answers "Invalid Product UID" for them and its own product
-    // list leaves them out — so those cannot come over. Said plainly, because it is the reason a run reports failures.
-    if (!productId) throw new Error(`stock movement ${r.transaction_uid}: its part ${productUid ?? "(none named)"} (${T(r.product?.product_name) ?? "unnamed"}) is not in Zuper's product list`);
+    // A movement has to hang off a part, and Zuper keeps movements of parts it has since deleted: its product list
+    // leaves them out and `GET /api/product/{uid}` answers "Invalid Product UID". The movement names the part, so the
+    // part is written from that name, flagged deleted — 445 of GBG's 773 movements were dropped for want of it.
+    const productId = mapGet(await ctxMap(ctx, "products"), productUid)
+      ?? (await namedPartOnSight(ctx, productUid, T(r.product?.product_name)));
+    if (!productId) throw new Error(`stock movement ${r.transaction_uid}: it names no part`);
     return {
       product_id: productId,
       location_id: r.from_location ? await stockLocationId(ctx, r.from_location, false) : null,
