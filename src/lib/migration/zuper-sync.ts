@@ -400,10 +400,14 @@ function zAddress(a: any): Record<string, unknown> | null {
   if (!a || typeof a !== "object") return null;
   const g: number[] = Array.isArray(a.geo_cordinates) ? a.geo_cordinates.map(Number) : [];
   const geo = g.length === 2 && g.every((x) => Number.isFinite(x)) && (g[0] !== 0 || g[1] !== 0); // [lat, lng]; 0,0 = unset
+  // Each part exactly as Zuper holds it (asTyped): trimming turned "Expo City Dubai " into "Expo City Dubai" on 5 of 8
+  // requests read, and an empty zip code into none where Zuper answers "".
   const out = {
-    street: T(a.street), landmark: T(a.landmark), city: T(a.city), state: T(a.state), country: T(a.country), zip_code: T(a.zip_code),
+    street: asTyped(a.street), landmark: asTyped(a.landmark), city: asTyped(a.city), state: asTyped(a.state),
+    country: asTyped(a.country), zip_code: asTyped(a.zip_code),
     latitude: geo ? g[0] : null, longitude: geo ? g[1] : null,
-    contact_first_name: T(a.first_name), contact_last_name: T(a.last_name), contact_email: T(a.email), contact_phone: T(a.phone_number),
+    contact_first_name: asTyped(a.first_name), contact_last_name: asTyped(a.last_name),
+    contact_email: asTyped(a.email), contact_phone: asTyped(a.phone_number),
   };
   return [out.street, out.landmark, out.city, out.state, out.country, out.zip_code].some(Boolean) ? out : null;
 }
@@ -526,9 +530,12 @@ export function customerFields(r: any): Record<string, unknown> {
   const first = T(r.customer_first_name), company = T(r.customer_company_name), email = T(r.customer_email);
   const cn = r.customer_contact_no ?? {}, acc = r.accounts ?? {};
   return {
-    first_name: first ?? company ?? email ?? "Customer", last_name: T(r.customer_last_name), company_name: company, email,
+    first_name: first ?? company ?? email ?? "Customer", last_name: T(r.customer_last_name), company_name: company,
+    // The address as Zuper holds it: "" where it holds "", none where it holds none (it answers both, record by record).
+    email: "customer_email" in (r ?? {}) ? asTyped(r.customer_email) : email,
     additional_emails: ((r.additional_emails ?? []) as unknown[]).map((e) => T(e)).filter(Boolean),
-    contact_no: { mobile: T(cn.mobile), home: T(cn.home), work: T(cn.work) },
+    // As Zuper holds them: "" kept, so a customer with an empty work number answers "" as Zuper does, not none.
+    contact_no: { mobile: asTyped(cn.mobile), home: asTyped(cn.home), work: asTyped(cn.work) },
     accounts: { tax: null, ltv: num0(acc.ltv), receivables: num0(acc.receivables), credits: num0(acc.credits) },
     is_portal_enabled: r.is_portal_enabled === true, has_card_on_file: r.has_card_on_file === true, tax_exempt: r.tax?.tax_exempt === true,
     has_sla: r.has_sla === true, do_not_service: r.do_not_service === true,
@@ -2119,7 +2126,8 @@ export const ENTITIES: Record<string, Entity> = {
         description: T(r.plain_text_description) ?? stripHtml(r.request_description),
         // Zuper's own rich description, so Tuper answers the request_description it answers rather than a rebuild of
         // it from the plain text (00093 added the column; nothing filled it).
-        description_html: T(r.request_description),
+        // As Zuper holds it, "" and none kept apart: it answers "" on one request and null on another.
+        description_html: asTyped(r.request_description),
         asset_id: mapGet(await ctxMap(ctx, "assets"), r.asset?.asset_uid),
         customer_id: await customerId(ctx, r.customer), organization_id: await organizationId(ctx, r.organization),
         // Zuper's own status (owner decision 2026-09-21, 00198), and the request's copy of its colour: Zuper answers
@@ -2611,7 +2619,7 @@ ENTITIES.customer_details = {
       // Zuper's own last change, so this write keeps it (Tuper 00220).
       ...(d.updated_at ? { updated_at: String(d.updated_at) } : {}),
       ...(n && typeof n === "object" ? { notifications: { email: n.email !== false, sms: n.sms === true, call: n.call === true } } : {}),
-      ...sent(d, "customer_description", "description", (v) => T(v)),
+      ...sent(d, "customer_description", "description", (v) => asTyped(v)),
       ...sent(d, "plain_text_description", "plain_text_description", (v) => T(v)),
       ...sent(d, "markdown_description", "markdown_description", (v) => T(v)),
       ...sent(d, "visible_to_all", "visible_to_all", (v) => v === true),
