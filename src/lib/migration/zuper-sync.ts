@@ -2468,6 +2468,7 @@ ENTITIES.user_details = {
   uid: (r) => r.user_uid,
   async transform(r, ctx) {
     const d = (await zuperGet(ctx.cfg, `/api/user/${r.user_uid}`)).data ?? {};
+    r._photo = d.profile_picture;
     // The access role the person has in Zuper (owner OK 2026-09-22): it decides what they may do in Tuper too.
     const access = {
       ...("access_role" in d
@@ -2485,6 +2486,19 @@ ENTITIES.user_details = {
       burden_rate: m?.burden_rate && typeof m.burden_rate === "object" && m.burden_rate.value != null ? num0(m.burden_rate.value) : null,
       worker_comp_code: T(m?.worker_comp_code),
     };
+  },
+  // Their picture. Tuper copied the photos of the people who had one when the users were imported (jms-avatars,
+  // 2026-09-14); 42 of 66 have none and answered an empty picture wherever a record names its maker. Zuper's own link
+  // fills those in, as the file links do elsewhere — a photo Tuper already holds is left alone.
+  async afterWrite(ctx, id, r) {
+    const url = T(r._photo);
+    if (!url || !/^https:\/\//.test(url)) return;
+    const users = () => ctx.client.schema("core").from("users");
+    const { data, error } = await users().select("avatar_url").eq("id", id).maybeSingle();
+    if (error) throw error;
+    if ((data as { avatar_url: string | null } | null)?.avatar_url) return;
+    const { error: upErr } = await users().update({ avatar_url: url }).eq("id", id);
+    if (upErr) throw upErr;
   },
 };
 ENTITIES.user_fields = zuperFieldPass("user_fields", "users", "users", "USER", {
