@@ -874,14 +874,46 @@ async function writeJobHistory(ctx: Ctx, jobId: string, r: any, isNew: boolean):
 /** A document's Zuper line items → jms.line_items (products linked through the products map). `taxes` is the
  *  document's own tax list: Zuper charges tax on the document, Tuper records it on each line, so every line Zuper did
  *  not mark exempt carries the document's tax. */
+/**
+ * The part a document's line names, where Tuper doesn't have it: Zuper deletes a part and stops answering it by uid
+ * (404), but every line that names it still carries the part's whole record (product_ref_id). That record is written
+ * here, flagged deleted, so the line keeps its part — and the quote answers Zuper's product_uid and the part itself,
+ * where it answered null for both.
+ */
+async function productOnSight(ctx: Ctx, line: any): Promise<string | null> {
+  const uid = T(line?.product_uid);
+  if (!uid) return null;
+  const known = mapGet(await ctxMap(ctx, "products"), uid);
+  if (known) return known;
+  const ref = line.product_ref_id && typeof line.product_ref_id === "object" ? line.product_ref_id : null;
+  if (!ref) return null;
+  return once(ctx, `product:${uid}`, async () => {
+    const payload = await ENTITIES.products.transform!({ ...ref, product_uid: uid }, ctx);
+    if (!payload) return null;
+    // The line's copy of the part names no service type, and a service needs one here (products_service_type_ck):
+    // Zuper's own default, a fixed-price service, stands in.
+    if (payload.product_type === "SERVICE" && !payload.service_type) payload.service_type = "FIXED";
+    const made = await ctx.client.schema("jms").from("products")
+      .insert({ ...payload, tenant_id: ctx.tenantId, is_deleted: true, deleted_at: new Date().toISOString() }).select("id").single();
+    if (made.error) throw made.error;
+    const id = (made.data as { id: string }).id;
+    await setMap(ctx, "products", uid, id);
+    // The part's own fields, which the line carries as meta_data — Zuper answers them on the embedded part too.
+    await writeProductStockAndFields(ctx, id, { ...ref, custom_fields: Array.isArray(ref.meta_data) ? ref.meta_data : [] });
+    return id;
+  });
+}
+
 async function writeLineItems(ctx: Ctx, parentType: "QUOTE" | "INVOICE" | "CONTRACT", parentId: string, items: any[] | undefined, isNew: boolean, taxes?: any[]): Promise<void> {
   const products = await ctxMap(ctx, "products");
   const taxId = await documentTaxId(ctx, taxes);
   // A line names a stock location Zuper may since have deleted (GBG's "The Pitstop - JGE", on 18 quote lines). It is
   // found or made by name, inactive, as a product's stock does; mapping it by uid alone left those lines with none.
   const lineLocations: (string | null)[] = [];
+  const lineProducts: (string | null)[] = [];
   for (const l of items ?? []) {
     lineLocations.push(T(l?.location_uid) ? await stockLocationId(ctx, { location_uid: l.location_uid, location_name: l.location_name }, false) : null);
+    lineProducts.push(mapGet(products, l?.product_uid) ?? (await productOnSight(ctx, l)));
   }
   const tbl = () => ctx.client.schema("jms").from("line_items");
   if (!isNew) { const { error } = await tbl().delete().eq("tenant_id", ctx.tenantId).eq("parent_type", parentType).eq("parent_id", parentId); if (error) throw error; }
@@ -890,7 +922,7 @@ async function writeLineItems(ctx: Ctx, parentType: "QUOTE" | "INVOICE" | "CONTR
     const discount = String(l.discount_type).toUpperCase() === "PERCENTAGE" ? r2((qty * price * num0(l.discount)) / 100) : num0(l.discount);
     const type = String(l.line_item_type ?? "ITEM").toUpperCase();
     return {
-      tenant_id: ctx.tenantId, parent_type: parentType, parent_id: parentId, product_id: mapGet(products, l.product_uid),
+      tenant_id: ctx.tenantId, parent_type: parentType, parent_id: parentId, product_id: lineProducts[i] ?? null,
       description: T(l.name) ?? "Item", quantity: qty, unit_price: price, discount_amount: discount, tax_amount: 0,
       total: num0(l.total) || r2(qty * price - discount), display_order: i + 1,
       // The line's own copy of the item, as Zuper's quote and invoice tables show it (00083).
@@ -2765,7 +2797,7 @@ async function stockLocationId(ctx: Ctx, loc: any, active = true): Promise<strin
 }
 
 /** A product's stock at each location (Zuper's location_availability) and its custom fields. */
-async function writeProductStockAndFields(ctx: Ctx, productId: string, r: any): Promise<void> {
+export async function writeProductStockAndFields(ctx: Ctx, productId: string, r: any): Promise<void> {
   const stock = new Map<string, Record<string, unknown>>();
   for (const a of (r.location_availability ?? []) as any[]) {
     const locationId = await stockLocationId(ctx, a.location, a.location?.is_deleted !== true);
