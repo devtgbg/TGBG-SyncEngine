@@ -113,15 +113,29 @@ export async function zuperWebhooks(): Promise<Hook[]> {
   return out;
 }
 
-/** Every webhook registered in Tuper. Tuper says whether one has a secret, never what it is. */
+/**
+ * Every webhook registered in Tuper. Tuper says whether one has a secret, never what it is.
+ *
+ * Paged, as Zuper's list is: `count` is capped at 100 a page however large a number is asked for. Asking once for a
+ * thousand returned the first hundred and looked complete, so when Tuper went from 10 registrations to 189 the ten
+ * this engine acts on fell outside that page and the dashboard read "0 of 10 working".
+ */
 export async function tuperWebhooks(): Promise<Hook[]> {
-  const path = "/service/notifications/webhook?count=1000";
-  const r = await call("tuper", "GET", `${config.tuper.url}${path}`, path, config.tuper.apiKey);
-  if (!r.ok) throw new Error(`Tuper's webhook list answered ${r.status}`);
-  return ((r.json?.data ?? []) as any[]).map((w) => ({
-    uid: String(w.webhook_uid ?? ""), module: String(w.webhook_module ?? ""), event: String(w.webhook_event ?? ""),
-    url: String(w.webhook_url ?? ""), active: w.is_active === true, signed: w.has_secret === true,
-  }));
+  const out: Hook[] = [];
+  for (let page = 1; page <= 20; page++) {
+    const path = `/service/notifications/webhook?page=${page}&count=100`;
+    const r = await call("tuper", "GET", `${config.tuper.url}${path}`, path, config.tuper.apiKey);
+    if (!r.ok) throw new Error(`Tuper's webhook list answered ${r.status}`);
+    const rows = (r.json?.data ?? []) as any[];
+    for (const w of rows) {
+      out.push({
+        uid: String(w.webhook_uid ?? ""), module: String(w.webhook_module ?? ""), event: String(w.webhook_event ?? ""),
+        url: String(w.webhook_url ?? ""), active: w.is_active === true, signed: w.has_secret === true,
+      });
+    }
+    if (rows.length < 100) break;
+  }
+  return out;
 }
 
 /** Zuper events Zupersync acts on, by module. */

@@ -158,7 +158,8 @@ export default async function Connections() {
       <section className="card">
         <header className="card-head">
           <h2><span className="src tuper">Tuper</span> webhooks → Zupersync</h2>
-          <p className="note">Tuper sends each change to <span className="mono">{cat.tuperEndpoint}</span>, signed with its secret. Tuper builds the body from the webhook&apos;s module, so the module has to be the one Tuper&apos;s catalogue names, or the body carries no record id.</p>
+          <p className="note">Tuper sends each change to <span className="mono">{cat.tuperEndpoint}</span>, signed with its secret. Tuper builds the body from the webhook&apos;s module, so the module has to be the one Tuper&apos;s catalogue names, or the body carries no record id.
+            {tHooks.length > cat.tuperEvents.length ? <> Tuper has <strong>{tHooks.length}</strong> webhooks pointed here; the {cat.tuperEvents.length} below are the ones this engine acts on — the rest are recorded and skipped.</> : null}</p>
         </header>
         {conn.tuper?.error ? <p className="error">Tuper&apos;s webhook list could not be read: {conn.tuper.error}</p> : null}
         {conn.tuper?.wrongModule.length ? (
