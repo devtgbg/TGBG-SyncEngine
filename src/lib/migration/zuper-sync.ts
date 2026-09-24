@@ -3212,6 +3212,17 @@ async function workflowAction(ctx: Ctx, a: any): Promise<Record<string, unknown>
   return { type: "log", not_built: kind, display_name: T(a?.display_name) ?? kind };
 }
 
+/**
+ * Whether an imported workflow is switched on: off for one Tuper doesn't hold yet, and otherwise whatever it is
+ * set to now. Turning one on is the owner's decision, so a later import must never undo it.
+ */
+async function workflowStaysOff(ctx: Ctx, uid: string): Promise<boolean> {
+  const { data, error } = await ctx.client.schema("jms").from("workflows")
+    .select("is_active").eq("tenant_id", ctx.tenantId).eq("zuper_uid", uid).maybeSingle();
+  if (error) throw error;
+  return (data as { is_active: boolean } | null)?.is_active === true;
+}
+
 ENTITIES.workflows = {
   name: "workflows", schema: "jms", table: "workflows", concurrency: 2,
   deps: ["job_categories", "job_statuses", "users", "teams", "customers", "organizations", "request_statuses"],
@@ -3260,8 +3271,14 @@ ENTITIES.workflows = {
       allowed_users: allowedUsers, allowed_teams: allowedTeams,
       allow_workflow_to_trigger: r.allow_workflow_to_trigger !== false,
       conditions, actions,
-      // A workflow Tuper can't fire is held switched off whatever Zuper says, so it can never half-run.
-      is_active: event ? r.is_active === true : false,
+      // A workflow arrives switched off, as the reminders and the job notification rules did before it. Zuper has
+      // one of these live — it emails three people on every new request — and Tuper's mailbox is set up, so an
+      // import that carried it over active would start sending the moment it ran. The owner (2026-09-24) reads
+      // each one in Settings › Workflow and switches on what they want.
+      //
+      // Whether it is on is then theirs, not Zuper's: a workflow Tuper already holds keeps the setting it has, so
+      // running this again never switches off what the owner switched on.
+      is_active: await workflowStaysOff(ctx, String(r.workflow_uid)),
       is_deleted: r.is_deleted === true,
       created_by: await userOnSight(ctx, r.created_by),
       ...ownTimes(r),
