@@ -589,11 +589,34 @@ export async function processEvent(delivery: Delivery): Promise<SyncOneResult | 
       return { entity: route.entity, uid: "", action: r.written ? "updated" : "skipped", id: null };
     }
 
-    const uid = route.uidFields.map((f) => findUid(delivery.body, f)).find(Boolean) || delivery.uid || null;
+    // A bulk action names every record it touched at once: job.bulk_action carries `job_uid` as a LIST (and an
+    // `action`, "delete" on the ones seen), and the other modules' bulk events do the same. Read as a single uid it
+    // found nothing and the delivery failed — 9 of them covering 146 jobs, which were only ever caught because a
+    // later pass re-read those jobs.
+    const uids = route.uidFields.flatMap((f) => findUids(delivery.body, f));
+    const uid = uids[0] || delivery.uid || null;
     if (!uid) {
       const reason = `none of ${route.uidFields.join(", ")} found in the delivered body`;
       await finish({ processed_at: new Date().toISOString(), sync_entity: route.entity, process_error: reason });
       return { action: "skipped", reason };
+    }
+    if (uids.length > 1) {
+      // The bulk itself says what was done; a route that always deletes (job.delete) still deletes.
+      const deleting = route.deletion || /^delete/i.test(String((delivery.body as Record<string, unknown> | null)?.action ?? ""));
+      let done = 0;
+      const failures: string[] = [];
+      for (const u of uids) {
+        try {
+          await (deleting
+            ? oneAtATime(u, () => markDeleted(route.entity, u))
+            : syncRecord(route.entity, u, { enrich: route.enrich, detail: route.detail, selfFetching: route.fetch === "self" }));
+          done++;
+        } catch (err) { failures.push(`${u}: ${errorText(err)}`); }
+      }
+      const note = `${deleting ? "deleted" : "re-read"} ${done} of ${uids.length}${failures.length ? `, ${failures.length} failed — ${failures[0]}` : ""}`;
+      await finish({ processed_at: new Date().toISOString(), sync_entity: route.entity, process_error: failures.length ? note.slice(0, 400) : null });
+      console.log(`[zupersync] ${route.module}/${delivery.event} → ${route.entity} ${note}`);
+      return { entity: route.entity, uid: uids[0], action: done ? (deleting ? "deleted" : "updated") : "skipped", id: null };
     }
 
     target = { route, uid };
@@ -665,6 +688,24 @@ export async function processPending(limit = 50): Promise<{ attempted: number; o
 }
 
 /** Find a uid in a body whose shape Zuper does not document. */
+/**
+ * The same lookup, for a field that may hold one uid or a list of them (a bulk action names every record it touched).
+ * Order is kept, so the first is the one a single-record path would have used.
+ */
+export function findUids(body: any, field: string, depth = 0): string[] {
+  if (!body || typeof body !== "object" || depth > 6) return [];
+  const direct = body[field];
+  if (typeof direct === "string" && direct) return [direct];
+  if (Array.isArray(direct)) {
+    const list = direct.filter((v): v is string => typeof v === "string" && Boolean(v));
+    if (list.length) return [...new Set(list)];
+  }
+  for (const v of Object.values(body)) {
+    if (v && typeof v === "object") { const hit = findUids(v, field, depth + 1); if (hit.length) return hit; }
+  }
+  return [];
+}
+
 function findUid(body: any, field: string, depth = 0): string | null {
   if (!body || typeof body !== "object" || depth > 6) return null;
   const direct = body[field];

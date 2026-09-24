@@ -257,8 +257,11 @@ const MODULES: Record<string, ModuleSpec> = {
       // Names only the series (recurring_job_uid), no job: the jobs a recurrence makes arrive as their own job.new
       // (2026-09-17: six job.new within the same second as the one job.new_recurrence, all synced).
       "job.new_recurrence": ["New Recurring Job", { skip: "names only the recurring series; each job it makes arrives as its own job.new" }],
-      // Deletes the recurrence rule, not the job.
-      "job.delete_recurrence": ["Delete Recurring Job"],
+      // Deletes the recurrence rule, not the job — and like job.new_recurrence it names only the series
+      // (recurring_job_uid, no job_uid), which this engine holds no record of. The jobs the rule removes arrive as
+      // their own job.delete: on 2026-09-23 one job.delete_recurrence came with ten job.delete inside the same
+      // minute, and on 2026-09-21 with two. Without this the delivery failed on every attempt for want of a job_uid.
+      "job.delete_recurrence": ["Delete Recurring Job", { skip: "names only the recurring series; each job it removes arrives as its own job.delete" }],
       "job.status_alert": ["Status Alert", NO_STATE("sending an alert")],
       // A punch also sets the job's actual start/end, so it re-reads the whole job; job_activity writes the log.
       "job.timelog_update": ["Update Job Timelog"],
