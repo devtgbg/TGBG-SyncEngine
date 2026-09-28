@@ -66,7 +66,7 @@ interface OutboxRow {
   previous: Record<string, unknown>;
   status: string;
   attempts: number;
-  queued_at: string;
+  queued_at: string | Date;
 }
 
 /**
@@ -88,9 +88,15 @@ interface OutboxRow {
  */
 export type Edits = Record<string, { previous: unknown; value: unknown }>;
 
-export function editsOf(rows: { operation: string; changed: Record<string, unknown>; previous?: Record<string, unknown>; queued_at: string }[]): Edits {
+/** When a row was queued, however the driver hands it over: pg parses timestamptz into a Date, not a string. */
+const queuedAt = (r: { queued_at: string | Date }): number => new Date(r.queued_at).getTime();
+
+export function editsOf(rows: { operation: string; changed: Record<string, unknown>; previous?: Record<string, unknown>; queued_at: string | Date }[]): Edits {
   const edits: Edits = {};
-  for (const r of [...rows].sort((a, b) => a.queued_at.localeCompare(b.queued_at))) {
+  // Oldest first, so the last edit of a column wins and the first remembers where it started. Sorted by instant
+  // rather than by text: the column arrives as a Date, and calling localeCompare on it threw — which in a dry run
+  // failed the row rather than planning it, 191 of them over one weekend.
+  for (const r of [...rows].sort((a, b) => queuedAt(a) - queuedAt(b))) {
     if (r.operation === "create") continue;
     for (const [k, v] of Object.entries(r.changed ?? {})) {
       if (k in edits) edits[k].value = v;                                  // the last edit wins
