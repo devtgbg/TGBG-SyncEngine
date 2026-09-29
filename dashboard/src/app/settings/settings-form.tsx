@@ -188,7 +188,7 @@ export function SettingsForm({ initial, version }: { initial: Settings; version:
                   {k.label}
                 </label>
               ))}
-              <p className="note">Not built yet, so never sent: {NOT_PUSHABLE.join(", ")}.</p>
+              <p className="note">Zuper → Tuper already carries every kind of record. What is missing is the way back: nothing turns a change made in Tuper into Zuper&apos;s own calls for {NOT_PUSHABLE.join(", ")}, so those are never sent whatever is ticked here.</p>
             </fieldset>
             <Switch checked={s.push.retryFailed} onChange={(v) => push({ retryFailed: v })} disabled={!pushOn}
               label="Retry changes that failed" about="Every 30 seconds, up to 5 tries each. A retry plans the change again; sending is still governed by the mode above." />

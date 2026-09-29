@@ -21,6 +21,11 @@ export const PUSHABLE: { key: string; label: string }[] = [
 ];
 
 /** Kinds Tuper can change that have no push yet, so the page can say so rather than leave them out. */
+/**
+ * Kinds Zuper → Tuper carries but no one can send back yet. They are not missing from the sync: every one of them is
+ * written into Tuper as Zuper changes it. What they have no code for is the other direction — the planner that turns
+ * a change made in Tuper into Zuper's own API calls (src/pusher.ts holds two, for jobs and customers).
+ */
 export const NOT_PUSHABLE = ["Organizations", "Assets", "Products", "Notes", "Quotes", "Invoices", "Contracts", "Requests", "Timesheets", "Users"];
 
 export const DEFAULTS: Settings = {
