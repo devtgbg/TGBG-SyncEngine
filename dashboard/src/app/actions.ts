@@ -33,6 +33,7 @@ function fromForm(f: FormData): Settings {
       deletes: on("deletes"),
       onConflict: f.get("onConflict"),
       maxAgeMinutes: Number(f.get("maxAgeMinutes")),
+      retryFailed: on("pushRetry"),
     },
     replay: on("replay"),
     sweep: { enabled: on("sweep"), everyMinutes: Number(f.get("sweepEvery")) },

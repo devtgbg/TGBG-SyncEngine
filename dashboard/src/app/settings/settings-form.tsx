@@ -51,6 +51,7 @@ function Submitted({ s }: { s: Settings }) {
       {flag("push", s.push.mode !== "off")}
       <input type="hidden" name="pushMode" value={s.push.mode === "live" ? "live" : "dry-run"} />
       {PUSHABLE.map((k) => <span key={k.key}>{flag(`entity:${k.key}`, s.push.entities.includes(k.key))}</span>)}
+      {flag("pushRetry", s.push.retryFailed)}
       {flag("deletes", s.push.deletes)}
       <input type="hidden" name="onConflict" value={s.push.onConflict} />
       <input type="hidden" name="maxAgeMinutes" value={s.push.maxAgeMinutes} />
@@ -189,6 +190,8 @@ export function SettingsForm({ initial, version }: { initial: Settings; version:
               ))}
               <p className="note">Not built yet, so never sent: {NOT_PUSHABLE.join(", ")}.</p>
             </fieldset>
+            <Switch checked={s.push.retryFailed} onChange={(v) => push({ retryFailed: v })} disabled={!pushOn}
+              label="Retry changes that failed" about="Every 30 seconds, up to 5 tries each. A retry plans the change again; sending is still governed by the mode above." />
             <Switch checked={s.push.deletes} onChange={(v) => push({ deletes: v })} disabled={!pushOn}
               label="Delete in Zuper when deleted in Tuper" about="Jobs only. A deletion in Zuper cannot be undone there." />
             <label className="field">

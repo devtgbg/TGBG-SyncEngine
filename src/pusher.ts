@@ -713,8 +713,12 @@ export async function pushPending(
   const cfg = await getSyncConfig(client, config.tenantId);
   if (!cfg.api_key) throw new Error("no Zuper API key configured");
 
-  // Dry run plans only fresh rows; live also takes rows a dry run already planned.
-  const statuses = mode === "live" ? ["queued", "planned", "failed"] : ["queued"];
+  // Live takes rows a dry run already planned as well as fresh ones. A dry run plans fresh rows, and — unless retrying
+  // is switched off — rows that failed: a plan reads Zuper and sends nothing, and without this a row that failed while
+  // planning was never looked at again. One ordering bug stranded 191 of them over a weekend.
+  const statuses = mode === "live"
+    ? (config.push.retryFailed ? ["queued", "planned", "failed"] : ["queued", "planned"])
+    : (config.push.retryFailed ? ["queued", "failed"] : ["queued"]);
   const data = await sql<OutboxRow>(
     `SELECT id, entity, jms_id, zuper_uid, operation, changed, previous, status, attempts, queued_at
        FROM sync.outbox

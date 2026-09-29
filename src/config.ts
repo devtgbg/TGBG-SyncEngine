@@ -173,6 +173,13 @@ export const config = {
     everySeconds: Math.max(10, Number(optional("PUSH_EVERY_SECONDS", "30"))),
     batch: Math.max(1, Number(optional("PUSH_BATCH", "20"))),
     maxAttempts: Math.max(1, Number(optional("PUSH_MAX_ATTEMPTS", "5"))),
+    /**
+     * Plan a row that failed again on the next pass, up to maxAttempts, in plan only as well as live. Off leaves a
+     * failed row where it is for a person to look at. A plan costs reads of Zuper and sends nothing, so retrying one
+     * is safe; what a retry must never do on its own is repeat a SEND, which the attempt cap and the create rule
+     * below already prevent.
+     */
+    retryFailed: optional("PUSH_RETRY_FAILED", "true") !== "false",
     // A new job arrives in several writes (row, assignees, teams, line items).
     createDelaySeconds: Math.max(0, Number(optional("PUSH_CREATE_DELAY_SECONDS", "90"))),
     deletes: optional("PUSH_DELETES", "false") === "true",

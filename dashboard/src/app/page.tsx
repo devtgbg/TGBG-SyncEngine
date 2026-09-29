@@ -195,6 +195,13 @@ export default async function Overview({ searchParams }: { searchParams: Promise
               <CommandButton command="sweep-now" label="Sweep now" latest={latest["sweep-now"]} disabled={!s?.inbound} />
             </li>
             <li>
+              {/* The push direction's own net: the same idea as replay, on the rows waiting for Zuper. */}
+              <div><strong>Retry failed pushes</strong> <span className={`state ${s && s.push.mode !== "off" && s.push.retryFailed ? "on" : "off"}`}>
+                {s?.push.mode === "off" ? "off" : s?.push.retryFailed ? "every 30 seconds" : "off"}</span>
+                <p className="note">Plans a change to Zuper again after it failed, up to 5 tries. {s?.push.mode === "off" ? "Held while Tuper → Zuper is off. " : s?.push.retryFailed ? "" : "Turned off in Settings. "}
+                  {eng?.state.push ? `Last pass: ${eng.state.push.planned} planned, ${eng.state.push.sent} sent, ${eng.state.push.failed} failed (${dubaiTime(eng.state.push.at)}).` : "No pass reported since the engine started."} <Link href="/pushes">To Zuper</Link></p></div>
+            </li>
+            <li>
               <div><strong>Connections</strong>
                 <p className="note">The webhooks registered on each side, checked every 30 minutes. {regsAt ? `Last checked ${dubaiTime(regsAt)}.` : "Not checked yet."}</p></div>
               <CommandButton command="refresh-connections" label="Check now" latest={latest["refresh-connections"]} />

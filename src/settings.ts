@@ -18,8 +18,8 @@ export type PushMode = "off" | "dry-run" | "live";
 export interface Settings {
   /** Zuper → Tuper. */
   inbound: boolean;
-  /** Tuper → Zuper. */
-  push: { mode: PushMode; entities: string[]; deletes: boolean; onConflict: "zuper-wins" | "tuper-wins"; maxAgeMinutes: number };
+  /** Tuper → Zuper. `retryFailed` is this direction's answer to `replay`: plan a row that failed again. */
+  push: { mode: PushMode; entities: string[]; deletes: boolean; onConflict: "zuper-wins" | "tuper-wins"; maxAgeMinutes: number; retryFailed: boolean };
   /** Retry deliveries that failed. */
   replay: boolean;
   /** Re-read what Zuper changed recently, for webhooks that never arrived. */
@@ -37,7 +37,7 @@ export function fromEnvironment(): Settings {
     inbound: config.inbound,
     push: {
       mode: config.push.mode, entities: [...config.push.entities], deletes: config.push.deletes,
-      onConflict: config.push.onConflict, maxAgeMinutes: config.push.maxAgeMinutes,
+      onConflict: config.push.onConflict, maxAgeMinutes: config.push.maxAgeMinutes, retryFailed: config.push.retryFailed,
     },
     replay: config.reconcile.enabled,
     sweep: { enabled: config.sweep.enabled, everyMinutes: config.sweep.everyMinutes },
@@ -65,6 +65,7 @@ export function normalise(raw: unknown, base: Settings): Settings {
       deletes: bool(p.deletes, base.push.deletes),
       onConflict: p.onConflict === "zuper-wins" || p.onConflict === "tuper-wins" ? p.onConflict : base.push.onConflict,
       maxAgeMinutes: int(p.maxAgeMinutes, base.push.maxAgeMinutes, 5, 7 * 24 * 60),
+      retryFailed: bool(p.retryFailed, base.push.retryFailed),
     },
     replay: bool(r.replay, base.replay),
     sweep: { enabled: bool(s.enabled, base.sweep.enabled), everyMinutes: int(s.everyMinutes, base.sweep.everyMinutes, 5, 24 * 60) },
@@ -98,6 +99,7 @@ function apply(s: Settings, version: number): void {
   c.push.deletes = s.push.deletes;
   c.push.onConflict = s.push.onConflict;
   c.push.maxAgeMinutes = s.push.maxAgeMinutes;
+  c.push.retryFailed = s.push.retryFailed;
   c.reconcile.enabled = s.replay;
   c.sweep.enabled = s.sweep.enabled;
   c.sweep.everyMinutes = s.sweep.everyMinutes;
@@ -112,7 +114,7 @@ function apply(s: Settings, version: number): void {
 /** One line a person can read in the log. */
 export function describe(s: Settings): string {
   const push = s.push.mode === "off" ? "off" : s.push.mode === "dry-run" ? "plan only" : `live for ${s.push.entities.join(", ") || "nothing"}`;
-  return `Zuper → Tuper ${s.inbound ? "on" : "off"}; Tuper → Zuper ${push}; replay ${s.replay ? "on" : "off"}; ` +
+  return `Zuper → Tuper ${s.inbound ? "on" : "off"}; Tuper → Zuper ${push}${s.push.mode === "off" ? "" : `, retry ${s.push.retryFailed ? "on" : "off"}`}; replay ${s.replay ? "on" : "off"}; ` +
     `sweep ${s.sweep.enabled ? `every ${s.sweep.everyMinutes}m` : "off"}; call log ${s.apiLog.enabled ? "on" : "off"}`;
 }
 

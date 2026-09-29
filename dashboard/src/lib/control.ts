@@ -59,7 +59,7 @@ export interface Engine {
     timers?: { replay?: boolean; sweep?: boolean; pusher?: boolean };
     sweep?: { at: string; full: boolean; jobsInWindow: number; jobsDrifted: number; jobsMissing: number; resynced: number; failed: number };
     replay?: { at: string; attempted: number; ok: number; failed: number };
-    push?: { at: string; mode: string; jobs: number; sent: number; failed: number };
+    push?: { at: string; mode: string; jobs: number; planned: number; sent: number; skipped: number; failed: number; waiting?: number };
     connections?: { at: string; summary: string };
   };
   /** Seconds since the last heartbeat. */

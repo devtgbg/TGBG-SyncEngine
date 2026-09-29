@@ -8,7 +8,7 @@ export type PushMode = "off" | "dry-run" | "live";
 
 export interface Settings {
   inbound: boolean;
-  push: { mode: PushMode; entities: string[]; deletes: boolean; onConflict: "zuper-wins" | "tuper-wins"; maxAgeMinutes: number };
+  push: { mode: PushMode; entities: string[]; deletes: boolean; onConflict: "zuper-wins" | "tuper-wins"; maxAgeMinutes: number; retryFailed: boolean };
   replay: boolean;
   sweep: { enabled: boolean; everyMinutes: number };
   apiLog: { enabled: boolean; bodyHours: number; days: number };
@@ -25,7 +25,7 @@ export const NOT_PUSHABLE = ["Organizations", "Assets", "Products", "Notes", "Qu
 
 export const DEFAULTS: Settings = {
   inbound: true,
-  push: { mode: "off", entities: ["jobs"], deletes: false, onConflict: "zuper-wins", maxAgeMinutes: 120 },
+  push: { mode: "off", entities: ["jobs"], deletes: false, onConflict: "zuper-wins", maxAgeMinutes: 120, retryFailed: true },
   replay: true,
   sweep: { enabled: true, everyMinutes: 30 },
   apiLog: { enabled: true, bodyHours: 48, days: 7 },
@@ -49,6 +49,7 @@ export function normalise(raw: unknown, base: Settings = DEFAULTS): Settings {
       deletes: bool(p.deletes, base.push.deletes),
       onConflict: p.onConflict === "zuper-wins" || p.onConflict === "tuper-wins" ? p.onConflict : base.push.onConflict,
       maxAgeMinutes: int(p.maxAgeMinutes, base.push.maxAgeMinutes, 5, 7 * 24 * 60),
+      retryFailed: bool(p.retryFailed, base.push.retryFailed),
     },
     replay: bool(r.replay, base.replay),
     sweep: { enabled: bool(s.enabled, base.sweep.enabled), everyMinutes: int(s.everyMinutes, base.sweep.everyMinutes, 5, 24 * 60) },
@@ -84,6 +85,7 @@ export function changes(before: Settings | null, after: Settings): string[] {
   if (before.push.deletes !== after.push.deletes) out.push(`deletes to Zuper ${onOff(after.push.deletes)}`);
   if (before.push.onConflict !== after.push.onConflict) out.push(`on a conflict ${after.push.onConflict === "zuper-wins" ? "Zuper wins" : "Tuper wins"}`);
   if (before.push.maxAgeMinutes !== after.push.maxAgeMinutes) out.push(`oldest change sent: ${minutes(after.push.maxAgeMinutes)}`);
+  if (before.push.retryFailed !== after.push.retryFailed) out.push(`retry failed pushes ${onOff(after.push.retryFailed)}`);
   if (before.replay !== after.replay) out.push(`replay ${onOff(after.replay)}`);
   if (before.sweep.enabled !== after.sweep.enabled) out.push(`sweep ${onOff(after.sweep.enabled)}`);
   if (before.sweep.everyMinutes !== after.sweep.everyMinutes) out.push(`sweep every ${minutes(after.sweep.everyMinutes)}`);
