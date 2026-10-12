@@ -3041,6 +3041,95 @@ ENTITIES.customer_categories = {
 // An asset's own history (Asset Details › History): serial number changes, status moves, who it went to. Zuper lists
 // it per asset (GET /api/assets/{uid}/history) and has no list of all of them, so every asset Tuper holds is asked.
 // Nothing imported it before, and Tuper answered an empty history for an asset Zuper has entries for.
+// ── Planned Preventive Maintenance ──
+// Zuper's Assets > PPMs: how often an asset is serviced, and the visits that follow. GET /api/ppm lists them whole
+// (GBG has four) and there is no read-by-uid — /api/ppm/{uid} answers "The PPM UID sent is not valid" — so the list
+// row is the whole record, which is just as well: it carries the contract, the service, the job settings and every
+// scheduled date.
+//
+// Zuper's own ppm_number comes across as it is, so a PPM is the same number in both systems.
+ENTITIES.ppm = {
+  name: "ppm", schema: "jms", table: "ppm_schedules",
+  deps: ["assets", "contracts", "properties", "products", "job_categories", "jobs", "users"],
+  fetch: (ctx) => zuperGet(ctx.cfg, "/api/ppm?page=1&count=200").then((j) => j.data ?? []),
+  uid: (r) => r.ppm_uid,
+  async transform(r, ctx) {
+    const settings = r.job_settings && typeof r.job_settings === "object" ? r.job_settings : {};
+    const duration = r.estimated_duration && typeof r.estimated_duration === "object" ? r.estimated_duration : {};
+    const whole = (v: any, ceiling: number): number | null => {
+      const n = Math.round(Number(v));
+      return Number.isFinite(n) && n >= 0 && n <= ceiling ? n : null;
+    };
+    const asset = mapGet(await ctxMap(ctx, "assets"), r.asset?.asset_uid);
+    if (!asset) throw new Error(`ppm ${r.ppm_uid}: ${r.asset ? "its asset isn't imported" : "no asset"}`);
+    const priority = String(r.priority ?? "MEDIUM").toUpperCase();
+    const frequency = String(r.frequency ?? "MONTHS").toUpperCase();
+    const jobPriority = T(settings.job_priority)?.toUpperCase() ?? null;
+    const repeat = r.repeat_on && typeof r.repeat_on === "object" ? r.repeat_on : {};
+    const list = (v: unknown) => (Array.isArray(v) ? v.map(Number).filter((n) => Number.isInteger(n)) : []);
+    return {
+      ppm_number: Math.round(num0(r.ppm_number)) || null,
+      name: T(r.ppm_name),
+      asset_id: asset,
+      contract_id: mapGet(await ctxMap(ctx, "contracts"), r.service_contract?.contract_uid),
+      property_id: mapGet(await ctxMap(ctx, "properties"), r.property?.property_uid),
+      product_id: mapGet(await ctxMap(ctx, "products"), r.product?.product_uid ?? r.product?.product_ref_id?.product_uid),
+      // The service as it was quoted on this PPM, kept whole: a contract's price is what was agreed then.
+      product_line: r.product?.product && typeof r.product.product === "object" ? r.product.product : {},
+      priority: ["LOW", "MEDIUM", "HIGH", "CRITICAL"].includes(priority) ? priority : "MEDIUM",
+      period: whole(r.period, 365) || 1,
+      frequency: ["DAYS", "WEEKS", "MONTHS", "YEARS"].includes(frequency) ? frequency : "MONTHS",
+      repeat_on: { byweekday: list(repeat.byweekday), bymonth: list(repeat.bymonth), bymonthday: list(repeat.bymonthday) },
+      next_service_date: dubaiDate(r.next_service_date),
+      last_service_date: dubaiDate(r.last_service_date),
+      end_date: dubaiDate(r.end_date),
+      estimated_days: whole(duration.days, 365), estimated_hours: whole(duration.hours, 23), estimated_minutes: whole(duration.minutes, 59),
+      auto_generate: settings.auto_generate === true,
+      generate_job_before: whole(settings.generate_job_before, 365) ?? 0,
+      job_category_id: mapGet(await ctxMap(ctx, "job_categories"), settings.job_category?.category_uid),
+      job_priority: jobPriority && ["LOW", "MEDIUM", "HIGH", "CRITICAL"].includes(jobPriority) ? jobPriority : null,
+      job_location: settings.job_location && typeof settings.job_location === "object" ? settings.job_location : {},
+      is_active: r.is_active !== false,
+      ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
+      created_by: mapGet(await ctxMap(ctx, "users"), r.created_by?.user_uid),
+      ...ownTimes(r),
+    };
+  },
+  // The visits and the assets the PPM covers. A visit's job is linked when Tuper has that job; one it does not have
+  // keeps the visit marked as issued, because it was — Zuper says so, and pretending otherwise would offer to issue
+  // it a second time.
+  async afterWrite(ctx, id, r) {
+    const jobs = await ctxMap(ctx, "jobs");
+    const dates = Array.isArray(r.scheduled_dates) ? r.scheduled_dates : [];
+    const visits: Record<string, unknown>[] = [];
+    const seen = new Set<string>();
+    for (const [i, d] of dates.entries()) {
+      const on = dubaiDate(d?.schedule_at);
+      if (!on || seen.has(on)) continue;
+      seen.add(on);
+      visits.push({
+        tenant_id: ctx.tenantId, ppm_id: id, schedule_at: on, display_order: i + 1,
+        job_created: d?.job_created === true,
+        job_id: mapGet(jobs, d?.job?.job_uid),
+        remarks: T(d?.remarks),
+      });
+    }
+    const vt = () => ctx.client.schema("jms").from("ppm_visits");
+    const { error: delVisits } = await vt().delete().eq("tenant_id", ctx.tenantId).eq("ppm_id", id);
+    if (delVisits) throw delVisits;
+    if (visits.length) { const { error } = await vt().insert(visits); if (error) throw error; }
+
+    const assets = await ctxMap(ctx, "assets");
+    const covered = [r.asset?.asset_uid, ...(Array.isArray(r.assets) ? r.assets.map((a: any) => a?.asset_uid ?? a?.asset?.asset_uid) : [])]
+      .map((uid) => mapGet(assets, uid)).filter((x): x is string => Boolean(x));
+    const at = () => ctx.client.schema("jms").from("ppm_assets");
+    const { error: delAssets } = await at().delete().eq("tenant_id", ctx.tenantId).eq("ppm_id", id);
+    if (delAssets) throw delAssets;
+    const rows = [...new Set(covered)].map((asset_id) => ({ tenant_id: ctx.tenantId, ppm_id: id, asset_id }));
+    if (rows.length) { const { error } = await at().insert(rows); if (error) throw error; }
+  },
+};
+
 ENTITIES.asset_history = {
   name: "asset_history", schema: "jms", table: "asset_history", concurrency: 6,
   deps: ["assets", "customers", "organizations", "properties", "products", "jobs", "users"],
