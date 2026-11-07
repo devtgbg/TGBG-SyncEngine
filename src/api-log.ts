@@ -20,7 +20,7 @@ import { sql } from "./store.js";
 
 export type System = "zuper" | "tuper";
 /** What set the work going. `tuper-webhook` is a change made in Tuper; `webhook` is one made in Zuper. */
-export type Origin = "webhook" | "tuper-webhook" | "replay" | "sweep" | "push" | "admin";
+export type Origin = "webhook" | "tuper-webhook" | "replay" | "sweep" | "push" | "admin" | "reconciliation";
 
 /**
  * One record being written to Tuper (src/tuper-writes.ts). Every call made while it is open is tied to it by `id`, and

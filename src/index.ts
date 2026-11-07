@@ -21,6 +21,7 @@ import { receiver } from "./receiver.js";
 import { replayRunning, startReplay, stopReplay } from "./reconcile.js";
 import { pushState, pusherRunning, startPusher } from "./pusher.js";
 import { startSweep, stopSweep, sweepRunning } from "./sweep.js";
+import { nightlyRunning, startNightly, stopNightly } from "./nightly.js";
 import { flush as flushApiLog, startApiLogPurge } from "./api-log.js";
 import { startSettings } from "./settings.js";
 import { startCommands } from "./commands.js";
@@ -118,10 +119,13 @@ app.listen(config.port, () => {
       if (s.inbound && s.replay) startReplay(); else stopReplay();
       // Re-read what Zuper changed recently whose webhook never arrived (Zuper gives up after its retries).
       if (s.inbound && s.sweep.enabled) startSweep(); else stopSweep();
+      // Once a night, the whole of Zuper against the whole of Tuper. The sweep's window can never see a
+      // deletion, a merge, or an entity nothing sweeps — this is the only check that can. Read-only.
+      if (s.inbound && config.nightly.enabled) startNightly(); else stopNightly();
       // Changes made in Tuper, towards Zuper: off, planned only, or live for the kinds chosen.
       startPusher();
     },
-  }, () => ({ replay: replayRunning(), sweep: sweepRunning(), pusher: pusherRunning() }));
+  }, () => ({ replay: replayRunning(), sweep: sweepRunning(), pusher: pusherRunning(), nightly: nightlyRunning() }));
   // Old API call bodies and rows go on a timer (src/api-log.ts).
   startApiLogPurge();
   // Buttons on the dashboard (src/commands.ts), and what connects the two systems (src/connections.ts).

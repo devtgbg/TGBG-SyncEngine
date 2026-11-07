@@ -9,6 +9,21 @@
  * How it works: ask Zuper which jobs changed in a window, compare each against
  * when we last wrote it, and re-fetch only the ones that have actually drifted.
  *
+ * THIS IS LOAD-BEARING, not a safety net, and the delivery pipeline's design
+ * does not show it. A delivery that reaches reconcile.ts's attempt cap is never
+ * retried again by anything — it sits waiting for a person, and one has been
+ * stranded since 2026-09-30. The reason that has not left its job permanently
+ * wrong is that this sweep re-reads the record on its own schedule. So "the
+ * webhooks cover it, the sweep is redundant" is false: without it, every capped
+ * delivery becomes a silently stale record for as long as nobody looks.
+ *
+ * The AMC Engine depends on this second-hand. It clears its double-booking
+ * overlay when zuper_sync_map.synced_at passes its own write, so it relies on
+ * this sweep moving synced_at for a job whose delivery died. Note the corollary
+ * it found on 2026-10-14: once a job stops changing it leaves this window, so
+ * its synced_at FREEZES. Anything comparing synced_at against a margin will
+ * false-positive forever on quiet records.
+ *
  * Four things here were established empirically, and each is a trap:
  *
  *  1. USE THE GET, NOT THE POST. `POST /api/jobs/filter` accepts filter keys and
@@ -216,8 +231,13 @@ const pass = async () => {
     console.log(`[zupersync] sweep${full ? " (full)" : ""}: ` + news.map((k) =>
       `${k.kind} ${k.missing} missing, ${k.behind} behind, ${k.resynced} synced${k.failed ? `, ${k.failed} failed (${k.errors[0] ?? ""})` : ""}`).join("; "));
   }
+  // `capped` is the one number that says the sweep gave up with work still to do. It used to be printed and
+  // nowhere else, so it vanished with the container's logs — which is exactly how 1,530 jobs stayed behind for
+  // three weeks after a bulk edit in Zuper touched 2,355 of them in one minute on 2026-10-15: the cap is 200 a
+  // pass, the window slid past 16:40 after a few passes, and the remainder was never in the input again.
   report("sweep", {
-    full, jobsInWindow: r.inWindow, jobsDrifted: r.drifted, jobsMissing: r.unmapped, resynced: r.resynced + others.reduce((n, k) => n + k.resynced, 0),
+    full, capped: r.stoppedEarly, jobsLeftBehind: r.stoppedEarly ? Math.max(0, r.drifted + r.unmapped - (r.resynced + r.failed)) : 0,
+    jobsInWindow: r.inWindow, jobsDrifted: r.drifted, jobsMissing: r.unmapped, resynced: r.resynced + others.reduce((n, k) => n + k.resynced, 0),
     failed: r.failed + others.reduce((n, k) => n + k.failed, 0),
     kinds: others.map((k) => ({ kind: k.kind, missing: k.missing, behind: k.behind, synced: k.resynced, failed: k.failed })),
   });

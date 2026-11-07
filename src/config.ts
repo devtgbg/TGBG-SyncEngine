@@ -211,6 +211,20 @@ export const config = {
     maxAgeMinutes: Math.max(5, Number(optional("PUSH_MAX_AGE_MINUTES", "120"))),
   },
 
+  /**
+   * The nightly reconciliation (src/nightly.ts): Zuper's WHOLE list against everything Tuper has mapped.
+   *
+   * Not a more frequent sweep — a different question. The sweep asks what changed in its last window, so it
+   * can never see a deletion, a merge, or an entity nothing sweeps. Read-only while the normal noise floor is
+   * being learned (docs/NIGHTLY-RECONCILIATION.md).
+   */
+  nightly: {
+    enabled: optional("NIGHTLY_ENABLED", "true") !== "false",
+    // Local hour. After the day's work, before the AMC Engine's 05:45 drift check, so a problem it finds is
+    // already on the record when that runs.
+    hour: Math.min(23, Math.max(0, Number(optional("NIGHTLY_HOUR", "2")))),
+  },
+
   sweep: {
     enabled: optional("SWEEP_ENABLED", "true") !== "false",
     everyMinutes: Math.max(5, Number(optional("SWEEP_EVERY_MINUTES", "30"))),
