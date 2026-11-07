@@ -65,9 +65,24 @@ async function moveToNext(client: SupabaseClient, tenantId: string, s: (typeof S
     const next = await client.schema("jms").rpc(s.next, { p_tenant: tenantId });
     if (next.error) throw next.error;
     const to = String(next.data);
-    const { error: moveError } = await client.schema("jms").from(s.table)
-      .update({ [s.column]: s.column === "product_no" ? Number(to) : to }).eq("tenant_id", tenantId).eq("id", holder);
-    if (!moveError) return to;
-    if (moveError.code !== "23505" || attempt >= 3) throw moveError;
+    const { data: moved, error: moveError } = await client.schema("jms").from(s.table)
+      .update({ [s.column]: s.column === "product_no" ? Number(to) : to }).eq("tenant_id", tenantId).eq("id", holder)
+      .select(s.column).maybeSingle();
+    if (moveError) {
+      if (moveError.code !== "23505" || attempt >= 3) throw moveError;
+      continue;
+    }
+    // Tuper drops a column IT allocates from an update the sync sends (its 0c4adac: work_order_number,
+    // request_number, contract_number, product_no — every column this function moves). Such an update answers 200 and
+    // changes nothing, so a caller that trusts the absence of an error would report a renumber that did not happen,
+    // write a "renumbered" activity entry for it, and leave the arriving record to collide on INSERT instead. Read the
+    // number back and say plainly which of the two calls this path needs is now refused.
+    const held = String((moved as Record<string, unknown> | null)?.[s.column] ?? "");
+    if (held === to) return to;
+    throw new Error(
+      `${s.table}.${s.column} could not be moved to ${to}: Tuper accepted the update and kept ${held || "the old number"}. ` +
+      `This path exists only because ${s.renumber} is refused for a sync key; now the update is ignored too, so neither ` +
+      `call can renumber a record. ${s.renumber} has to be allowed for the sync key.`,
+    );
   }
 }
