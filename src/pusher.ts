@@ -372,6 +372,17 @@ export async function planJob(
   if (cols.has("organization_id")) {
     const uid = await uidFor(client, "organizations", j.organization_id);
     if (uid) fields.organization = uid;
+    // TWO FAULTS HERE, both latent while push is dry-run, both to fix before it ever goes live (2026-11-05).
+    //
+    // 1. CLEARING is not the same as UNRESOLVABLE. organization_id = null means someone removed the job's
+    //    organization, and this branch reports "that organization is not in Zuper" and sends nothing — so the
+    //    clear never reaches Zuper, under a reason that describes a different problem. Zuper's own command
+    //    centre cleared 639 jobs' organizations on 2026-11-03; had the push been live, not one would have gone.
+    // 2. Even sending it would not work as written: on PUT /jobs, `organization: null` answers 200 and does
+    //    NOT apply, while `organization: ""` does. A null here would be accepted, logged as success, and
+    //    silently ignored — the worst shape of all, and the same one that bit the portal's asset mirror.
+    //
+    // The same two apply to customer_id above and to any other id column a person can clear.
     else plan.notPushed.push({ column: "organization_id", reason: "that organization is not in Zuper" });
   }
   if (cols.has("asset_id")) {
