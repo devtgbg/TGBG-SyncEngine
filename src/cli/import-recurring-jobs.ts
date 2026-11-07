@@ -214,6 +214,14 @@ for (let page = 1; ; page++) {
     if (known) {
       const { error } = await client.schema("jms").from("recurring_jobs").update(payload).eq("id", known).eq("tenant_id", tenantId);
       if (error) throw error;
+      // The map carries WHEN WE LAST WROTE this record, and the comparison reads it to decide "behind"
+      // (zuper.updated_at > synced_at). Updating the row without refreshing it left every existing series
+      // looking stale for ever: after a full re-run on 2026-11-05 the data was current and the comparison
+      // still reported 513 behind, because only the 80 inserts had touched the map.
+      const { error: mErr } = await client.schema("jms").from("zuper_sync_map").upsert(
+        { tenant_id: tenantId, entity: "recurring_jobs", zuper_uid: uid, jms_id: known, synced_at: new Date().toISOString() },
+        { onConflict: "tenant_id,entity,zuper_uid" });
+      if (mErr) throw mErr;
     } else {
       const { data, error } = await client.schema("jms").from("recurring_jobs").insert(payload).select("id").single();
       if (error) throw error;
