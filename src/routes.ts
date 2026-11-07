@@ -69,6 +69,7 @@ const ENTITY_FETCH: Record<string, { mode: FetchMode; path?: (uid: string) => st
   job_details: { mode: "self" },                                            // transform GETs /api/jobs/{uid} itself
   job_activity: { mode: "self" },                                           // GETs the job's activity feed (+ /timelog)
   estimate_activity: { mode: "self" },                                      // GETs the quote's activity feed
+  asset_history_live: { mode: "self" },                                     // GETs /api/assets/{uid}/history itself
   jobs: { mode: "detail", path: (u) => `/api/jobs/${u}` },               // never a list row — see sweep.ts
   customers: { mode: "detail", path: (u) => `/api/customers/${u}` },        // plural
   organizations: { mode: "detail", path: (u) => `/api/organization/${u}` }, // singular
@@ -124,6 +125,22 @@ export function detailPathFor(entity: string): ((uid: string) => string) | null 
 /** Whether an entity's own transform fetches what it needs from a uid stub. */
 export function isSelfFetching(entity: string): boolean {
   return ENTITY_FETCH[entity]?.mode === "self";
+}
+
+/**
+ * How an entity's record is read, for the guards in `npm run check-routes`.
+ *
+ * An entity absent from ENTITY_FETCH is not a type error and not a crash at boot: it reads as `unsupported`,
+ * which silently turns a route into a skip, and turns an ENRICH entity into "refusing to transform a stub" on
+ * every delivery of the event that enriches it. Both have happened. The check asserts them instead.
+ */
+export function fetchModeFor(entity: string): FetchMode {
+  return ENTITY_FETCH[entity]?.mode ?? "unsupported";
+}
+
+/** Every entity whose transform fetches its own record from a uid stub. */
+export function selfFetchingEntities(): string[] {
+  return Object.keys(ENTITY_FETCH).filter((e) => ENTITY_FETCH[e].mode === "self");
 }
 
 /** A route says which sync entity to run, and how to get the record. */
@@ -499,6 +516,10 @@ const MODULES: Record<string, ModuleSpec> = {
     label: "Assets",
     entity: "assets",
     uidFields: ["asset_uid"],
+    // An asset's history is read whenever the asset syncs, because Zuper's asset.history event cannot say which
+    // asset it belongs to (see that event below). Every documented way to create a history row — an action, a status
+    // change, a serial/part/product edit — also touches the asset, so this is the moment the row appears.
+    enrich: ["asset_history_live"],
     events: {
       "asset.new": ["New Asset"],
       "asset.update": ["Asset Update"],
@@ -511,7 +532,12 @@ const MODULES: Record<string, ModuleSpec> = {
       "asset.update_attachment": ["Update Aseet Attachment", FILES],
       "asset.bulk_action": ["Asset Bulk Action"],
       "asset.status_update": ["Asset Status Update"],
-      "asset.history": ["Asset History"],
+      // Zuper delivers only asset_history_uid here — no asset — and publishes no way to resolve one to the other:
+      // no single-entry read, no account-wide history list, only GET /api/assets/{asset_uid}/history (checked
+      // against Zuper's own API reference and four candidate paths, all 404, 2026-10-22). Its entries do not even
+      // name their asset. So nothing can be fetched from this event. The history itself is NOT lost: it is read
+      // when the asset syncs (enrich above) and by the sweep for rows created without the asset changing.
+      "asset.history": ["Asset History", { skip: "names only the history entry; Zuper delivers no asset and offers no lookup — history is read when the asset syncs" }],
       "asset.recover": ["Asset Recover"],
       "asset.new_note": ["Asset New Note", NOTE("asset")],
       "asset.update_note": ["Asset Update Note", NOTE("asset")],

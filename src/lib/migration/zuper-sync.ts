@@ -626,19 +626,37 @@ async function jobStatusId(ctx: Ctx, s: any, categoryId: string | null): Promise
     const type = String(s.status_type ?? "");
     const name = T(s.status_name) ?? "Status";
     const statuses = () => ctx.client.schema("jms").from("job_statuses");
-    let res = await statuses()
+    // A same-named live status already in the category (an older Zuper status id) IS that status — kept as an alias, so
+    // the status still answers its live uid: mapped under job_statuses too, a status had two uids and answered either
+    // (16 did, 2026-09-22).
+    //
+    // Looked up BEFORE inserting rather than after the insert fails. Zuper repeats its status names across status ids,
+    // so the name is usually already there and the insert usually loses to job_statuses_live_name_key: 84 of a week's
+    // failing Tuper calls were this one insert, every one of them adopted the existing status and finished the delivery.
+    // Failures a person has to learn to ignore are worse than an extra read.
+    const adopt = async (): Promise<string | null> => {
+      const { data, error } = await statuses().select("id")
+        .eq("tenant_id", ctx.tenantId).eq("category_id", categoryId).eq("name", name).eq("is_deleted", false)
+        .limit(1).maybeSingle();
+      if (error) throw error;
+      const id = (data as { id: string } | null)?.id ?? null;
+      if (id) await setMap(ctx, "job_status_aliases", uid, id);
+      return id;
+    };
+    const known = await adopt();
+    if (known) return known;
+
+    const res = await statuses()
       .insert({ tenant_id: ctx.tenantId, category_id: categoryId, name, status_type: JOB_STATUS_TYPES.has(type) ? type : "OTHER", color: T(s.status_color), display_order: 999, is_active: false })
       .select("id").single();
-    // A same-named status already in the category (an older Zuper status id) is that status — kept as an alias, so the
-    // status still answers its live uid: mapped under job_statuses too, a status had two uids and answered either
-    // (16 did, 2026-09-22).
-    if (res.error?.code === "23505") {
-      res = await statuses().select("id").eq("tenant_id", ctx.tenantId).eq("category_id", categoryId).eq("name", name).limit(1).single();
-      if (res.error) throw res.error;
-      await setMap(ctx, "job_status_aliases", uid, (res.data as { id: string }).id);
-      return (res.data as { id: string }).id;
+    if (res.error) {
+      // Another delivery created the same status between the lookup and here.
+      if (res.error.code === "23505") {
+        const raced = await adopt();
+        if (raced) return raced;
+      }
+      throw res.error;
     }
-    if (res.error) throw res.error;
     await setMap(ctx, "job_statuses", uid, (res.data as { id: string }).id);
     return (res.data as { id: string }).id;
   });
@@ -3130,6 +3148,53 @@ ENTITIES.ppm = {
   },
 };
 
+/**
+ * One Zuper asset-history entry → the jms row. Shared by the bulk import (ENTITIES.asset_history) and the live
+ * enrichment (ENTITIES.asset_history_live) so the two cannot drift: a field added for one is written by both.
+ */
+async function assetHistoryFields(r: any, assetId: string, ctx: Ctx): Promise<Record<string, unknown>> {
+  return {
+    asset_id: assetId,
+    action_type: T(r.action_type) ?? "UPDATE",
+    status: asTyped(r.status), serial_number: asTyped(r.serial_number), remarks: asTyped(r.remarks),
+    meta_data: r.meta_data && typeof r.meta_data === "object" ? r.meta_data : {},
+    job_id: mapGet(await ctxMap(ctx, "jobs"), r.job?.job_uid),
+    customer_id: await customerId(ctx, r.customer),
+    organization_id: await organizationId(ctx, r.organization),
+    property_id: mapGet(await ctxMap(ctx, "properties"), r.property?.property_uid),
+    product_id: mapGet(await ctxMap(ctx, "products"), r.product?.product_uid),
+    attachments: Array.isArray(r.attachments) ? r.attachments : [],
+    is_active: r.is_active !== false,
+    ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
+    created_by: await userOnSight(ctx, r.created_by),
+    ...ownTimes(r),
+  };
+}
+
+/**
+ * An asset's history as Zuper holds it now → jms.asset_history, keyed by Zuper's own asset_history_uid so a re-read
+ * updates rather than duplicates. Zuper's entries do NOT name their asset, so the asset id has to come from the
+ * caller — which is also why the asset.history webhook is unroutable on its own (routes.ts).
+ */
+async function writeAssetHistory(ctx: Ctx, assetId: string, rows: any[]): Promise<void> {
+  const map = await ctxMap(ctx, "asset_history");
+  const tbl = () => ctx.client.schema("jms").from("asset_history");
+  for (const r of rows) {
+    const uid = T(r.asset_history_uid);
+    if (!uid) continue;
+    const payload = await assetHistoryFields(r, assetId, ctx);
+    const id = map.get(uid);
+    if (id) {
+      const { error } = await tbl().update(payload).eq("id", id).eq("tenant_id", ctx.tenantId);
+      if (error) throw error;
+    } else {
+      const { data, error } = await tbl().insert({ tenant_id: ctx.tenantId, ...payload }).select("id").single();
+      if (error) throw error;
+      await setMap(ctx, "asset_history", uid, (data as { id: string }).id);
+    }
+  }
+}
+
 ENTITIES.asset_history = {
   name: "asset_history", schema: "jms", table: "asset_history", concurrency: 6,
   deps: ["assets", "customers", "organizations", "properties", "products", "jobs", "users"],
@@ -3145,20 +3210,248 @@ ENTITIES.asset_history = {
     }
   },
   uid: (r) => r.asset_history_uid,
+  async transform(r, ctx) { return assetHistoryFields(r, r._asset_id, ctx); },
+};
+
+/**
+ * An asset's history, read when the ASSET syncs (routes.ts enriches every asset event with this).
+ *
+ * Zuper's asset.history webhook carries only asset_history_uid and no asset, and Zuper publishes no way to resolve
+ * one to the other: there is no single-entry read and no account-wide history list, only
+ * GET /api/assets/{asset_uid}/history. So the event cannot be acted on and the history has to be fetched from the
+ * asset's side instead. Every documented way to create a history row also touches the asset — POST
+ * /assets/{uid}/actions, PUT /assets/{uid}/status (an automatic STATUS_UPDATE row), and a PUT of the serial number,
+ * parts or product — so an asset event is the right moment to re-read, and in production the asset.history delivery
+ * arrives in the same second as an asset.update for the same asset.
+ *
+ * What this does NOT catch is a history row created without the asset record changing: 38 of 86 asset.history
+ * deliveries in the 30 days to 2026-10-22 had no identifiable asset event within a minute. Those are the sweep's.
+ */
+ENTITIES.asset_history_live = {
+  name: "asset_history_live", schema: "jms", table: "assets", mapEntity: "assets", enrichOnly: true,
+  deps: ["assets", "customers", "organizations", "properties", "products", "jobs", "users"], concurrency: 4,
+  async *pages(ctx) {
+    const uids = [...(await ctxMap(ctx, "assets")).keys()];
+    if (uids.length) yield uids.map((asset_uid) => ({ asset_uid }));
+  },
+  uid: (r) => r.asset_uid,
   async transform(r, ctx) {
+    const answer = await zuperGet(ctx.cfg, `/api/assets/${r.asset_uid}/history?page=1&count=100&sort=DESC`).catch(() => null);
+    r._history = (answer?.data ?? []) as any[];
+    return {};
+  },
+  async afterWrite(ctx, id, r) {
+    await writeAssetHistory(ctx, id, r._history ?? []);
+    // When this asset's history was last read, so the sweep can rotate through the assets nobody has touched.
+    // setMap refreshes synced_at on every call, which is the whole marker — no extra table.
+    await setMap(ctx, "asset_history_read", String(r.asset_uid), id);
+  },
+};
+
+
+// ── Workflows (Settings › Workflow) ──────────────────────────────────────────
+// Zuper's workflows: what fires them, what has to be true, and what they then do. GBG has nine, one of them live
+// (every new request emails three people); nothing imported them before, so Tuper held none.
+//
+// Zuper's list gives a workflow's heading only — the conditions and the actions come from the by-uid read, so each
+// one is asked for separately.
+
+/** Zuper's trigger event → the event Tuper emits for the same thing. */
+const WORKFLOW_EVENTS: Record<string, string> = {
+  "request.new": "jms.request.created",
+  "request.update": "jms.request.updated",
+  "request.status_update": "jms.request.status_changed",
+  "job.new": "jms.job.created",
+  "job.update": "jms.job.updated",
+  "job.status_update": "jms.job.status_changed",
+  "job.assign_users": "jms.job.assignment_changed",
+  "job.update_acceptance": "jms.job.acceptance_changed",
+  "customer.new": "jms.customer.created",
+  "customer.update": "jms.customer.updated",
+  "service_contract.new": "jms.service_contract.created",
+  "service_contract.update": "jms.service_contract.updated",
+  "asset.new": "jms.asset.created",
+  "asset.update": "jms.asset.updated",
+};
+
+/** Zuper's condition field → the column (or payload key) Tuper's engine answers it from. */
+const WORKFLOW_CONDITION_FIELDS: Record<string, string> = {
+  job_category: "category_id",
+  "current_job_status.name": "current_status_id",   // Zuper names it "name" and holds the status's uid
+  current_job_status: "current_status_id",
+  job_type: "job_type",
+  job_priority: "priority",
+  job_acceptance: "acceptance_status",
+  customer: "customer_id",
+  organization: "organization_id",
+  request_status: "status_id",
+  request_priority: "priority",
+};
+
+/** Zuper's match → the operator Tuper's engine understands. */
+const WORKFLOW_MATCHES: Record<string, string> = {
+  EQUAL_TO: "EQ", NOT_EQUAL_TO: "NEQ", CONTAINS: "CONTAINS", EXISTS: "EXISTS", IS_NOT_EMPTY: "EXISTS",
+};
+
+/** A condition's value, which for a category, a status or a person is Zuper's uid and must become Tuper's id. */
+async function workflowConditionValue(ctx: Ctx, field: string, raw: unknown): Promise<unknown> {
+  const v = raw == null ? null : String(raw);
+  if (!v) return v;
+  if (field === "category_id") return mapGet(await ctxMap(ctx, "job_categories"), v) ?? v;
+  if (field === "current_status_id") return mapGet(await ctxMap(ctx, "job_statuses"), v) ?? v;
+  if (field === "customer_id") return mapGet(await ctxMap(ctx, "customers"), v) ?? v;
+  if (field === "organization_id") return mapGet(await ctxMap(ctx, "organizations"), v) ?? v;
+  if (field === "status_id") return mapGet(await ctxMap(ctx, "request_statuses"), v) ?? v;
+  return v;
+}
+
+/**
+ * Tuper's job card for the card a Zuper action prints.
+ *
+ * Tuper's cards carry no Zuper uid, so they are matched by name, and the name comes from Zuper's own template list
+ * (GET /api/jobs/template, all 19 of them) — an action names the uid and only sometimes the name.
+ */
+async function workflowJobCard(ctx: Ctx, uid: unknown, name: unknown): Promise<string | null> {
+  const key = "workflow_card_names";
+  if (!ctx.extra[key]) {
+    const list = (await zuperGet(ctx.cfg, "/api/jobs/template?page=1&count=200"))?.data ?? [];
+    ctx.extra[key] = new Map(((list as any[]) ?? []).map((t) => [String(t.template_uid), T(t.template_name) ?? ""]));
+  }
+  const byUid = (ctx.extra[key] as Map<string, string>).get(String(uid ?? "")) ?? null;
+  const wanted = byUid || T(name);
+  if (!wanted) return null;
+  const { data, error } = await ctx.client.schema("jms").from("job_card_templates")
+    .select("id, name").eq("tenant_id", ctx.tenantId);
+  if (error) throw error;
+  const rows = (data ?? []) as { id: string; name: string }[];
+  const hit = rows.find((c) => c.name.trim().toLowerCase() === wanted.trim().toLowerCase());
+  return hit?.id ?? null;
+}
+
+/** One Zuper action as the action Tuper's engine runs, or null where Tuper has nothing that does it. */
+async function workflowAction(ctx: Ctx, a: any): Promise<Record<string, unknown> | null> {
+  const cv: Record<string, string> = {};
+  for (const x of (a?.custom_values ?? []) as any[]) if (x?.label) cv[String(x.label)] = x.value == null ? "" : String(x.value);
+  const kind = String(a?.field_value ?? "");
+
+  if (kind === "internal_email" || kind === "customer_email") {
     return {
-      asset_id: r._asset_id,
-      action_type: T(r.action_type) ?? "UPDATE",
-      status: asTyped(r.status), serial_number: asTyped(r.serial_number), remarks: asTyped(r.remarks),
-      meta_data: r.meta_data && typeof r.meta_data === "object" ? r.meta_data : {},
-      job_id: mapGet(await ctxMap(ctx, "jobs"), r.job?.job_uid),
-      customer_id: await customerId(ctx, r.customer),
-      organization_id: await organizationId(ctx, r.organization),
-      property_id: mapGet(await ctxMap(ctx, "properties"), r.property?.property_uid),
-      product_id: mapGet(await ctxMap(ctx, "products"), r.product?.product_uid),
-      attachments: Array.isArray(r.attachments) ? r.attachments : [],
-      is_active: r.is_active !== false,
-      ...("is_deleted" in (r ?? {}) ? { is_deleted: r.is_deleted === true } : {}),
+      type: "send_email",
+      to: cv.to ?? "", cc: cv.cc ?? "", bcc: cv.bcc ?? "",
+      subject: cv.email_subject ?? "",
+      body_html: cv.email_body ?? "",
+      // Zuper attaches the job card the action names; Tuper's cards are matched by name.
+      ...(cv.template_uid && cv.template_uid !== "None"
+        ? { job_card_template_id: await workflowJobCard(ctx, cv.template_uid, cv.job_template_name) }
+        : {}),
+    };
+  }
+
+  if (kind === "internal_push" || kind === "push_notification") {
+    const users = await ctxMap(ctx, "users");
+    const ids = String(cv.user_uid ?? "").split(",").map((s) => s.trim()).filter(Boolean)
+      .map((uid) => mapGet(users, uid)).filter((id): id is string => !!id);
+    return { type: "notify_users", user_ids: ids, title: "Workflow", message: cv.message ?? "" };
+  }
+
+  if (kind === "job_card_to_note") {
+    const cardId = await workflowJobCard(ctx, cv.template_uid, cv.job_template_name);
+    return cardId ? { type: "job_card_to_note", job_card_template_id: cardId, visibility: "INTERNAL" } : null;
+  }
+
+  if (kind === "job_category" && String(a?.action_type ?? "") === "CREATE") {
+    const categoryId = mapGet(await ctxMap(ctx, "job_categories"), cv.job_category ?? a?.change_value);
+    if (!categoryId) return null;
+    // Zuper counts an offset from the moment the workflow fires, as "schedule_date/current_date/no_of_days".
+    const off = (prefix: string) => {
+      const days = N(cv[`${prefix}/current_date/no_of_days`]);
+      const hours = N(cv[`${prefix}/current_date/no_of_hours`]);
+      const minutes = N(cv[`${prefix}/current_date/no_of_mins`]);
+      return days === null && hours === null && minutes === null
+        ? null : { days: days ?? 0, hours: hours ?? 0, minutes: minutes ?? 0 };
+    };
+    const schedule = off("schedule_date"), due = off("due_date");
+    return {
+      type: "create_job", category_id: categoryId, title: T(cv.job_title) ?? "Job",
+      ...(cv.is_parent_job === "true" ? { is_parent_job: true } : {}),
+      ...(schedule ? { schedule_offset: schedule } : {}),
+      ...(due ? { due_offset: due } : {}),
+    };
+  }
+
+  // Anything else Zuper can do that Tuper can't yet: kept as a log line so the workflow still reads as it did,
+  // rather than silently losing what it was for.
+  return { type: "log", not_built: kind, display_name: T(a?.display_name) ?? kind };
+}
+
+/**
+ * Whether an imported workflow is switched on: off for one Tuper doesn't hold yet, and otherwise whatever it is
+ * set to now. Turning one on is the owner's decision, so a later import must never undo it.
+ */
+async function workflowStaysOff(ctx: Ctx, uid: string): Promise<boolean> {
+  const { data, error } = await ctx.client.schema("jms").from("workflows")
+    .select("is_active").eq("tenant_id", ctx.tenantId).eq("zuper_uid", uid).maybeSingle();
+  if (error) throw error;
+  return (data as { is_active: boolean } | null)?.is_active === true;
+}
+
+ENTITIES.workflows = {
+  name: "workflows", schema: "jms", table: "workflows", concurrency: 2,
+  deps: ["job_categories", "job_statuses", "users", "teams", "customers", "organizations", "request_statuses"],
+  async fetch(ctx) {
+    const list = (await zuperGet(ctx.cfg, "/api/workflow?page=1&count=100"))?.data ?? [];
+    const out: any[] = [];
+    for (const w of list as any[]) {
+      const one = await zuperGet(ctx.cfg, `/api/workflow/${w.workflow_uid}`).catch(() => null);
+      out.push({ ...(w ?? {}), ...((one as any)?.data ?? {}) });
+    }
+    return out;
+  },
+  uid: (r) => r.workflow_uid,
+  async transform(r, ctx) {
+    const event = WORKFLOW_EVENTS[String(r.trigger_event ?? "")] ?? null;
+    // A trigger Tuper doesn't emit would make a workflow that could never run: keep it, switched off, so it is
+    // visible in Settings rather than quietly missing.
+    const conditions: Record<string, unknown>[] = [];
+    for (const c of (r.conditions ?? []) as any[]) {
+      const field = WORKFLOW_CONDITION_FIELDS[String(c?.field_value ?? "")] ?? T(c?.field_value);
+      const op = WORKFLOW_MATCHES[String(c?.match ?? "EQUAL_TO")] ?? "EQ";
+      if (!field) continue;
+      conditions.push(op === "EXISTS"
+        ? { field, op }
+        : { field, op, value: await workflowConditionValue(ctx, field, c?.match_value) });
+    }
+    const actions: Record<string, unknown>[] = [];
+    for (const a of (r.actions ?? []) as any[]) {
+      const made = await workflowAction(ctx, a);
+      if (made) actions.push(made);
+    }
+
+    const users = await ctxMap(ctx, "users"), teams = await ctxMap(ctx, "teams");
+    const allowedUsers = ((r.allowed_users ?? []) as any[])
+      .map((u) => mapGet(users, typeof u === "string" ? u : u?.user_uid)).filter((v): v is string => !!v);
+    const allowedTeams = ((r.allowed_teams ?? []) as any[])
+      .map((t) => mapGet(teams, typeof t === "string" ? t : t?.team_uid)).filter((v): v is string => !!v);
+
+    return {
+      zuper_uid: String(r.workflow_uid),
+      name: T(r.workflow_name) ?? "Workflow",
+      description: T(r.workflow_description),
+      trigger_event: event ?? `zuper.${String(r.trigger_event ?? "unknown")}`,
+      trigger_module: T(r.trigger_module),
+      workflow_access: String(r.workflow_access ?? "COMPANY_WIDE") === "USERS" ? "USERS" : "COMPANY_WIDE",
+      allowed_users: allowedUsers, allowed_teams: allowedTeams,
+      allow_workflow_to_trigger: r.allow_workflow_to_trigger !== false,
+      conditions, actions,
+      // A workflow arrives switched off, as the reminders and the job notification rules did before it. Zuper has
+      // one of these live — it emails three people on every new request — and Tuper's mailbox is set up, so an
+      // import that carried it over active would start sending the moment it ran. The owner (2026-09-24) reads
+      // each one in Settings › Workflow and switches on what they want.
+      //
+      // Whether it is on is then theirs, not Zuper's: a workflow Tuper already holds keeps the setting it has, so
+      // running this again never switches off what the owner switched on.
+      is_active: await workflowStaysOff(ctx, String(r.workflow_uid)),
+      is_deleted: r.is_deleted === true,
       created_by: await userOnSight(ctx, r.created_by),
       ...ownTimes(r),
     };

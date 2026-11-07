@@ -152,6 +152,47 @@ async function customers(cfg: SyncConfig, o: SweepOpts): Promise<KindResult> {
   return r;
 }
 
+/**
+ * Asset history for the assets the live path cannot reach.
+ *
+ * Zuper's asset.history webhook names only the history entry, never its asset, and Zuper publishes no lookup from
+ * one to the other — so the event is unroutable and history is read from the asset's side instead (routes.ts
+ * enriches every asset event with it). That covers a history row created by changing the asset, which is most of
+ * them, but not one created without the asset moving: 38 of 86 asset.history deliveries in the 30 days to
+ * 2026-10-22 had no identifiable asset event within a minute.
+ *
+ * Reading all 2,295 assets' history every pass would cost ~51 minutes at this budget, so it rotates instead: the
+ * assets whose history was read longest ago (or never) go first, HISTORY_PER_PASS of them, and the marker written
+ * by ENTITIES.asset_history_live moves them to the back of the queue. The whole base comes round in a couple of
+ * days while a changed asset is still read within seconds by the live path.
+ */
+const HISTORY_PER_PASS = 120;
+
+async function assetHistory(cfg: SyncConfig, o: SweepOpts): Promise<KindResult> {
+  const r = blank("asset_history");
+  const uids: string[] = [];
+  for await (const page of getPages(cfg, "/api/assets")) {
+    for (const a of page) { const u = String(a.asset_uid ?? "").trim(); if (u) uids.push(u); }
+    await o.pace();
+  }
+  r.listed = uids.length;
+  if (!uids.length || o.dryRun) return r;
+
+  // Oldest marker first; an asset with no marker has never been read and sorts first of all.
+  const read = await syncedAt("asset_history_read", uids);
+  const queue = uids
+    .map((uid) => ({ uid, at: read.get(uid)?.synced_at ?? "" }))
+    .sort((a, b) => a.at.localeCompare(b.at))
+    .slice(0, HISTORY_PER_PASS);
+
+  for (const { uid } of queue) {
+    if (o.budget() <= 0) break;
+    try { await syncOne("asset_history_live", uid, { detail: null, selfFetching: true }); r.resynced++; } catch (err) { fail(r, err); }
+    await o.pace();
+  }
+  return r;
+}
+
 const NOTE_HOSTS = ["job", "customer", "request", "asset"];
 
 async function notes(cfg: SyncConfig, o: SweepOpts): Promise<KindResult> {
@@ -199,6 +240,7 @@ export async function sweepRecords(o: SweepOpts): Promise<KindResult[]> {
 
   for (const spec of BY_UPDATED_AT.filter((s) => o.full || !s.full)) await run(spec.entity, () => byUpdatedAt(cfg, spec, o));
   if (o.full) await run("customers", () => customers(cfg, o));
+  if (o.full) await run("asset_history", () => assetHistory(cfg, o));
   await run("notes", () => notes(cfg, o));
   if (!o.dryRun) {
     // One list call each, as the two above. Timesheet approvals are deliberately not here: each one has to be read

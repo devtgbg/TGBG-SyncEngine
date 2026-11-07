@@ -40,6 +40,7 @@ import { withCause } from "./api-log.js";
 import { noteRecord, trackWrite } from "./tuper-writes.js";
 import { ENTITIES, getSyncConfig, zuperGet, type SyncConfig } from "./lib/migration/zuper-sync.js";
 import { detailPathFor, isSelfFetching, resolveRoute, type NoteHost, type Route } from "./routes.js";
+import { stubUidFields } from "./lib/uid-fields.js";
 
 /** Structurally identical to zuper-sync.ts's Ctx, which is not exported. */
 type Ctx = {
@@ -465,18 +466,6 @@ export async function syncHostNotes(
     action: r.action, id: r.id,
     detail: `${r.notes.listed} listed in Zuper, ${r.notes.written} written, ${r.notes.deleted} deleted`,
   })));
-}
-
-/** Give a stub record the uid field its entity reads. */
-function stubUidFields(entityName: string, uid: string): Record<string, string> {
-  const byEntity: Record<string, string> = {
-    jobs: "job_uid", job_details: "job_uid", job_activity: "job_uid",
-    customers: "customer_uid", organizations: "organization_uid", users: "user_uid",
-    assets: "asset_uid", estimates: "estimate_uid", estimate_activity: "estimate_uid", invoices: "invoice_uid",
-    contracts: "service_contract_uid", products: "product_uid", requests: "request_uid",
-  };
-  const k = byEntity[entityName];
-  return k ? { [k]: uid } : { uid };
 }
 
 /**
