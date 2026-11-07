@@ -19,7 +19,10 @@
 @media (max-width: 720px) { .topbar { position: static; } }
 .topbar-inner { max-width: 1320px; margin: 0 auto; padding: 10px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; }
 .brand { display: inline-flex; align-items: center; gap: 8px; font-weight: 700; font-size: 14px; color: var(--ink); text-decoration: none; letter-spacing: 0.01em; }
-.brand-mark { display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 7px; background: var(--accent); color: var(--bg); font-size: 14px; }
+/* The buggy on its chip, in the brand's deep green (--logo-* in globals.css). Wider than the square it
+   replaced because a 222×172 drawing squeezed into 24px reads as a smudge; the padding keeps the wheels
+   and canopy off the rounded corners. */
+.brand-mark { width: 48px; height: 36px; flex: none; display: block; padding: 3px 4px; border-radius: 9px; background: var(--logo-chip); }
 nav.site { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 18px; }
 .nav-group { display: inline-flex; align-items: center; gap: 2px; }
 /* The two groups are told apart by a rule, not by a word: a grey word beside the links reads as a disabled one. */

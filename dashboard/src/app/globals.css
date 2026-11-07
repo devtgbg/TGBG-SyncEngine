@@ -17,6 +17,19 @@
   --muted-bg: #f0eeeb; --muted-ink: #6f6963;
   /* Chart series: categorical slots 1 and 2, validated (dataviz validate_palette.js) against #ffffff. */
   --series-1: #2a78d6; --series-2: #eb6834;
+  /*
+   * The buggy mark (logo.tsx), in The Golf Buggy Guy's own greens — read off
+   * golf-buggy-guy-logo.svg, where the signature green is #146734/#1d582c over #112113.
+   *
+   * The buggy stands on a chip of the deep brand green, so its four colours never meet the page and
+   * are the same in both themes. Only --logo-chip changes: on the near-black bar the deepest green
+   * would disappear, so it lifts a shade and the chip stays a visible shape.
+   */
+  --logo-chip: #112113;
+  --logo-panel: #e9f0ea;
+  --logo-frame: #4aa868;
+  --logo-shadow: #0c1f13;
+  --logo-hub: #e9f0ea;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -32,6 +45,8 @@
     --bad-bg: #3a1d19; --bad-ink: #f0968a;
     --muted-bg: #27252c; --muted-ink: #9b95a3;
     --series-1: #3987e5; --series-2: #d95926;
+    /* Only the chip moves: the deepest green is invisible on this bar, so it lifts to stay a shape. */
+    --logo-chip: #1b3f27;
   }
 }
 
@@ -43,6 +58,7 @@
   --bad-bg: #3a1d19; --bad-ink: #f0968a;
   --muted-bg: #27252c; --muted-ink: #9b95a3;
   --series-1: #3987e5; --series-2: #d95926;
+  --logo-chip: #1b3f27;
 }
 
 * { box-sizing: border-box; }

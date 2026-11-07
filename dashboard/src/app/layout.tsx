@@ -4,6 +4,7 @@ import "./engine.css";
 import { engine, getSettings, liveness } from "@/lib/control";
 import { DIRECTION, directionOf } from "@/lib/engine";
 import { LiveRefresh } from "./live";
+import { BuggyMark } from "./logo";
 import { NavLinks } from "./nav";
 
 export const metadata: Metadata = {
@@ -34,7 +35,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body>
         <header className="topbar">
           <div className="topbar-inner">
-            <a href="/" className="brand"><span className="brand-mark" aria-hidden="true">⇄</span>Zupersync</a>
+            <a href="/" className="brand"><BuggyMark />Zupersync</a>
             <NavLinks />
             <span className="topbar-end">
               <EngineBadge />
