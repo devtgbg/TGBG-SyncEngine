@@ -135,6 +135,11 @@ const NUMBERED: Record<string, { kind: "job" | "contract" | "product" | "request
   requests: { kind: "request", column: "request_number" },
 };
 
+/** The HTTP status buried in the Zuper client's error message, or 0 when it carried none. */
+function zuperStatus(err: unknown): number {
+  return Number(/→ (\d{3})/.exec(errorText(err))?.[1] ?? 0);
+}
+
 export interface SyncOneResult {
   entity: string;
   uid: string;
@@ -181,7 +186,23 @@ async function writeOne(entityName: string, uid: string, opts: SyncOneOpts): Pro
   let r: any = opts.raw;
   if (!r) {
     if (opts.detail) {
-      r = (await zuperGet(cfg, opts.detail(uid)))?.data ?? null;
+      try {
+        r = (await zuperGet(cfg, opts.detail(uid)))?.data ?? null;
+      } catch (err) {
+        // A 404 on a BY-UID read is Zuper's own answer about this record, not a record missing from a list — the one
+        // signal we are entitled to read as "it is gone". `npm run compare --deletions` has always trusted exactly
+        // this before flagging anything; the live path used to treat it as a failure instead, so a delivery about a
+        // deleted record failed, retried five times and then stranded forever, with the record still live in Tuper.
+        //
+        // Absence from a LIST is never read this way: Zuper's lists omit records that exist (inactive users, for one).
+        // A uid we have never mapped flags nothing — flagDeleted answers "skipped" — so a create that arrives before
+        // Zuper will serve the record cannot delete anything.
+        if (zuperStatus(err) === 404) {
+          console.log(`[zupersync] ${entityName} ${uid}: Zuper answers 404 — marking it deleted, as a delete webhook would have`);
+          return await flagDeleted(entityName, uid);
+        }
+        throw err;
+      }
       if (!r) throw new Error(`Zuper returned no record for ${entityName} ${uid}`);
     } else if (opts.selfFetching) {
       r = {};

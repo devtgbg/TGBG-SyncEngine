@@ -300,7 +300,6 @@ const MODULES: Record<string, ModuleSpec> = {
 
   CUSTOMER: {
     label: "Customers",
-    // Zuper has no customer delete — only deactivate, which is a field change.
     entity: "customers",
     uidFields: ["customer_uid"],
     events: {
@@ -319,6 +318,16 @@ const MODULES: Record<string, ModuleSpec> = {
       "customer.delete_attachment": ["Delete Customer Attachment", FILES],
       "customer.update_attachment": ["Update Customer Attachment", FILES],
       "customer.bulk_action": ["Customer Bulk Action"],
+      // NOT in Zuper's own catalogue. GET /api/misc/CUSTOMER/events lists fifteen customer events and this is not
+      // among them, which is why nothing subscribes to it and why it was long believed not to exist — the comment
+      // here used to say so. Zuper sends it anyway: 58 real deliveries arrived between 2026-09-18 and 2026-09-28.
+      //
+      // Until now the fallback rule caught them ("an unknown customer.* event means re-read the customer"), which is
+      // the worst possible reading of a delete. 25 failed because the re-read 404'd on a record Zuper had removed,
+      // and the other 31 SUCCEEDED — re-reading the customer and leaving it live in Tuper after Zuper deleted it.
+      // That is one source of the 784 customers Tuper holds that Zuper no longer lists; Zuper has no other way to
+      // tell us, as a list cannot report an absence.
+      "customer.delete": ["Customer Delete", DELETE],
     },
   },
 

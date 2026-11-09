@@ -64,6 +64,12 @@ const same = (a: ReturnType<typeof resolveRoute>, b: ReturnType<typeof resolveRo
 
 // 1. routes.ts carries exactly Zuper's catalogue, module for module.
 const fixtureModules = Object.keys(fixture.modules).sort();
+// Events Zuper SENDS but does not publish in its catalogue, so routes.ts is deliberately ahead of the fixture.
+// Each one is here with its evidence, because the fallback rule gets them dangerously wrong if they are forgotten:
+// customer.delete arrived 58 times between 2026-09-18 and 2026-09-28 while GET /api/misc/CUSTOMER/events did not
+// mention it, and inferred as an update it re-reads the customer and leaves a record Zuper deleted live in Tuper.
+const OUT_OF_CATALOGUE: Record<string, string> = { "customer.delete": "customers" };
+
 const routeModules = Object.keys(EVENT_CATALOGUE).sort();
 if (fixtureModules.join() !== routeModules.join()) {
   problems.push(`modules differ — Zuper: ${fixtureModules.join(", ")}; routes.ts: ${routeModules.join(", ")}`);
@@ -72,7 +78,7 @@ for (const m of fixtureModules) {
   const want = new Set(fixture.modules[m].map(([k]) => k));
   const have = new Set(EVENT_CATALOGUE[m] ?? []);
   for (const k of want) if (!have.has(k)) problems.push(`${m}/${k}: in Zuper's catalogue, missing from routes.ts`);
-  for (const k of have) if (!want.has(k)) problems.push(`${m}/${k}: in routes.ts, not in Zuper's catalogue`);
+  for (const k of have) if (!want.has(k) && !(k in OUT_OF_CATALOGUE)) problems.push(`${m}/${k}: in routes.ts, not in Zuper's catalogue`);
 }
 
 // 2. Keys never collide once normalised — routing looks them up globally.
@@ -192,6 +198,19 @@ for (const [key, entity, inferred] of future) {
   const r = resolveRoute("", key);
   if (r?.entity !== entity || r?.inferred !== inferred || r?.skip) problems.push(`${key}: expected an inferred re-read of ${entity}`);
 }
+// Events Zuper SENDS but does not publish. The fixture is Zuper's own catalogue, so nothing above can test these;
+// they are listed here by hand, with the evidence, because the fallback rule gets them dangerously wrong if they are
+// forgotten. customer.delete: 58 deliveries between 2026-09-18 and 2026-09-28, while GET /api/misc/CUSTOMER/events
+// does not mention it. Inferred as an update it re-reads the customer and leaves a deleted record live.
+for (const [key, entity] of Object.entries(OUT_OF_CATALOGUE)) {
+  const r = resolveRoute("", key);
+  if (!r) { problems.push(`${key}: refused outright, but Zuper has really sent it`); continue; }
+  if (fixture.modules.CUSTOMER?.some(([k]) => k === key)) problems.push(`${key} is in the catalogue now — move it out of OUT_OF_CATALOGUE and test it with the rest`);
+  if (!r.deletion) problems.push(`${key}: NOT treated as a deletion — it would re-read a removed record and leave it live`);
+  if (r.entity !== entity) problems.push(`${key}: deletes from ${r.entity}, expected ${entity}`);
+  if (r.inferred) problems.push(`${key}: still only INFERRED — it needs its own rule, or a catalogue change silently takes it away`);
+}
+
 if (resolveRoute("", "measurement.some_new_event") !== null) problems.push("an unknown measurement event must not become a job re-sync");
 if (resolveRoute("", "nonsense.thing") !== null) problems.push("an unknown prefix must be refused");
 
@@ -212,4 +231,4 @@ if (problems.length) {
   for (const p of problems) console.log(`  ✗ ${p}`);
   process.exit(1);
 }
-console.log(`\n✓ all ${total} events route by their wire key, and all ${Object.keys(MUST_DELETE).length} deletions are exact`);
+console.log(`\n✓ all ${total} events route by their wire key, all ${Object.keys(MUST_DELETE).length} deletions are exact, and ${Object.keys(OUT_OF_CATALOGUE).length} event(s) Zuper sends without publishing`);
